@@ -4,6 +4,9 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 
+# WorkBuddy local workspace data
+.workbuddy/
+
 # Maven wrapper temp
 .mvn/.gradle-enterprise/
 .mvn/.develocity/
