@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package med;
+
+option java_package = "com.med.qa.proto";
+option java_outer_classname = "MedSessionProto";
+option java_multiple_files = true;
+
+// RoleType 严格对齐统一存储规范第四节：PATIENT=0 / DOCTOR=1 / ASSISTANT=2 / SYSTEM=3
+enum Role {
+  PATIENT = 0;
+  DOCTOR = 1;
+  ASSISTANT = 2;
+  SYSTEM = 3;
+}
+
+// 会话状态：ACTIVE=0 / CLOSED=1 / ARCHIVED=2（与 domain.enums.SessionStatus 对齐）
+enum SessionState {
+  ACTIVE = 0;
+  CLOSED = 1;
+  ARCHIVED = 2;
+}
+
+// 单条会话消息。字段顺序与命名严格对齐统一存储规范：
+// message_id / session_id / tenant_id / dept_id / patient_id / role /
+// content / token_count / masked / created_at / metadata
+message ChatMessage {
+  string message_id = 1;
+  string session_id = 2;
+  string tenant_id = 3;
+  string dept_id = 4;
+  string patient_id = 5;
+  Role role = 6;
+  string content = 7;
+  int32 token_count = 8;
+  bool masked = 9;
+  int64 created_at = 10;
+  map<string, string> metadata = 11;
+}
+
+// 会话聚合。Redis 键规范 med:chat:{tenant_id}:{dept_id}:{session_id}
+message ChatSession {
+  string session_id = 1;
+  string tenant_id = 2;
+  string dept_id = 3;
+  string patient_id = 4;
+  SessionState status = 5;
+  string title = 6;
+  int64 created_at = 7;
+  int64 updated_at = 8;
+  map<string, string> metadata = 9;
+}
