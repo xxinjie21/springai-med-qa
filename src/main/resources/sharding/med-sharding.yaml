@@ -1,0 +1,42 @@
+# ShardingSphere-JDBC rule configuration for the unified medical session storage spec.
+#
+# Physical layout: med_message_{crc32(session_id) % 16} across 16 tables in a single MySQL schema.
+# Routing, SQL rewriting and result merging are performed by ShardingSphere; the only project code
+# involved is the MED_CRC32_MOD algorithm plugin (com.med.qa.memory.sharding.Crc32ShardingAlgorithm).
+#
+# Placeholders use the ShardingSphere `$${ENV_NAME::default}` syntax and are resolved because the
+# JDBC URL declares `?placeholder-type=environment`.
+
+databaseName: med_qa
+
+dataSources:
+  med_ds:
+    dataSourceClassName: com.zaxxer.hikari.HikariDataSource
+    driverClassName: com.mysql.cj.jdbc.Driver
+    jdbcUrl: jdbc:mysql://$${MED_MYSQL_HOST::127.0.0.1}:$${MED_MYSQL_PORT::3306}/$${MED_MYSQL_DATABASE::med_qa}?useUnicode=true&characterEncoding=utf8mb4&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    username: $${MED_MYSQL_USERNAME::med_qa}
+    password: $${MED_MYSQL_PASSWORD::med_qa}
+    minimumIdle: 4
+    maximumPoolSize: 32
+    connectionTimeout: 5000
+    idleTimeout: 60000
+    maxLifetime: 1800000
+
+rules:
+  - !SHARDING
+    tables:
+      med_message:
+        actualDataNodes: med_ds.med_message_${0..15}
+        tableStrategy:
+          standard:
+            shardingColumn: session_id
+            shardingAlgorithmName: med_message_crc32_mod
+    shardingAlgorithms:
+      med_message_crc32_mod:
+        type: MED_CRC32_MOD
+        props:
+          sharding-count: 16
+
+props:
+  sql-show: false
+  sql-simple: false
