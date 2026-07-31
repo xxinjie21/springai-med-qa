@@ -25,6 +25,7 @@
         <protobuf-maven-plugin.version>3.1.0</protobuf-maven-plugin.version>
         <protobuf-java.version>4.29.3</protobuf-java.version>
         <jacoco-maven-plugin.version>0.8.13</jacoco-maven-plugin.version>
+        <shardingsphere.version>5.5.2</shardingsphere.version>
     </properties>
 
     <dependencies>
@@ -34,15 +35,44 @@
         </dependency>
 
         <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>
             <version>${protobuf-java.version}</version>
+        </dependency>
+
+        <!-- Transparent MySQL table sharding: med_message_{crc32(session_id) % 16} -->
+        <dependency>
+            <groupId>org.apache.shardingsphere</groupId>
+            <artifactId>shardingsphere-jdbc</artifactId>
+            <version>${shardingsphere.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
         </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
+        </dependency>
+
+        <!--
+            Required at runtime by ShardingSphere's standalone JDBC metadata repository, and reused
+            as an in-memory stand-in for MySQL so sharding routing is verified without middleware.
+            Must stay `runtime` (not `test`): narrowing the scope would break ShardingSphere startup.
+        -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
         </dependency>
     </dependencies>
 
