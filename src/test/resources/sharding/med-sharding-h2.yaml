@@ -1,0 +1,34 @@
+# Test-only mirror of src/main/resources/sharding/med-sharding.yaml.
+#
+# The sharding rules (16 actual data nodes, session_id sharding column, MED_CRC32_MOD algorithm) are
+# byte-for-byte identical to production; only the underlying data source is swapped for an in-memory
+# H2 schema so routing can be verified without a running MySQL instance.
+
+databaseName: med_qa_test
+
+dataSources:
+  med_ds:
+    dataSourceClassName: com.zaxxer.hikari.HikariDataSource
+    driverClassName: org.h2.Driver
+    jdbcUrl: jdbc:h2:mem:med_qa_sharding;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: ''
+    maximumPoolSize: 4
+
+rules:
+  - !SHARDING
+    tables:
+      med_message:
+        actualDataNodes: med_ds.med_message_${0..15}
+        tableStrategy:
+          standard:
+            shardingColumn: session_id
+            shardingAlgorithmName: med_message_crc32_mod
+    shardingAlgorithms:
+      med_message_crc32_mod:
+        type: MED_CRC32_MOD
+        props:
+          sharding-count: 16
+
+props:
+  sql-show: false
