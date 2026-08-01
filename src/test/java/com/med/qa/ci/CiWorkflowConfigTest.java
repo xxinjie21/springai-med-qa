@@ -87,9 +87,10 @@ class CiWorkflowConfigTest {
         assertThat(javaWith.get("cache")).isEqualTo("maven");
 
         // Build step must call the maven wrapper with the verify phase.
+        // Note: the chmod step also contains "./mvnw", so require "verify" too.
         String buildRun = steps.stream()
                 .map(s -> String.valueOf(s.get("run")))
-                .filter(r -> r.contains("./mvnw"))
+                .filter(r -> r.contains("./mvnw") && r.contains("verify"))
                 .findFirst().orElseThrow();
         assertThat(buildRun).contains("verify");
 
