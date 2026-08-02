@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.med.qa.mapper.ChatMessageMapper">
+
+    <resultMap id="MessageResultMap" type="com.med.qa.domain.entity.ChatMessageDO">
+        <id column="message_id" property="messageId"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="patient_id" property="patientId"/>
+        <result column="role" property="role"
+                typeHandler="com.med.qa.mapper.typehandler.RoleTypeTypeHandler"/>
+        <result column="content" property="content"/>
+        <result column="token_count" property="tokenCount"/>
+        <result column="masked" property="masked"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="metadata" property="metadata"
+                typeHandler="com.med.qa.mapper.typehandler.MetadataTypeHandler"/>
+    </resultMap>
+
+    <sql id="allColumns">
+        message_id, session_id, tenant_id, dept_id, patient_id,
+        role, content, token_count, masked, created_at, metadata
+    </sql>
+
+    <insert id="insert" parameterType="com.med.qa.domain.entity.ChatMessageDO" useGeneratedKeys="false">
+        INSERT INTO med_message (
+            message_id, session_id, tenant_id, dept_id, patient_id,
+            role, content, token_count, masked, created_at, metadata
+        ) VALUES (
+            #{messageId}, #{sessionId}, #{tenantId}, #{deptId}, #{patientId},
+            #{role, typeHandler=com.med.qa.mapper.typehandler.RoleTypeTypeHandler},
+            #{content}, #{tokenCount}, #{masked}, #{createdAt},
+            #{metadata, typeHandler=com.med.qa.mapper.typehandler.MetadataTypeHandler}
+        )
+    </insert>
+
+    <select id="selectById" resultMap="MessageResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_message
+        WHERE message_id = #{messageId}
+    </select>
+
+    <select id="selectBySessionId" resultMap="MessageResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_message
+        WHERE session_id = #{sessionId}
+    </select>
+
+    <select id="selectBySessionIdOrderByCreatedAtAsc" resultMap="MessageResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_message
+        WHERE session_id = #{sessionId}
+        ORDER BY created_at ASC
+    </select>
+
+    <update id="updateMasked">
+        UPDATE med_message
+        SET masked = #{masked}
+        WHERE message_id = #{messageId}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM med_message
+        WHERE message_id = #{messageId}
+    </delete>
+
+    <delete id="deleteBySessionId">
+        DELETE FROM med_message
+        WHERE session_id = #{sessionId}
+    </delete>
+
+</mapper>
