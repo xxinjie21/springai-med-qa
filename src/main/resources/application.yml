@@ -11,6 +11,12 @@ spring:
     hikari:
       pool-name: med-qa-pool
 
+# MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
+# correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
+mybatis:
+  mapper-locations: classpath*:mapper/*.xml
+  type-handlers-package: com.med.qa.mapper.typehandler
+
 server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
