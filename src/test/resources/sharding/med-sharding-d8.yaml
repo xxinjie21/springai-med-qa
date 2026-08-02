@@ -1,0 +1,35 @@
+# D8-only mirror of src/main/resources/sharding/med-sharding.yaml used by ChatMessageMapperShardingTest.
+#
+# The sharding RULES are byte-for-byte identical to production (16 actual data nodes, session_id
+# sharding column, MED_CRC32_MOD algorithm). Only the underlying data source differs: an isolated
+# in-memory H2 schema (med_qa_d8) so the D8 mapper test cannot collide with Crc32ShardingRoutingTest
+# which uses med_qa_sharding.
+
+databaseName: med_qa_d8
+
+dataSources:
+  med_ds:
+    dataSourceClassName: com.zaxxer.hikari.HikariDataSource
+    driverClassName: org.h2.Driver
+    jdbcUrl: jdbc:h2:mem:med_qa_d8;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: ''
+    maximumPoolSize: 4
+
+rules:
+  - !SHARDING
+    tables:
+      med_message:
+        actualDataNodes: med_ds.med_message_${0..15}
+        tableStrategy:
+          standard:
+            shardingColumn: session_id
+            shardingAlgorithmName: med_message_crc32_mod
+    shardingAlgorithms:
+      med_message_crc32_mod:
+        type: MED_CRC32_MOD
+        props:
+          sharding-count: 16
+
+props:
+  sql-show: false

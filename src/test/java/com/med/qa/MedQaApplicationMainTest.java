@@ -37,7 +37,8 @@ class MedQaApplicationMainTest {
             try (ConfigurableApplicationContext ctx = org.springframework.boot.SpringApplication.run(
                     MedQaApplication.class,
                     "--spring.main.web-application-type=servlet",
-                    "--server.port=not-a-number")) {
+                    "--server.port=not-a-number",
+                    "--spring.flyway.enabled=false")) {
                 // should not reach here
             }
         });
@@ -47,6 +48,7 @@ class MedQaApplicationMainTest {
         return org.springframework.boot.SpringApplication.run(
                 MedQaApplication.class,
                 "--spring.main.web-application-type=none",
-                "--spring.main.banner-mode=off");
+                "--spring.main.banner-mode=off",
+                "--spring.flyway.enabled=false");
     }
 }
