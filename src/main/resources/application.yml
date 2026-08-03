@@ -10,6 +10,22 @@ spring:
     url: jdbc:shardingsphere:classpath:sharding/med-sharding.yaml?placeholder-type=environment
     hikari:
       pool-name: med-qa-pool
+  data:
+    redis:
+      # Backing store of the conversation memory cache, keys med:chat:{tenant}:{dept}:{session}.
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      database: ${REDIS_DATABASE:0}
+      timeout: 3s
+      connect-timeout: 3s
+      client-name: med-qa
+
+# Conversation memory cache tuning; MySQL stays the source of truth so these values only
+# trade Redis footprint against read amplification.
+med:
+  cache:
+    ttl: ${MED_CACHE_TTL:30m}
+    max-messages: ${MED_CACHE_MAX_MESSAGES:200}
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
