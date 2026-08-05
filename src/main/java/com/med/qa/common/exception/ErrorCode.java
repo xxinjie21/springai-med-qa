@@ -30,6 +30,12 @@ public enum ErrorCode {
     /** HTTP method not allowed on this endpoint. */
     METHOD_NOT_ALLOWED(40500, "method not allowed"),
 
+    /**
+     * The consultation session is already being mutated by another request and the distributed
+     * lock could not be acquired within the configured wait window.
+     */
+    SESSION_LOCKED(40900, "session is busy, please retry"),
+
     /** Too many requests, rejected by rate limiter. */
     RATE_LIMITED(42900, "too many requests"),
 
