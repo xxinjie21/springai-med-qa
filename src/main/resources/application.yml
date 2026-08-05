@@ -3,6 +3,12 @@ spring:
     name: springai-med-qa
   profiles:
     active: ${SPRING_PROFILES_ACTIVE:dev}
+  autoconfigure:
+    exclude:
+      # Redisson is used for locking/rate limiting only. Its auto-configuration would also replace
+      # the Lettuce connection factory of the message cache and eagerly connect to Redis during
+      # context refresh; config/RedissonConfig declares the client lazily instead.
+      - org.redisson.spring.starter.RedissonAutoConfigurationV2
   datasource:
     # All MySQL traffic goes through ShardingSphere-JDBC, which transparently routes
     # med_message writes/reads to med_message_{crc32(session_id) % 16}.
@@ -26,6 +32,13 @@ med:
   cache:
     ttl: ${MED_CACHE_TTL:30m}
     max-messages: ${MED_CACHE_MAX_MESSAGES:200}
+  # Distributed session lock (Redisson RLock). lease-time 0 keeps the watchdog in charge, so a slow
+  # LLM round trip cannot lose the lock while a crashed node still releases it after the watchdog
+  # timeout.
+  lock:
+    wait-time: ${MED_LOCK_WAIT_TIME:3s}
+    lease-time: ${MED_LOCK_LEASE_TIME:0s}
+    watchdog-timeout: ${MED_LOCK_WATCHDOG_TIMEOUT:30s}
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
