@@ -26,6 +26,7 @@
         <protobuf-java.version>4.29.3</protobuf-java.version>
         <jacoco-maven-plugin.version>0.8.13</jacoco-maven-plugin.version>
         <shardingsphere.version>5.5.2</shardingsphere.version>
+        <redisson.version>3.45.1</redisson.version>
     </properties>
 
     <dependencies>
@@ -95,6 +96,18 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--
+            Redisson supplies the distributed session lock (RLock with watchdog lease renewal) and,
+            from D25 on, the RRateLimiter. No hand-rolled SETNX/Lua locking is written in this
+            project. Version pinned to the 3.45.x line, which tracks the same Netty 4.1 baseline as
+            the Spring Boot 3.4 BOM.
+        -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+            <version>${redisson.version}</version>
         </dependency>
     </dependencies>
 
