@@ -32,6 +32,10 @@ med:
   cache:
     ttl: ${MED_CACHE_TTL:30m}
     max-messages: ${MED_CACHE_MAX_MESSAGES:200}
+  # Spring AI short-term memory window (MessageWindowChatMemory). Only the rolling window size is
+  # configured here; the window is persisted through the two-tier repository (Redis + sharded MySQL).
+  chat:
+    max-messages: ${MED_CHAT_MAX_MESSAGES:20}
   # Distributed session lock (Redisson RLock). lease-time 0 keeps the watchdog in charge, so a slow
   # LLM round trip cannot lose the lock while a crashed node still releases it after the watchdog
   # timeout.
