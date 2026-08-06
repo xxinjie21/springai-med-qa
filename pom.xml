@@ -27,7 +27,25 @@
         <jacoco-maven-plugin.version>0.8.13</jacoco-maven-plugin.version>
         <shardingsphere.version>5.5.2</shardingsphere.version>
         <redisson.version>3.45.1</redisson.version>
+        <spring-ai.version>1.0.0</spring-ai.version>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!--
+                Spring AI BOM: pins every org.springframework.ai module to one GA version
+                (1.0.0, compatible with Spring Boot 3.4.x and Java 17). Only the chat-memory
+                client library is pulled in at D12; vector store / model starters arrive later.
+            -->
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <dependency>
@@ -96,6 +114,18 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--
+            Spring AI chat-memory client library: provides ChatMemory / ChatMemoryRepository /
+            MessageWindowChatMemory (the official, maintained short-term memory) and the
+            MessageChatMemoryAdvisor that plugs memory into the ChatClient chain. Version is
+            managed by the Spring AI BOM. No autoconfiguration jar is on the classpath, so adding
+            it does not require any LLM API key or connection at context startup.
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-client-chat</artifactId>
         </dependency>
 
         <!--
