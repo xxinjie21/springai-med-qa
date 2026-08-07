@@ -9,6 +9,10 @@ spring:
       # the Lettuce connection factory of the message cache and eagerly connect to Redis during
       # context refresh; config/RedissonConfig declares the client lazily instead.
       - org.redisson.spring.starter.RedissonAutoConfigurationV2
+      # The Spring AI Redis vector store auto-configuration requires a JedisConnectionFactory bean
+      # (this application runs Spring Data Redis on Lettuce) and creates the search index eagerly
+      # during context refresh; config/VectorStoreConfig declares the store lazily instead.
+      - org.springframework.ai.vectorstore.redis.autoconfigure.RedisVectorStoreAutoConfiguration
   datasource:
     # All MySQL traffic goes through ShardingSphere-JDBC, which transparently routes
     # med_message writes/reads to med_message_{crc32(session_id) % 16}.
@@ -43,6 +47,28 @@ med:
     wait-time: ${MED_LOCK_WAIT_TIME:3s}
     lease-time: ${MED_LOCK_LEASE_TIME:0s}
     watchdog-timeout: ${MED_LOCK_WATCHDOG_TIMEOUT:30s}
+  # Medical RAG vector index (Spring AI RedisVectorStore over Redis Stack / RediSearch). Only index
+  # topology is configured; similarity search and Top-K selection belong to the official component.
+  # The prefix must stay outside the med:chat: namespace so the index never scans cached
+  # conversation windows. Retrieval is scoped through the metadata tags declared below - the
+  # documents themselves are never parsed for entities.
+  rag:
+    vector-store:
+      index-name: ${MED_RAG_INDEX_NAME:med-doc-index}
+      prefix: ${MED_RAG_KEY_PREFIX:med:doc:}
+      content-field-name: content
+      embedding-field-name: embedding
+      # HNSW keeps recall high as the corpus grows; switch to FLAT for exact search on small sets.
+      vector-algorithm: ${MED_RAG_VECTOR_ALGORITHM:HNSW}
+      distance-metric: COSINE
+      initialize-schema: ${MED_RAG_INITIALIZE_SCHEMA:true}
+      metadata-fields:
+        - name: tenant_id
+          type: TAG
+        - name: dept_id
+          type: TAG
+        - name: patient_id
+          type: TAG
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
