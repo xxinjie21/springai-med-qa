@@ -1,0 +1,33 @@
+# Local development stack.
+#
+# D13 introduces the Redis Stack node only: it backs BOTH the conversation memory cache
+# (med:chat:{tenant}:{dept}:{session}) and the RediSearch vector index used by the Spring AI
+# RedisVectorStore (med:doc:* keys). MySQL and the application service are added in D28.
+#
+# Usage: docker compose up -d redis-stack
+name: springai-med-qa
+
+services:
+  redis-stack:
+    # Redis Stack bundles RediSearch + RedisJSON, both required by RedisVectorStore.
+    image: redis/redis-stack:7.4.0-v3
+    container_name: med-qa-redis-stack
+    ports:
+      # 6379 -> Redis protocol (cache, Redisson locks, vector index)
+      - "6379:6379"
+      # 8001 -> RedisInsight UI, handy to inspect the FT index during development
+      - "8001:8001"
+    environment:
+      REDIS_ARGS: "--appendonly yes --save 60 1000"
+    volumes:
+      - redis-stack-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  redis-stack-data:

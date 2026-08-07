@@ -139,6 +139,18 @@
             <artifactId>redisson-spring-boot-starter</artifactId>
             <version>${redisson.version}</version>
         </dependency>
+
+        <!--
+            Spring AI Redis vector store starter (RediSearch/Redis Stack). Supplies the official
+            RedisVectorStore, so no cosine/L2 math, Top-K heap, LRU eviction or snapshot persistence
+            is written by hand. Version managed by the Spring AI BOM. The starter's
+            auto-configuration is excluded in application.yml because it eagerly creates the search
+            index during context refresh; config/VectorStoreConfig declares the bean lazily instead.
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-vector-store-redis</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
