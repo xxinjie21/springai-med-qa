@@ -29,6 +29,48 @@ spring:
       timeout: 3s
       connect-timeout: 3s
       client-name: med-qa
+  # Timeouts of the auto-configured RestClient.Builder, which config/EmbeddingModelConfig reuses for
+  # the embedding endpoint. Embedding a batch of documents is slower than a chat turn, hence the
+  # generous read timeout; the retry policy below turns a timeout into a bounded number of retries.
+  http:
+    client:
+      connect-timeout: 5s
+      read-timeout: 60s
+  ai:
+    # Spring AI model auto-configuration is switched off: it instantiates every model eagerly and
+    # fails when no API key is present, which would make the context unbootable on machines without
+    # credentials. config/EmbeddingModelConfig declares the embedding model lazily from the very
+    # same spring.ai.openai.* properties instead. Only the embedding side of the OpenAI starter is
+    # used by this project.
+    model:
+      chat: none
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        speech: none
+        transcription: none
+    openai:
+      # Any OpenAI-compatible gateway works, including an on-premise medical model server; only the
+      # base URL changes. The key is never written to the repository.
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      api-key: ${OPENAI_API_KEY:}
+      embedding:
+        embeddings-path: ${OPENAI_EMBEDDINGS_PATH:/v1/embeddings}
+        # Only the document text is embedded; metadata tags stay out of the vector so they can be
+        # used as filters without polluting similarity.
+        metadata-mode: EMBED
+        options:
+          model: ${MED_EMBEDDING_MODEL:text-embedding-3-small}
+          dimensions: ${MED_EMBEDDING_DIMENSIONS:1536}
+    # Official retry/backoff policy applied to every model call by the Spring AI RetryTemplate.
+    retry:
+      max-attempts: 3
+      backoff:
+        initial-interval: 1s
+        multiplier: 2
+        max-interval: 10s
+      on-client-errors: false
 
 # Conversation memory cache tuning; MySQL stays the source of truth so these values only
 # trade Redis footprint against read amplification.
@@ -69,6 +111,15 @@ med:
           type: TAG
         - name: patient_id
           type: TAG
+    # Embedding stage. The endpoint itself is configured through the official spring.ai.openai.*
+    # block above; these two knobs are the ones the official properties cannot express: the width
+    # the index is built with (cross-checked against the requested dimensions at wiring time) and
+    # how documents are grouped into token-bounded embedding requests.
+    embedding:
+      expected-dimensions: ${MED_EMBEDDING_DIMENSIONS:1536}
+      encoding-type: CL100K_BASE
+      max-input-token-count: ${MED_EMBEDDING_MAX_INPUT_TOKENS:8191}
+      reserve-percentage: 0.1
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
