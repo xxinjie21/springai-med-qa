@@ -151,6 +151,23 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-vector-store-redis</artifactId>
         </dependency>
+
+        <!--
+            Spring AI OpenAI-compatible model starter. Only its embedding side is used here: it
+            supplies the official OpenAiEmbeddingModel plus the canonical spring.ai.openai.*
+            configuration properties (base-url, api-key, embeddings-path, options.model,
+            options.dimensions) and the spring.ai.retry.* backoff policy, so no HTTP client, retry
+            loop or token batching is hand-written. Because any OpenAI-compatible gateway exposes
+            the same REST contract, the endpoint can be repointed at an on-premise medical model
+            purely through configuration. The model auto-configurations are excluded in
+            application.yml (they fail fast when no API key is present, which would make the whole
+            offline test suite unbootable); config/EmbeddingModelConfig declares the model lazily
+            from the very same properties instead.
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-openai</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
