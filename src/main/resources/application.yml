@@ -111,6 +111,14 @@ med:
           type: TAG
         - name: patient_id
           type: TAG
+    # Document ingestion guard rails. Batching of the embedding calls themselves is Spring AI's
+    # TokenCountBatchingStrategy inside the store; these limits only bound how much a single
+    # ingestion call pushes at it. Documents are indexed verbatim - never split, normalized or
+    # scanned for entities - and are scoped only by the tenant/dept/patient tags declared above.
+    ingestion:
+      batch-size: ${MED_RAG_INGEST_BATCH_SIZE:25}
+      max-content-length: ${MED_RAG_INGEST_MAX_CONTENT_LENGTH:20000}
+      max-documents-per-request: ${MED_RAG_INGEST_MAX_DOCUMENTS:500}
     # Embedding stage. The endpoint itself is configured through the official spring.ai.openai.*
     # block above; these two knobs are the ones the official properties cannot express: the width
     # the index is built with (cross-checked against the requested dimensions at wiring time) and
