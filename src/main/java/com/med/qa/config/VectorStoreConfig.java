@@ -1,5 +1,6 @@
 package com.med.qa.config;
 
+import com.med.qa.rag.MedDocumentIngestionProperties;
 import com.med.qa.rag.MedVectorStoreProperties;
 import com.med.qa.rag.MedVectorStoreProperties.MetadataFieldSpec;
 import org.springframework.ai.embedding.BatchingStrategy;
@@ -49,7 +50,11 @@ import redis.clients.jedis.search.Schema;
  * namespace, so the vector index, the message cache and Redisson always target the same instance.</p>
  */
 @Configuration
-@EnableConfigurationProperties({MedVectorStoreProperties.class, RedisProperties.class})
+@EnableConfigurationProperties({
+        MedVectorStoreProperties.class,
+        MedDocumentIngestionProperties.class,
+        RedisProperties.class
+})
 public class VectorStoreConfig {
 
     /** Bean name of the Jedis client dedicated to the vector index. */
