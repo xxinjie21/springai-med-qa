@@ -1,6 +1,7 @@
 package com.med.qa.config;
 
 import com.med.qa.rag.MedDocumentIngestionProperties;
+import com.med.qa.rag.MedRetrievalProperties;
 import com.med.qa.rag.MedVectorStoreProperties;
 import com.med.qa.rag.MedVectorStoreProperties.MetadataFieldSpec;
 import org.springframework.ai.embedding.BatchingStrategy;
@@ -53,6 +54,7 @@ import redis.clients.jedis.search.Schema;
 @EnableConfigurationProperties({
         MedVectorStoreProperties.class,
         MedDocumentIngestionProperties.class,
+        MedRetrievalProperties.class,
         RedisProperties.class
 })
 public class VectorStoreConfig {
