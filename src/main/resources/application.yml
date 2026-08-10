@@ -119,6 +119,16 @@ med:
       batch-size: ${MED_RAG_INGEST_BATCH_SIZE:25}
       max-content-length: ${MED_RAG_INGEST_MAX_CONTENT_LENGTH:20000}
       max-documents-per-request: ${MED_RAG_INGEST_MAX_DOCUMENTS:500}
+    # Retrieval guard rails. Similarity scoring, Top-K selection and the translation of the
+    # tenant/dept/patient tag filter into a native RediSearch query are all done by the official
+    # RedisVectorStore; these limits only bound how much evidence one consultation turn may pull
+    # into a prompt. similarity-threshold 0 is Spring AI's "accept all": a threshold tuned too high
+    # returns nothing, which a clinician cannot tell apart from "the guideline does not exist".
+    retrieval:
+      top-k: ${MED_RAG_TOP_K:4}
+      max-top-k: ${MED_RAG_MAX_TOP_K:50}
+      similarity-threshold: ${MED_RAG_SIMILARITY_THRESHOLD:0.0}
+      max-query-length: ${MED_RAG_MAX_QUERY_LENGTH:1000}
     # Embedding stage. The endpoint itself is configured through the official spring.ai.openai.*
     # block above; these two knobs are the ones the official properties cannot express: the width
     # the index is built with (cross-checked against the requested dimensions at wiring time) and
