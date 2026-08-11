@@ -138,6 +138,12 @@ med:
       encoding-type: CL100K_BASE
       max-input-token-count: ${MED_EMBEDDING_MAX_INPUT_TOKENS:8191}
       reserve-percentage: 0.1
+    # RAG question-answer advisor (Spring AI QuestionAnswerAdvisor) tuning. The advisor is built per
+    # consultation scope by MedRagAdvisorFactory; this block only sets its chain order. Retrieval
+    # Top-K, similarity threshold and the tenant/dept/patient tag isolation are governed by
+    # med.rag.retrieval.* and MedRetrievalFilters, never here.
+    advisor:
+      order: ${MED_RAG_ADVISOR_ORDER:1}
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.
