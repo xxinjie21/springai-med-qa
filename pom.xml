@@ -153,6 +153,18 @@
         </dependency>
 
         <!--
+            Spring AI official RAG advisor: QuestionAnswerAdvisor retrieves scoped documents from the
+            vector store and augments the prompt. The advisor reuses the project's MedRetrievalService
+            (Top-K, threshold) and MedRetrievalFilters (tenant/dept/patient tag isolation), so no
+            retrieval pipeline, similarity scoring or prompt stitching is hand-written. Version is
+            managed by the Spring AI BOM (1.0.0, matching the rest of the stack).
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-advisors-vector-store</artifactId>
+        </dependency>
+
+        <!--
             Spring AI OpenAI-compatible model starter. Only its embedding side is used here: it
             supplies the official OpenAiEmbeddingModel plus the canonical spring.ai.openai.*
             configuration properties (base-url, api-key, embeddings-path, options.model,
