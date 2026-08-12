@@ -8,10 +8,12 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.retry.NonTransientAiException;
 import org.springframework.ai.retry.TransientAiException;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -242,6 +244,87 @@ public class MedDocumentService {
             builder.id(request.getId());
         }
         return builder.build();
+    }
+
+    /**
+     * Removes one previously indexed document by its store identifier.
+     *
+     * @param documentId identifier assigned at ingestion, must not be blank
+     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the identifier is blank,
+     *                      {@link ErrorCode#STORAGE_ERROR} when the index delete fails
+     */
+    public void deleteById(String documentId) {
+        if (!StringUtils.hasText(documentId)) {
+            throw new BizException(ErrorCode.BAD_REQUEST, "document id must not be blank");
+        }
+        deleteByIds(List.of(documentId));
+    }
+
+    /**
+     * Removes several previously indexed documents by their store identifiers.
+     *
+     * <p>An empty list is a no-op: the vector store is never contacted, so a careless caller cannot
+     * wipe the whole index by submitting nothing.</p>
+     *
+     * @param documentIds identifiers to remove, must not be {@code null}, non-empty and hold no blank
+     *                   entry
+     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the list is null/empty or carries a
+     *                      blank id, {@link ErrorCode#STORAGE_ERROR} when the index delete fails
+     */
+    public void deleteByIds(List<String> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            throw new BizException(ErrorCode.BAD_REQUEST, "document ids must not be empty");
+        }
+        for (String id : documentIds) {
+            if (!StringUtils.hasText(id)) {
+                throw new BizException(ErrorCode.BAD_REQUEST, "document id must not be blank");
+            }
+        }
+        try {
+            vectorStore.delete(documentIds);
+        } catch (BizException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            ErrorCode errorCode = classifyFailure(ex);
+            log.error("failed to delete {} document(s) from index '{}'",
+                    documentIds.size(), storeProperties.getIndexName(), ex);
+            throw new BizException(errorCode,
+                    "failed to delete " + documentIds.size() + " document(s) from vector index '"
+                            + storeProperties.getIndexName() + "'", ex);
+        }
+    }
+
+    /**
+     * Removes every document of an isolation scope.
+     *
+     * <p>A patient-scoped delete removes only that patient's own documents (the department-wide
+     * shared documents are deliberately left untouched); a department-wide delete removes every
+     * document of the department, including the shared ones. The isolation filter is the same
+     * predicate retrieval already uses, so deletion can never widen past what the caller is entitled
+     * to.</p>
+     *
+     * @param scope tags of the documents to remove, must not be {@code null}
+     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the scope is {@code null},
+     *                      {@link ErrorCode#STORAGE_ERROR} when the index delete fails
+     */
+    public void deleteByScope(MedDocumentScope scope) {
+        if (scope == null) {
+            throw new BizException(ErrorCode.BAD_REQUEST, "document scope must not be null");
+        }
+        boolean includeShared = !scope.isPatientScoped();
+        Filter.Expression filter = MedRetrievalFilters.scope(scope, includeShared);
+        try {
+            vectorStore.delete(filter);
+        } catch (BizException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            ErrorCode errorCode = classifyFailure(ex);
+            log.error("failed to delete documents of scope {} from index '{}'",
+                    scope, storeProperties.getIndexName(), ex);
+            throw new BizException(errorCode,
+                    "failed to delete documents of scope " + scope + " from vector index '"
+                            + storeProperties.getIndexName() + "'", ex);
+        }
     }
 
     /**
