@@ -82,6 +82,13 @@ med:
   # configured here; the window is persisted through the two-tier repository (Redis + sharded MySQL).
   chat:
     max-messages: ${MED_CHAT_MAX_MESSAGES:20}
+    # SSE streaming consultation endpoint tuning. A heartbeat comment keeps a slow or quiet connection
+    # open; the timeout bounds how long an exchange may stay open before Spring closes it. Both are
+    # seconds and must be positive. The streaming model itself is enabled separately via
+    # spring.ai.model.chat plus an OpenAI-compatible API key (kept out of the repository).
+    stream:
+      heartbeat-interval-seconds: ${MED_CHAT_STREAM_HEARTBEAT:15}
+      sse-timeout-seconds: ${MED_CHAT_STREAM_TIMEOUT:120}
   # Distributed session lock (Redisson RLock). lease-time 0 keeps the watchdog in charge, so a slow
   # LLM round trip cannot lose the lock while a crashed node still releases it after the watchdog
   # timeout.
