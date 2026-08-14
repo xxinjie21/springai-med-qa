@@ -44,12 +44,14 @@ class ShardingRuleConfigTest {
     }
 
     /**
-     * Loads a ShardingSphere YAML file with the {@code !SHARDING} rule tag stripped, so it can be
-     * inspected by a plain safe SnakeYAML constructor.
+     * Loads a ShardingSphere YAML file with the {@code !SHARDING} and {@code !SINGLE} rule tags
+     * stripped, so it can be inspected by a plain safe SnakeYAML constructor. The production config
+     * carries both a sharding rule (for {@code med_message}) and a single-table rule (for
+     * {@code med_session}); the tags are only syntactic markers here, the structure is what we assert.
      */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> loadYaml(final String name) throws IOException {
-        String sanitized = readResource(name).replace("!SHARDING", "");
+        String sanitized = readResource(name).replace("!SHARDING", "").replace("!SINGLE", "");
         return (Map<String, Object>) new Yaml(new SafeConstructor(new LoaderOptions())).load(sanitized);
     }
 
@@ -57,8 +59,11 @@ class ShardingRuleConfigTest {
     private static Map<String, Object> shardingRule(final Map<String, Object> root) {
         List<Object> rules = (List<Object>) root.get("rules");
         assertNotNull(rules, "rules block missing");
-        assertEquals(1, rules.size(), "exactly one sharding rule expected");
-        return (Map<String, Object>) rules.get(0);
+        return rules.stream()
+                .map(rule -> (Map<String, Object>) rule)
+                .filter(rule -> rule.containsKey("shardingAlgorithms"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("sharding rule (with shardingAlgorithms) not found"));
     }
 
     @SuppressWarnings("unchecked")

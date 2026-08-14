@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.med.qa.mapper.ChatSessionMapper">
+
+    <resultMap id="SessionResultMap" type="com.med.qa.domain.entity.ChatSessionDO">
+        <id column="session_id" property="sessionId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="patient_id" property="patientId"/>
+        <result column="title" property="title"/>
+        <result column="status" property="status"
+                typeHandler="com.med.qa.mapper.typehandler.SessionStatusTypeHandler"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <sql id="allColumns">
+        session_id, tenant_id, dept_id, patient_id, title, status, created_at, updated_at
+    </sql>
+
+    <sql id="filterConditions">
+        WHERE tenant_id = #{tenantId}
+          AND dept_id = #{deptId}
+        <if test="patientId != null">
+            AND patient_id = #{patientId}
+        </if>
+        <if test="status != null">
+            AND status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+        </if>
+    </sql>
+
+    <insert id="insert" parameterType="com.med.qa.domain.entity.ChatSessionDO" useGeneratedKeys="false">
+        INSERT INTO med_session (
+            session_id, tenant_id, dept_id, patient_id, title, status, created_at, updated_at
+        ) VALUES (
+            #{sessionId}, #{tenantId}, #{deptId}, #{patientId}, #{title},
+            #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler},
+            #{createdAt}, #{updatedAt}
+        )
+    </insert>
+
+    <select id="selectById" resultMap="SessionResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_session
+        WHERE session_id = #{sessionId}
+    </select>
+
+    <update id="updateStatus">
+        UPDATE med_session
+        SET status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler},
+            updated_at = #{updatedAt}
+        WHERE session_id = #{sessionId}
+          AND status = #{expectedStatus, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+    </update>
+
+    <select id="selectPage" resultMap="SessionResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_session
+        <include refid="filterConditions"/>
+        ORDER BY created_at DESC, session_id DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <select id="countByCondition" resultType="long">
+        SELECT COUNT(*)
+        FROM med_session
+        <include refid="filterConditions"/>
+    </select>
+
+</mapper>

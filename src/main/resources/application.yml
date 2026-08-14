@@ -96,6 +96,13 @@ med:
     wait-time: ${MED_LOCK_WAIT_TIME:3s}
     lease-time: ${MED_LOCK_LEASE_TIME:0s}
     watchdog-timeout: ${MED_LOCK_WATCHDOG_TIMEOUT:30s}
+  # Consultation session lifecycle guard rails. The default page size and the title length cap only
+  # bound what a single listing/creation call may request: the title cap protects the VARCHAR(255)
+  # column of med_session, a page size cap keeps one listing call from sweeping a whole department.
+  session:
+    default-page-size: ${MED_SESSION_DEFAULT_PAGE_SIZE:20}
+    max-page-size: ${MED_SESSION_MAX_PAGE_SIZE:100}
+    max-title-length: ${MED_SESSION_MAX_TITLE_LENGTH:200}
   # Medical RAG vector index (Spring AI RedisVectorStore over Redis Stack / RediSearch). Only index
   # topology is configured; similarity search and Top-K selection belong to the official component.
   # The prefix must stay outside the med:chat: namespace so the index never scans cached
