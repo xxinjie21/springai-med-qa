@@ -103,6 +103,15 @@ med:
     default-page-size: ${MED_SESSION_DEFAULT_PAGE_SIZE:20}
     max-page-size: ${MED_SESSION_MAX_PAGE_SIZE:100}
     max-title-length: ${MED_SESSION_MAX_TITLE_LENGTH:200}
+  # API-key authentication and patient-session ownership enforcement (D21). The filter is enabled by
+  # default and fails closed: until API keys are mounted (per environment, never committed) every
+  # request without a valid key is rejected with 401. Local dev / offline tests set
+  # MED_SECURITY_ENABLED=false. The keys map pairs an opaque key with the principal it authenticates;
+  # here it is intentionally empty so no secret lands in the repository.
+  security:
+    enabled: ${MED_SECURITY_ENABLED:true}
+    require-auth: ${MED_SECURITY_REQUIRE_AUTH:true}
+    header-name: ${MED_SECURITY_HEADER:X-API-Key}
   # Medical RAG vector index (Spring AI RedisVectorStore over Redis Stack / RediSearch). Only index
   # topology is configured; similarity search and Top-K selection belong to the official component.
   # The prefix must stay outside the med:chat: namespace so the index never scans cached

@@ -9,6 +9,8 @@ import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.memory.cache.RedisMessageCache;
 import com.med.qa.memory.lock.SessionLockService;
+import com.med.qa.security.MedSecurityContext;
+import com.med.qa.security.PatientAccessGuard;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,6 +41,14 @@ import java.util.UUID;
  * {@code UPDATE ... WHERE status = expected} predicate of
  * {@link ChatSessionMapper#updateStatus(String, SessionStatus, SessionStatus, long)} keeps the
  * transition safe even against a writer that bypassed the lock.</p>
+ *
+ * <h2>Access control</h2>
+ * <p>When a {@link PatientAccessGuard} is present (the application context always wires one), every
+ * ownership-sensitive operation enforces the caller resolved by {@link ApiKeyAuthFilter} into the
+ * {@link MedSecurityContext}: a patient may only reach sessions whose {@code patient_id} equals their
+ * own, while staff may reach any session of their department. The guard is injected as an optional
+ * dependency so the plain (guard-less) constructor used by unit tests keeps the service behaviour
+ * unchanged.</p>
  *
  * <h2>Failure semantics</h2>
  * <ul>
@@ -72,21 +82,45 @@ public class MedChatSessionService {
 
     private final Clock clock;
 
+    @Nullable
+    private final PatientAccessGuard accessGuard;
+
     /**
-     * Creates the service used by the application context.
+     * Creates the service used by the application context, with patient-ownership enforcement.
      *
      * @param sessionMapper MyBatis mapper over {@code med_session}, must not be {@code null}
      * @param lockService   distributed session lock, must not be {@code null}
      * @param cache         Redis window cache, dropped when a session is archived, must not be
      *                      {@code null}
      * @param properties    listing and title guard rails, must not be {@code null}
+     * @param accessGuard   patient-ownership guard, must not be {@code null}
      */
     @Autowired
     public MedChatSessionService(ChatSessionMapper sessionMapper,
                                  SessionLockService lockService,
                                  RedisMessageCache cache,
-                                 MedSessionProperties properties) {
-        this(sessionMapper, lockService, cache, properties, Clock.systemUTC());
+                                 MedSessionProperties properties,
+                                 PatientAccessGuard accessGuard) {
+        this(sessionMapper, lockService, cache, properties, accessGuard, Clock.systemUTC());
+    }
+
+    /**
+     * Creates the service with an explicit clock and no ownership guard, for unit tests.
+     *
+     * @param sessionMapper MyBatis mapper over {@code med_session}, must not be {@code null}
+     * @param lockService   distributed session lock, must not be {@code null}
+     * @param cache         Redis window cache, must not be {@code null}
+     * @param properties    listing and title guard rails, must not be {@code null}
+     * @param clock         clock stamping {@code created_at} / {@code updated_at}, must not be
+     *                      {@code null}
+     * @throws IllegalArgumentException if any mandatory argument is {@code null}
+     */
+    public MedChatSessionService(ChatSessionMapper sessionMapper,
+                                 SessionLockService lockService,
+                                 RedisMessageCache cache,
+                                 MedSessionProperties properties,
+                                 Clock clock) {
+        this(sessionMapper, lockService, cache, properties, null, clock);
     }
 
     /**
@@ -96,14 +130,16 @@ public class MedChatSessionService {
      * @param lockService   distributed session lock, must not be {@code null}
      * @param cache         Redis window cache, must not be {@code null}
      * @param properties    listing and title guard rails, must not be {@code null}
+     * @param accessGuard   patient-ownership guard, or {@code null} to leave access control off
      * @param clock         clock stamping {@code created_at} / {@code updated_at}, must not be
      *                      {@code null}
-     * @throws IllegalArgumentException if any argument is {@code null}
+     * @throws IllegalArgumentException if any mandatory argument is {@code null}
      */
     public MedChatSessionService(ChatSessionMapper sessionMapper,
                                  SessionLockService lockService,
                                  RedisMessageCache cache,
                                  MedSessionProperties properties,
+                                 @Nullable PatientAccessGuard accessGuard,
                                  Clock clock) {
         if (sessionMapper == null) {
             throw new IllegalArgumentException("sessionMapper must not be null");
@@ -124,6 +160,7 @@ public class MedChatSessionService {
         this.lockService = lockService;
         this.cache = cache;
         this.properties = properties;
+        this.accessGuard = accessGuard;
         this.clock = clock;
     }
 
@@ -148,6 +185,9 @@ public class MedChatSessionService {
         requireText(tenantId, "tenantId");
         requireText(deptId, "deptId");
         requireText(patientId, "patientId");
+        if (accessGuard != null) {
+            accessGuard.assertScope(MedSecurityContext.getCurrent(), tenantId, deptId, patientId);
+        }
         String normalizedTitle = normalizeTitle(title);
 
         long now = clock.millis();
@@ -224,6 +264,9 @@ public class MedChatSessionService {
             log.warn("session {} was requested through department {}/{} but belongs to another one, "
                     + "reporting it as absent", sessionId, tenantId, deptId);
             return Optional.empty();
+        }
+        if (accessGuard != null) {
+            accessGuard.assertOwned(MedSecurityContext.getCurrent(), stored);
         }
         return Optional.of(stored);
     }
@@ -328,6 +371,10 @@ public class MedChatSessionService {
     public PageResult<ChatSessionDO> pageSessions(SessionPageQuery query) {
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");
+        }
+        if (accessGuard != null) {
+            accessGuard.assertScope(
+                    MedSecurityContext.getCurrent(), query.tenantId(), query.deptId(), query.patientId());
         }
         int size = resolvePageSize(query.size());
         long total;
