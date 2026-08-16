@@ -27,6 +27,13 @@ public class MedSecurityProperties {
     /** Whether a request without a key is rejected with {@code 401} instead of being let through. */
     private boolean requireAuth = true;
 
+    /**
+     * Whether {@link com.med.qa.security.annotation.RequireDept} is enforced by the
+     * {@code DeptScopeInterceptor} (D22). Independent of {@link #enabled}, so department-scope
+     * authorization can be silenced on its own while API-key authentication stays on.
+     */
+    private boolean deptScopeEnabled = true;
+
     /** Request header carrying the API key. */
     private String headerName = "X-API-Key";
 
@@ -53,6 +60,14 @@ public class MedSecurityProperties {
 
     public void setRequireAuth(boolean requireAuth) {
         this.requireAuth = requireAuth;
+    }
+
+    public boolean isDeptScopeEnabled() {
+        return deptScopeEnabled;
+    }
+
+    public void setDeptScopeEnabled(boolean deptScopeEnabled) {
+        this.deptScopeEnabled = deptScopeEnabled;
     }
 
     public String getHeaderName() {

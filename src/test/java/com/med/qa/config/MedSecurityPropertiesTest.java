@@ -16,11 +16,12 @@ import java.util.Map;
 class MedSecurityPropertiesTest {
 
     @Test
-    @DisplayName("ships with safe defaults: enabled, auth required, X-API-Key header, empty keys")
+    @DisplayName("ships with safe defaults: enabled, auth required, dept scope on, X-API-Key header, empty keys")
     void defaults() {
         MedSecurityProperties properties = new MedSecurityProperties();
         assertThat(properties.isEnabled()).isTrue();
         assertThat(properties.isRequireAuth()).isTrue();
+        assertThat(properties.isDeptScopeEnabled()).isTrue();
         assertThat(properties.getHeaderName()).isEqualTo("X-API-Key");
         assertThat(properties.getKeys()).isEmpty();
     }
@@ -33,6 +34,18 @@ class MedSecurityPropertiesTest {
         properties.setRequireAuth(false);
         assertThat(properties.isEnabled()).isFalse();
         assertThat(properties.isRequireAuth()).isFalse();
+    }
+
+    @Test
+    @DisplayName("department-scope enforcement toggles independently of api-key authentication")
+    void deptScopeToggleIsIndependent() {
+        MedSecurityProperties properties = new MedSecurityProperties();
+        properties.setDeptScopeEnabled(false);
+        assertThat(properties.isDeptScopeEnabled()).isFalse();
+        assertThat(properties.isEnabled()).isTrue();
+
+        properties.setDeptScopeEnabled(true);
+        assertThat(properties.isDeptScopeEnabled()).isTrue();
     }
 
     @Nested

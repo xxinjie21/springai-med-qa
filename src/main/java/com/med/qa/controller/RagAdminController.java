@@ -16,6 +16,8 @@ import com.med.qa.rag.MedDocumentScope;
 import com.med.qa.rag.MedDocumentService;
 import com.med.qa.rag.MedRetrievalQuery;
 import com.med.qa.rag.MedRetrievalService;
+import com.med.qa.security.MedRole;
+import com.med.qa.security.annotation.RequireDept;
 import org.springframework.ai.document.Document;
 import org.springframework.lang.Nullable;
 import org.springframework.util.StringUtils;
@@ -48,11 +50,17 @@ import java.util.Objects;
  * {@link ErrorCode#BAD_REQUEST}; embedding or index failures propagate as storage / LLM errors from
  * the services below.</p>
  *
- * <p>Authentication and audit are layered on by later iterations (security + audit packages); this
- * controller only owns request parsing, validation and response shaping.</p>
+ * <h2>Authorization</h2>
+ * <p>The whole corpus surface is staff-only: {@link RequireDept} with {@code roles = STAFF} refuses a
+ * patient principal (and any anonymous call) with {@code 403} before the handler runs, so a patient can
+ * never ingest, delete or preview department documents. The isolation scope itself travels inside the JSON
+ * body, which an interceptor must not consume, hence {@code required = false}: the department/patient
+ * narrowing keeps being enforced by the metadata tags of the RAG services below. Audit is layered on by a
+ * later iteration.</p>
  */
 @RestController
 @RequestMapping("/api/rag")
+@RequireDept(roles = MedRole.STAFF, required = false)
 public class RagAdminController {
 
     private final MedDocumentService documentService;

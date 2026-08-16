@@ -4,6 +4,7 @@ import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedChatStreamProperties;
 import com.med.qa.controller.dto.ChatStreamRequest;
+import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.ChatStreamService;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -38,6 +39,11 @@ import reactor.core.publisher.Flux;
  *
  * <p>The actual model call and RAG retrieval are delegated to {@link ChatStreamService}; this
  * controller owns only transport concerns (SSE framing, heartbeat, lifecycle cleanup).</p>
+ *
+ * <p>{@link RequireDept} guards the endpoint against anonymous use: the department id lives inside the
+ * JSON body, which the interceptor must not consume, so the declaration uses {@code required = false} —
+ * authentication is still mandatory, and the body scope keeps driving the RAG tenant/department/patient
+ * metadata filters.</p>
  */
 @RestController
 @RequestMapping("/api/chat")
@@ -77,6 +83,7 @@ public class ChatController {
      * @return the SSE emitter the container flushes to the client
      */
     @PostMapping(value = "/stream")
+    @RequireDept(required = false)
     public SseEmitter streamConsultation(@RequestBody ChatStreamRequest request, HttpServletResponse response) {
         try {
             request.validate();

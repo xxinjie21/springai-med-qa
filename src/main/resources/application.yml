@@ -108,9 +108,13 @@ med:
   # request without a valid key is rejected with 401. Local dev / offline tests set
   # MED_SECURITY_ENABLED=false. The keys map pairs an opaque key with the principal it authenticates;
   # here it is intentionally empty so no secret lands in the repository.
+  # dept-scope-enabled (D22) governs the @RequireDept interceptor: a caller reaching an endpoint of
+  # another department is refused with 403 before the handler runs. It is a separate switch so the
+  # declarative department check can be silenced without turning API-key authentication off.
   security:
     enabled: ${MED_SECURITY_ENABLED:true}
     require-auth: ${MED_SECURITY_REQUIRE_AUTH:true}
+    dept-scope-enabled: ${MED_SECURITY_DEPT_SCOPE_ENABLED:true}
     header-name: ${MED_SECURITY_HEADER:X-API-Key}
   # Medical RAG vector index (Spring AI RedisVectorStore over Redis Stack / RediSearch). Only index
   # topology is configured; similarity search and Top-K selection belong to the official component.

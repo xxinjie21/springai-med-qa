@@ -9,6 +9,8 @@ import com.med.qa.controller.dto.CreateSessionRequest;
 import com.med.qa.controller.dto.SessionResponse;
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
+import com.med.qa.security.annotation.DeptIdSource;
+import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.MedChatSessionService;
 import com.med.qa.service.SessionPageQuery;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,12 +32,17 @@ import java.util.List;
  * listing.
  *
  * <h2>Scope handling</h2>
- * <p>Every operation takes the {@code tenantId} / {@code deptId} scope from the request because
- * authentication and patient-ownership enforcement arrive in a later iteration (the security package).
- * The scope is only validated for non-blankness here; the {@link MedChatSessionService} enforces the
- * isolation semantics (a session requested through the wrong department is reported as absent, never as
- * "exists elsewhere"). This controller performs no session row, message or lock mutation of its own —
- * all of that lives behind the service.</p>
+ * <p>Every operation takes the {@code tenantId} / {@code deptId} scope from the request. The scope is
+ * validated for non-blankness here and authorized declaratively by {@link RequireDept} (D22): a caller
+ * asking for another department is refused with {@code 403} before the handler body runs. The
+ * {@link MedChatSessionService} then enforces the row-level isolation semantics (a session requested
+ * through the wrong department is reported as absent, never as "exists elsewhere") and the patient
+ * ownership rule. This controller performs no session row, message or lock mutation of its own — all of
+ * that lives behind the service.</p>
+ *
+ * <p>{@link #create(CreateSessionRequest)} carries its scope inside the JSON body, which an interceptor
+ * must not consume; it is therefore annotated with {@code required = false}, so only authentication and
+ * role are checked up front and the body scope is authorized by the service layer.</p>
  *
  * <h2>Validation</h2>
  * <p>Malformed or under-specified requests are rejected with {@link ErrorCode#BAD_REQUEST}. The service
@@ -70,6 +77,7 @@ public class SessionController {
      * @throws BizException {@link ErrorCode#BAD_REQUEST} on a null or malformed request
      */
     @PostMapping
+    @RequireDept(required = false)
     public ApiResult<SessionResponse> create(@RequestBody @Nullable CreateSessionRequest request) {
         if (request == null) {
             throw new BizException(ErrorCode.BAD_REQUEST, "create session request must not be null");
@@ -94,6 +102,7 @@ public class SessionController {
      * @throws BizException {@link ErrorCode#BAD_REQUEST} when the scope is blank
      */
     @GetMapping("/{sessionId}")
+    @RequireDept(source = DeptIdSource.QUERY)
     public ApiResult<SessionResponse> get(@PathVariable String sessionId,
                                          @RequestParam String tenantId,
                                          @RequestParam String deptId) {
@@ -114,6 +123,7 @@ public class SessionController {
      *                      {@link ErrorCode#SESSION_LOCKED} when busy
      */
     @PostMapping("/{sessionId}/close")
+    @RequireDept(source = DeptIdSource.QUERY)
     public ApiResult<SessionResponse> close(@PathVariable String sessionId,
                                            @RequestParam String tenantId,
                                            @RequestParam String deptId) {
@@ -134,6 +144,7 @@ public class SessionController {
      *                      {@link ErrorCode#SESSION_LOCKED} when busy
      */
     @PostMapping("/{sessionId}/archive")
+    @RequireDept(source = DeptIdSource.QUERY)
     public ApiResult<SessionResponse> archive(@PathVariable String sessionId,
                                              @RequestParam String tenantId,
                                              @RequestParam String deptId) {
@@ -159,6 +170,7 @@ public class SessionController {
      *                      page size that is too large
      */
     @GetMapping
+    @RequireDept(source = DeptIdSource.QUERY)
     public ApiResult<PageResult<SessionResponse>> list(
             @RequestParam String tenantId,
             @RequestParam String deptId,
