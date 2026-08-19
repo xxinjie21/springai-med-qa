@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.med.qa.mapper.AuditLogMapper">
+
+    <resultMap id="AuditLogResultMap" type="com.med.qa.domain.entity.AuditLogDO">
+        <id column="audit_id" property="auditId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="operator_id" property="operatorId"/>
+        <result column="operator_role" property="operatorRole"/>
+        <result column="action" property="action"/>
+        <result column="resource_type" property="resourceType"/>
+        <result column="resource_id" property="resourceId"/>
+        <result column="outcome" property="outcome"
+                typeHandler="com.med.qa.mapper.typehandler.AuditOutcomeTypeHandler"/>
+        <result column="error_code" property="errorCode"/>
+        <result column="latency_millis" property="latencyMillis"/>
+        <result column="message" property="message"/>
+        <result column="created_at" property="createdAt"/>
+    </resultMap>
+
+    <sql id="allColumns">
+        audit_id, tenant_id, dept_id, operator_id, operator_role, action, resource_type,
+        resource_id, outcome, error_code, latency_millis, message, created_at
+    </sql>
+
+    <sql id="filterConditions">
+        WHERE tenant_id = #{tenantId}
+          AND dept_id = #{deptId}
+        <if test="operatorId != null">
+            AND operator_id = #{operatorId}
+        </if>
+        <if test="action != null">
+            AND action = #{action}
+        </if>
+        <if test="outcome != null">
+            AND outcome = #{outcome, typeHandler=com.med.qa.mapper.typehandler.AuditOutcomeTypeHandler}
+        </if>
+    </sql>
+
+    <insert id="insert" parameterType="com.med.qa.domain.entity.AuditLogDO" useGeneratedKeys="false">
+        INSERT INTO med_audit_log (
+            audit_id, tenant_id, dept_id, operator_id, operator_role, action, resource_type,
+            resource_id, outcome, error_code, latency_millis, message, created_at
+        ) VALUES (
+            #{auditId}, #{tenantId}, #{deptId}, #{operatorId}, #{operatorRole}, #{action},
+            #{resourceType}, #{resourceId},
+            #{outcome, typeHandler=com.med.qa.mapper.typehandler.AuditOutcomeTypeHandler},
+            #{errorCode}, #{latencyMillis}, #{message}, #{createdAt}
+        )
+    </insert>
+
+    <select id="selectById" resultMap="AuditLogResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_audit_log
+        WHERE audit_id = #{auditId}
+    </select>
+
+    <select id="selectPage" resultMap="AuditLogResultMap">
+        SELECT <include refid="allColumns"/>
+        FROM med_audit_log
+        <include refid="filterConditions"/>
+        ORDER BY created_at DESC, audit_id DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <select id="countByCondition" resultType="long">
+        SELECT COUNT(*)
+        FROM med_audit_log
+        <include refid="filterConditions"/>
+    </select>
+
+</mapper>

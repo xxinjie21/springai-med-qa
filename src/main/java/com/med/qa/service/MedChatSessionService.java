@@ -9,6 +9,7 @@ import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.memory.cache.RedisMessageCache;
 import com.med.qa.memory.lock.SessionLockService;
+import com.med.qa.audit.annotation.MedAudit;
 import com.med.qa.security.MedSecurityContext;
 import com.med.qa.security.PatientAccessGuard;
 import org.slf4j.Logger;
@@ -180,6 +181,7 @@ public class MedChatSessionService {
      *                                  {@link MedSessionProperties#getMaxTitleLength()};
      *                                  {@link ErrorCode#STORAGE_ERROR} when the insert fails
      */
+    @MedAudit(action = "SESSION_CREATE", resourceType = "SESSION", target = "#result.sessionId")
     public ChatSessionDO createSession(String tenantId, String deptId, String patientId,
                                        @Nullable String title) {
         requireText(tenantId, "tenantId");
@@ -227,6 +229,7 @@ public class MedChatSessionService {
      *                                  this department; {@link ErrorCode#STORAGE_ERROR} on a MySQL
      *                                  failure
      */
+    @MedAudit(action = "SESSION_VIEW", resourceType = "SESSION", target = "#sessionId")
     public ChatSessionDO getSession(String tenantId, String deptId, String sessionId) {
         return findSession(tenantId, deptId, sessionId)
                 .orElseThrow(() -> new BizException(ErrorCode.NOT_FOUND,
@@ -246,6 +249,7 @@ public class MedChatSessionService {
      * @throws IllegalArgumentException if an identity segment is blank
      * @throws BizException             {@link ErrorCode#STORAGE_ERROR} on a MySQL failure
      */
+    @MedAudit(action = "SESSION_VIEW", resourceType = "SESSION", target = "#sessionId")
     public Optional<ChatSessionDO> findSession(String tenantId, String deptId, String sessionId) {
         requireText(tenantId, "tenantId");
         requireText(deptId, "deptId");
@@ -312,6 +316,7 @@ public class MedChatSessionService {
      *                                  {@link ErrorCode#SESSION_LOCKED} when busy,
      *                                  {@link ErrorCode#STORAGE_ERROR} on a MySQL failure
      */
+    @MedAudit(action = "SESSION_CLOSE", resourceType = "SESSION", target = "#sessionId")
     public ChatSessionDO closeSession(String tenantId, String deptId, String sessionId) {
         return lockService.executeLocked(tenantId, deptId, sessionId, () -> {
             ChatSessionDO session = getSession(tenantId, deptId, sessionId);
@@ -344,6 +349,7 @@ public class MedChatSessionService {
      *                                  {@link ErrorCode#STORAGE_ERROR} when MySQL fails or the cached
      *                                  window could not be dropped
      */
+    @MedAudit(action = "SESSION_ARCHIVE", resourceType = "SESSION", target = "#sessionId")
     public ChatSessionDO archiveSession(String tenantId, String deptId, String sessionId) {
         return lockService.executeLocked(tenantId, deptId, sessionId, () -> {
             ChatSessionDO session = getSession(tenantId, deptId, sessionId);
@@ -368,6 +374,7 @@ public class MedChatSessionService {
      *                                  {@link MedSessionProperties#getMaxPageSize()};
      *                                  {@link ErrorCode#STORAGE_ERROR} on a MySQL failure
      */
+    @MedAudit(action = "SESSION_LIST", resourceType = "SESSION")
     public PageResult<ChatSessionDO> pageSessions(SessionPageQuery query) {
         if (query == null) {
             throw new IllegalArgumentException("query must not be null");

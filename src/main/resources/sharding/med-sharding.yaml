@@ -37,12 +37,14 @@ rules:
         props:
           sharding-count: 16
 
-  # Sessions live in one non-sharded table. The SINGLE rule lets ShardingSphere manage it on med_ds
-  # (routing and metadata) alongside the sharded med_message tables; defaultDataSource ensures any
-  # future unconfigured table still resolves instead of failing with "table not found".
+  # Sessions and the audit trail live in non-sharded tables. The SINGLE rule lets ShardingSphere
+  # manage them on med_ds (routing and metadata) alongside the sharded med_message tables;
+  # defaultDataSource ensures any future unconfigured table still resolves instead of failing with
+  # "table not found".
   - !SINGLE
     tables:
       - med_ds.med_session
+      - med_ds.med_audit_log
     defaultDataSource: med_ds
 
 props:

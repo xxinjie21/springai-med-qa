@@ -17,6 +17,7 @@ import com.med.qa.rag.MedDocumentService;
 import com.med.qa.rag.MedRetrievalQuery;
 import com.med.qa.rag.MedRetrievalService;
 import com.med.qa.security.MedRole;
+import com.med.qa.audit.annotation.MedAudit;
 import com.med.qa.security.annotation.RequireDept;
 import org.springframework.ai.document.Document;
 import org.springframework.lang.Nullable;
@@ -86,6 +87,7 @@ public class RagAdminController {
      * @return the number of indexed documents and their store identifiers
      * @throws BizException {@link ErrorCode#BAD_REQUEST} on a missing/empty batch or an invalid item
      */
+    @MedAudit(action = "RAG_DOCUMENT_INGEST", resourceType = "RAG_DOCUMENT")
     @PostMapping("/documents/ingest")
     public ApiResult<RagIngestResponse> ingest(@RequestBody @Nullable RagIngestRequest request) {
         if (request == null || request.documents() == null || request.documents().isEmpty()) {
@@ -110,6 +112,7 @@ public class RagAdminController {
      * @return a receipt describing what was deleted
      * @throws BizException {@link ErrorCode#BAD_REQUEST} when neither ids nor a scope are present
      */
+    @MedAudit(action = "RAG_DOCUMENT_DELETE", resourceType = "RAG_DOCUMENT", target = "#request.ids")
     @PostMapping("/documents/delete")
     public ApiResult<RagDeleteResponse> delete(@RequestBody @Nullable RagDeleteRequest request) {
         if (request == null) {
@@ -141,6 +144,7 @@ public class RagAdminController {
      * @return the matched documents, best first
      * @throws BizException {@link ErrorCode#BAD_REQUEST} on a missing text or scope
      */
+    @MedAudit(action = "RAG_DOCUMENT_SEARCH", resourceType = "RAG_DOCUMENT")
     @PostMapping("/documents/search")
     public ApiResult<RagSearchPreviewResponse> searchPreview(
             @RequestBody @Nullable RagSearchPreviewRequest request) {

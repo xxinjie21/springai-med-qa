@@ -58,6 +58,17 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
 
+        <!--
+            Spring AOP + AspectJ weaving, backing the declarative @MedAudit audit trail (and, from
+            D25 on, the @RateLimit annotation). The official starter brings the proxy infrastructure
+            and the SpEL-based target expressions, so no interception, latency measurement or
+            annotation scanning is hand-written. Version managed by the Spring Boot BOM.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>

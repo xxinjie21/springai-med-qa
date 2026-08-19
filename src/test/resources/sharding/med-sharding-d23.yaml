@@ -1,0 +1,42 @@
+# Test-only mirror of src/main/resources/sharding/med-sharding.yaml for the D23 audit-mapper test.
+#
+# The sharding rules for med_message (16 actual data nodes, session_id sharding column, MED_CRC32_MOD
+# algorithm) are byte-for-byte identical to production; only the underlying data source is swapped for
+# an in-memory H2 schema so routing can be verified without a running MySQL instance. The SINGLE rule
+# routes the non-sharded med_session and med_audit_log tables to the same H2 data source, exactly as
+# production does (the audit trail is unsharded for index-backed time-window reviews, like med_session).
+
+databaseName: med_qa_d23
+
+dataSources:
+  med_ds:
+    dataSourceClassName: com.zaxxer.hikari.HikariDataSource
+    driverClassName: org.h2.Driver
+    jdbcUrl: jdbc:h2:mem:med_qa_d23;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: ''
+    maximumPoolSize: 4
+
+rules:
+  - !SHARDING
+    tables:
+      med_message:
+        actualDataNodes: med_ds.med_message_${0..15}
+        tableStrategy:
+          standard:
+            shardingColumn: session_id
+            shardingAlgorithmName: med_message_crc32_mod
+    shardingAlgorithms:
+      med_message_crc32_mod:
+        type: MED_CRC32_MOD
+        props:
+          sharding-count: 16
+
+  - !SINGLE
+    tables:
+      - med_ds.med_session
+      - med_ds.med_audit_log
+    defaultDataSource: med_ds
+
+props:
+  sql-show: false
