@@ -32,7 +32,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 @TestPropertySource(properties = {
         "spring.flyway.enabled=false",
-        "med.security.enabled=false"
+        "med.security.enabled=false",
+        "med.rate-limit.enabled=false"
 })
 class ChatControllerTest {
 

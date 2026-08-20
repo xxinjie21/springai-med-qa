@@ -9,6 +9,7 @@ import com.med.qa.controller.dto.CreateSessionRequest;
 import com.med.qa.controller.dto.SessionResponse;
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
+import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.DeptIdSource;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.MedChatSessionService;
@@ -78,6 +79,7 @@ public class SessionController {
      */
     @PostMapping
     @RequireDept(required = false)
+    @RateLimit(rate = 20, durationSeconds = 1)
     public ApiResult<SessionResponse> create(@RequestBody @Nullable CreateSessionRequest request) {
         if (request == null) {
             throw new BizException(ErrorCode.BAD_REQUEST, "create session request must not be null");

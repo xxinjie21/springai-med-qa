@@ -4,6 +4,7 @@ import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedChatStreamProperties;
 import com.med.qa.controller.dto.ChatStreamRequest;
+import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.ChatStreamService;
 import jakarta.servlet.http.HttpServletResponse;
@@ -84,6 +85,7 @@ public class ChatController {
      */
     @PostMapping(value = "/stream")
     @RequireDept(required = false)
+    @RateLimit(rate = 5, durationSeconds = 1)
     public SseEmitter streamConsultation(@RequestBody ChatStreamRequest request, HttpServletResponse response) {
         try {
             request.validate();

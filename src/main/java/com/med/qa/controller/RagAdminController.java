@@ -18,6 +18,7 @@ import com.med.qa.rag.MedRetrievalQuery;
 import com.med.qa.rag.MedRetrievalService;
 import com.med.qa.security.MedRole;
 import com.med.qa.audit.annotation.MedAudit;
+import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.RequireDept;
 import org.springframework.ai.document.Document;
 import org.springframework.lang.Nullable;
@@ -88,6 +89,7 @@ public class RagAdminController {
      * @throws BizException {@link ErrorCode#BAD_REQUEST} on a missing/empty batch or an invalid item
      */
     @MedAudit(action = "RAG_DOCUMENT_INGEST", resourceType = "RAG_DOCUMENT")
+    @RateLimit(rate = 10, durationSeconds = 1)
     @PostMapping("/documents/ingest")
     public ApiResult<RagIngestResponse> ingest(@RequestBody @Nullable RagIngestRequest request) {
         if (request == null || request.documents() == null || request.documents().isEmpty()) {

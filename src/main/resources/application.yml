@@ -131,6 +131,20 @@ med:
     max-resource-type-length: ${MED_AUDIT_MAX_RESOURCE_TYPE_LENGTH:32}
     max-resource-id-length: ${MED_AUDIT_MAX_RESOURCE_ID_LENGTH:128}
     max-message-length: ${MED_AUDIT_MAX_MESSAGE_LENGTH:500}
+  # Annotation-driven rate limiting (D25): per-caller, per-endpoint buckets backed by Redisson's
+  # distributed RRateLimiter. enabled defaults to true; the offline test suite and local dev set
+  # MED_RATE_LIMIT_ENABLED=false so the @RateLimit advice becomes a pass-through and never touches Redis.
+  # key-prefix isolates the limiter keys from the med:chat: cache namespace and the med:lock: keys. Each
+  # endpoint maps to its own bucket keyed by caller dimension (patient id, tenant id, or a SpEL key), so
+  # one noisy patient cannot starve another. acquire-timeout-millis 0 rejects immediately when no permit
+  # is free; default-rate / default-duration-seconds back the annotation when it omits rate()/durationSeconds().
+  rate-limit:
+    enabled: ${MED_RATE_LIMIT_ENABLED:true}
+    order: ${MED_RATE_LIMIT_ORDER:50}
+    key-prefix: ${MED_RATE_LIMIT_KEY_PREFIX:med:ratelimit:}
+    acquire-timeout-millis: ${MED_RATE_LIMIT_ACQUIRE_TIMEOUT:0}
+    default-rate: ${MED_RATE_LIMIT_DEFAULT_RATE:10}
+    default-duration-seconds: ${MED_RATE_LIMIT_DEFAULT_DURATION:1}
   # Medical RAG vector index (Spring AI RedisVectorStore over Redis Stack / RediSearch). Only index
   # topology is configured; similarity search and Top-K selection belong to the official component.
   # The prefix must stay outside the med:chat: namespace so the index never scans cached
