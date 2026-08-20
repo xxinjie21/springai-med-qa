@@ -28,6 +28,7 @@
         <shardingsphere.version>5.5.2</shardingsphere.version>
         <redisson.version>3.45.1</redisson.version>
         <spring-ai.version>1.0.0</spring-ai.version>
+        <hutool.version>5.8.37</hutool.version>
     </properties>
 
     <dependencyManagement>
@@ -190,6 +191,17 @@
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
+        </dependency>
+
+        <!--
+            Field desensitization (D24): the @Desensitize annotation delegates masking to the
+            maintained Hutool DesensitizedUtil, so no mask patterns are hand-written. Version pinned
+            to the 5.8.x GA line; the Spring Boot BOM does not manage Hutool.
+        -->
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-core</artifactId>
+            <version>${hutool.version}</version>
         </dependency>
     </dependencies>
 
