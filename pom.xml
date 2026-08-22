@@ -230,6 +230,20 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <!--
+                    D27: emit a LAYERED executable jar so the Dockerfile can explode it into
+                    dependencies / spring-boot-loader / snapshot-dependencies / application
+                    directories (via the Spring Boot 3.x `tools` jarmode extract command, run with
+                    the layers option) and copy them as separate, cache-friendly image layers.
+                    Layering is the default in Boot 3.x;
+                    it is pinned explicitly here so it cannot be silently turned off and quietly
+                    break the container build's layer caching.
+                -->
+                <configuration>
+                    <layers>
+                        <enabled>true</enabled>
+                    </layers>
+                </configuration>
             </plugin>
 
             <plugin>

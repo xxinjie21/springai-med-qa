@@ -1,0 +1,55 @@
+# Build context exclusions for the D27 multi-stage image.
+#
+# The image compiles from source inside the builder stage, so nothing that is
+# generated locally, machine-specific or secret should ever enter the context.
+# A smaller context also means faster `docker build` uploads and fewer spurious
+# cache invalidations.
+
+# Local build output -- the builder stage runs `mvnw clean package` itself.
+target/
+
+# Version control and CI metadata (not needed to compile or run).
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# WorkBuddy local workspace data: never ship into the image.
+.workbuddy/
+
+# Maven wrapper scratch dirs (the wrapper jar/properties themselves ARE needed).
+.mvn/.develocity/
+.mvn/.gradle-enterprise/
+
+# IDE metadata
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+.springBeans
+.sts4-cache
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local env / secrets -- must never be baked into an image layer.
+.env
+*.local
+application-local.yml
+
+# Docs and local-only stack definitions
+README.md
+ROADMAP.md
+LICENSE
+docker-compose.yml
+Dockerfile
+.dockerignore
