@@ -29,6 +29,13 @@
         <redisson.version>3.45.1</redisson.version>
         <spring-ai.version>1.0.0</spring-ai.version>
         <hutool.version>5.8.37</hutool.version>
+        <!--
+            SpringDoc OpenAPI 2.8.x is the GA line that supports Spring Boot 3.4 / Spring Framework
+            6.2. Earlier 2.5.x releases break at runtime with a NoSuchMethodError on
+            ControllerAdviceBean, so 2.8.x is the only safe choice for this stack. The Boot BOM does
+            not manage SpringDoc, hence the explicit version.
+        -->
+        <springdoc.version>2.8.5</springdoc.version>
     </properties>
 
     <dependencyManagement>
@@ -202,6 +209,19 @@
             <groupId>cn.hutool</groupId>
             <artifactId>hutool-core</artifactId>
             <version>${hutool.version}</version>
+        </dependency>
+
+        <!--
+            API documentation (D26): SpringDoc OpenAPI generates the OpenAPI 3 description and Swagger
+            UI straight from the controllers and DTOs at runtime, so no HTML or doc scaffolding is
+            hand-written. The starter pulls in swagger-ui and the webmvc integration; the Boot BOM does
+            not manage it, so the version is pinned via the springdoc.version property. All docs are
+            derived from annotations + this project's MedOpenApiProperties; no extra middleware.
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
         </dependency>
     </dependencies>
 

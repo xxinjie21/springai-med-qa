@@ -2,6 +2,7 @@ package com.med.qa.controller.dto;
 
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
+import io.swagger.v3.oas.annotations.media.Schema;
 import org.springframework.lang.Nullable;
 import org.springframework.util.StringUtils;
 
@@ -19,12 +20,16 @@ import org.springframework.util.StringUtils;
  * before any streaming or model call begins.</p>
  */
 public record ChatStreamRequest(
-        String tenant,
-        String dept,
-        String session,
-        @Nullable String patientId,
+        @Schema(description = "hospital / tenant identifier", example = "t-1001") String tenant,
+        @Schema(description = "department identifier", example = "dept-cardio") String dept,
+        @Schema(description = "consultation session identifier", example = "sess-9f2c1a") String session,
+        @Schema(description = "patient identifier, or null for department-wide retrieval",
+            example = "pat-7731") @Nullable String patientId,
+        @Schema(description = "patient's question", example = "Can I take ibuprofen with my ACE inhibitor?")
         String message,
+        @Schema(description = "whether department-wide documents take part, or null for default (true)")
         @Nullable Boolean includeSharedDocuments,
+        @Schema(description = "retrieval document count, or null for the configured default", example = "4")
         @Nullable Integer topK) {
 
     /**

@@ -7,6 +7,8 @@ import com.med.qa.controller.dto.ChatStreamRequest;
 import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.ChatStreamService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,6 +51,9 @@ import reactor.core.publisher.Flux;
 @RestController
 @RequestMapping("/api/chat")
 @EnableConfigurationProperties(MedChatStreamProperties.class)
+@Tag(name = "Consultation Chat", description = "Streaming AI consultation over Server-Sent Events. "
+        + "Requires an API key; the patient/tenant/dept scope from the request body drives the RAG "
+        + "tenant/department/patient metadata filters.")
 public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
@@ -83,9 +88,14 @@ public class ChatController {
      * @param response the servlet response, used to set a {@code 400} status on a rejected request
      * @return the SSE emitter the container flushes to the client
      */
-    @PostMapping(value = "/stream")
+    @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     @RequireDept(required = false)
     @RateLimit(rate = 5, durationSeconds = 1)
+    @Operation(summary = "Stream a consultation answer",
+            description = "Opens a text/event-stream and pushes the assistant's answer chunk by chunk, "
+                    + "with a periodic heartbeat. The tenant/dept/session identity and the patient's "
+                    + "question drive RAG retrieval. A malformed request is rejected with a single SSE "
+                    + "error event and HTTP 400 before the stream opens.")
     public SseEmitter streamConsultation(@RequestBody ChatStreamRequest request, HttpServletResponse response) {
         try {
             request.validate();

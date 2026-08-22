@@ -20,6 +20,8 @@ import com.med.qa.security.MedRole;
 import com.med.qa.audit.annotation.MedAudit;
 import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.RequireDept;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.ai.document.Document;
 import org.springframework.lang.Nullable;
 import org.springframework.util.StringUtils;
@@ -63,6 +65,9 @@ import java.util.Objects;
 @RestController
 @RequestMapping("/api/rag")
 @RequireDept(roles = MedRole.STAFF, required = false)
+@Tag(name = "RAG Administration", description = "Staff-only management of the medical RAG corpus: "
+        + "document ingestion, deletion and tag-scoped similarity-search preview. Isolation is enforced "
+        + "exclusively by tenant/dept/patient metadata tags; the query text is never parsed.")
 public class RagAdminController {
 
     private final MedDocumentService documentService;
@@ -91,6 +96,9 @@ public class RagAdminController {
     @MedAudit(action = "RAG_DOCUMENT_INGEST", resourceType = "RAG_DOCUMENT")
     @RateLimit(rate = 10, durationSeconds = 1)
     @PostMapping("/documents/ingest")
+    @Operation(summary = "Ingest documents into the RAG corpus",
+            description = "Indexes one or more medical documents (verbatim) tagged with their "
+                    + "tenant/dept/patient scope. Staff only.")
     public ApiResult<RagIngestResponse> ingest(@RequestBody @Nullable RagIngestRequest request) {
         if (request == null || request.documents() == null || request.documents().isEmpty()) {
             throw new BizException(ErrorCode.BAD_REQUEST,
@@ -116,6 +124,9 @@ public class RagAdminController {
      */
     @MedAudit(action = "RAG_DOCUMENT_DELETE", resourceType = "RAG_DOCUMENT", target = "#request.ids")
     @PostMapping("/documents/delete")
+    @Operation(summary = "Delete documents from the RAG corpus",
+            description = "Removes documents by id list or by isolation scope. When both are supplied, "
+                    + "ids take precedence. Staff only.")
     public ApiResult<RagDeleteResponse> delete(@RequestBody @Nullable RagDeleteRequest request) {
         if (request == null) {
             throw new BizException(ErrorCode.BAD_REQUEST, "delete request must not be null");
@@ -148,6 +159,10 @@ public class RagAdminController {
      */
     @MedAudit(action = "RAG_DOCUMENT_SEARCH", resourceType = "RAG_DOCUMENT")
     @PostMapping("/documents/search")
+    @Operation(summary = "Preview a tag-scoped similarity search",
+            description = "Runs a tenant/dept-scoped vector search and returns the matched documents "
+                    + "best first. The query text is embedded verbatim; topK and similarity threshold "
+                    + "fall back to the configured guard rails when omitted. Staff only.")
     public ApiResult<RagSearchPreviewResponse> searchPreview(
             @RequestBody @Nullable RagSearchPreviewRequest request) {
         if (request == null || !StringUtils.hasText(request.text())) {

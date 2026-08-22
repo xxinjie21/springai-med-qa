@@ -1,5 +1,6 @@
 package com.med.qa.controller.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
 import org.springframework.lang.Nullable;
 
 /**
@@ -20,11 +21,17 @@ import org.springframework.lang.Nullable;
  * @param includeSharedDocuments whether department-wide documents take part in the retrieval,
  *                               or {@code null} to use the default ({@code true})
  */
-public record RagSearchPreviewRequest(String text,
-                                      String tenantId,
-                                      String deptId,
-                                      @Nullable String patientId,
-                                      @Nullable Integer topK,
-                                      @Nullable Double similarityThreshold,
-                                      @Nullable Boolean includeSharedDocuments) {
+public record RagSearchPreviewRequest(
+        @Schema(description = "question or passage to match, embedded verbatim", example = "ACE inhibitor monitoring")
+        String text,
+        @Schema(description = "hospital / tenant identifier", example = "t-1001") String tenantId,
+        @Schema(description = "department identifier", example = "dept-cardio") String deptId,
+        @Schema(description = "patient identifier, or null for department-wide", example = "pat-7731")
+        @Nullable String patientId,
+        @Schema(description = "documents to return, or null for the configured default", example = "5")
+        @Nullable Integer topK,
+        @Schema(description = "minimum similarity in [0, 1], or null for the configured default",
+            example = "0.0") @Nullable Double similarityThreshold,
+        @Schema(description = "whether department-wide documents take part, or null for default (true)")
+        @Nullable Boolean includeSharedDocuments) {
 }

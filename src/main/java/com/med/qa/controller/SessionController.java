@@ -14,6 +14,9 @@ import com.med.qa.security.annotation.DeptIdSource;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.MedChatSessionService;
 import com.med.qa.service.SessionPageQuery;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.lang.Nullable;
@@ -54,6 +57,9 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/sessions")
 @EnableConfigurationProperties(MedSessionProperties.class)
+@Tag(name = "Session Lifecycle", description = "Consultation session creation, lookup, close, archive "
+        + "and paged listing. Every operation is scoped to a tenant/department and authorized by the "
+        + "@RequireDept interceptor and the patient-ownership guard.")
 public class SessionController {
 
     private final MedChatSessionService sessionService;
@@ -80,6 +86,9 @@ public class SessionController {
     @PostMapping
     @RequireDept(required = false)
     @RateLimit(rate = 20, durationSeconds = 1)
+    @Operation(summary = "Open a new consultation session",
+            description = "Creates a session in the ACTIVE state within exactly one tenant, department "
+                    + "and patient. The title is optional.")
     public ApiResult<SessionResponse> create(@RequestBody @Nullable CreateSessionRequest request) {
         if (request == null) {
             throw new BizException(ErrorCode.BAD_REQUEST, "create session request must not be null");
@@ -105,9 +114,12 @@ public class SessionController {
      */
     @GetMapping("/{sessionId}")
     @RequireDept(source = DeptIdSource.QUERY)
-    public ApiResult<SessionResponse> get(@PathVariable String sessionId,
-                                         @RequestParam String tenantId,
-                                         @RequestParam String deptId) {
+    @Operation(summary = "Get one session",
+            description = "Loads a single session by id within its tenant/department. An unknown or "
+                    + "out-of-scope session is reported as absent, never as existing elsewhere.")
+    public ApiResult<SessionResponse> get(@Parameter(description = "consultation session id") @PathVariable String sessionId,
+                                         @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+                                         @Parameter(description = "department id") @RequestParam String deptId) {
         requireScope(tenantId, deptId);
         ChatSessionDO session = sessionService.getSession(tenantId, deptId, sessionId);
         return ApiResult.ok(SessionResponse.from(session));
@@ -126,9 +138,12 @@ public class SessionController {
      */
     @PostMapping("/{sessionId}/close")
     @RequireDept(source = DeptIdSource.QUERY)
-    public ApiResult<SessionResponse> close(@PathVariable String sessionId,
-                                           @RequestParam String tenantId,
-                                           @RequestParam String deptId) {
+    @Operation(summary = "Close a session",
+            description = "Marks an ACTIVE session CLOSED so it stops accepting messages. Idempotent; "
+                    + "an archived session cannot be closed.")
+    public ApiResult<SessionResponse> close(@Parameter(description = "consultation session id") @PathVariable String sessionId,
+                                           @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+                                           @Parameter(description = "department id") @RequestParam String deptId) {
         requireScope(tenantId, deptId);
         ChatSessionDO session = sessionService.closeSession(tenantId, deptId, sessionId);
         return ApiResult.ok(SessionResponse.from(session));
@@ -147,9 +162,12 @@ public class SessionController {
      */
     @PostMapping("/{sessionId}/archive")
     @RequireDept(source = DeptIdSource.QUERY)
-    public ApiResult<SessionResponse> archive(@PathVariable String sessionId,
-                                             @RequestParam String tenantId,
-                                             @RequestParam String deptId) {
+    @Operation(summary = "Archive a session",
+            description = "Marks a session ARCHIVED as cold data, evicting its cached message window. "
+                    + "Idempotent.")
+    public ApiResult<SessionResponse> archive(@Parameter(description = "consultation session id") @PathVariable String sessionId,
+                                             @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+                                             @Parameter(description = "department id") @RequestParam String deptId) {
         requireScope(tenantId, deptId);
         ChatSessionDO session = sessionService.archiveSession(tenantId, deptId, sessionId);
         return ApiResult.ok(SessionResponse.from(session));
@@ -173,13 +191,17 @@ public class SessionController {
      */
     @GetMapping
     @RequireDept(source = DeptIdSource.QUERY)
+    @Operation(summary = "List sessions",
+            description = "Returns one page of a department's sessions, newest first. May be narrowed "
+                    + "to one patient and/or one lifecycle status; an out-of-range page yields an empty "
+                    + "page with the real total.")
     public ApiResult<PageResult<SessionResponse>> list(
-            @RequestParam String tenantId,
-            @RequestParam String deptId,
-            @RequestParam(required = false) @Nullable String patientId,
-            @RequestParam(required = false) @Nullable SessionStatus status,
-            @RequestParam(defaultValue = "1") int page,
-            @RequestParam(required = false) @Nullable Integer size) {
+            @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+            @Parameter(description = "department id") @RequestParam String deptId,
+            @Parameter(description = "optional patient filter") @RequestParam(required = false) @Nullable String patientId,
+            @Parameter(description = "optional lifecycle-status filter") @RequestParam(required = false) @Nullable SessionStatus status,
+            @Parameter(description = "one-based page number") @RequestParam(defaultValue = "1") int page,
+            @Parameter(description = "requested page size, or null for the configured default") @RequestParam(required = false) @Nullable Integer size) {
         requireScope(tenantId, deptId);
         SessionPageQuery query;
         try {

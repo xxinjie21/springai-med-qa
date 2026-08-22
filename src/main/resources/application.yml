@@ -72,6 +72,20 @@ spring:
         max-interval: 10s
       on-client-errors: false
 
+# SpringDoc OpenAPI (D26): generates the OpenAPI 3 document + Swagger UI from the controllers at
+# runtime. The docs endpoints are served under /v3/api-docs and /swagger-ui.html; the internal
+# Spring-AI / actuator routes are not documented. try-it-out is enabled so clinicians can exercise
+# the API directly from the browser.
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+    try-it-out-enabled: true
+    persist-authorization: true
+
 # Conversation memory cache tuning; MySQL stays the source of truth so these values only
 # trade Redis footprint against read amplification.
 med:
@@ -200,6 +214,26 @@ med:
     # med.rag.retrieval.* and MedRetrievalFilters, never here.
     advisor:
       order: ${MED_RAG_ADVISOR_ORDER:1}
+  # Generated API documentation (D26). The api-key-header mirrors med.security.header-name so the
+  # Swagger UI "Authorize" button uses the exact header the ApiKeyAuthFilter enforces. The three
+  # group paths split the surface into chat / session / rag dropdowns in Swagger UI.
+  openapi:
+    enabled: ${MED_OPENAPI_ENABLED:true}
+    title: ${MED_OPENAPI_TITLE:Med-QA Hospital AI Consultation API}
+    description: "${MED_OPENAPI_DESCRIPTION:Hospital-grade AI consultation backend: streaming chat, session lifecycle, and a tag-scoped medical RAG corpus. Every endpoint requires an API key in the configured header.}"
+    version: ${MED_OPENAPI_VERSION:1.0.0}
+    contact-name: ${MED_OPENAPI_CONTACT_NAME:Med-QA Team}
+    contact-email: ${MED_OPENAPI_CONTACT_EMAIL:}
+    contact-url: ${MED_OPENAPI_CONTACT_URL:}
+    license-name: ${MED_OPENAPI_LICENSE_NAME:Apache 2.0}
+    license-url: ${MED_OPENAPI_LICENSE_URL:https://www.apache.org/licenses/LICENSE-2.0}
+    api-key-header: ${MED_SECURITY_HEADER:X-API-Key}
+    chat-group-paths:
+      - /api/chat/**
+    session-group-paths:
+      - /api/sessions/**
+    rag-group-paths:
+      - /api/rag/**
 
 # MyBatis talks to the ShardingSphere DataSource; the med_message logical table is rewritten to the
 # correct med_message_{crc32(session_id) % 16} physical table by ShardingSphere at runtime.

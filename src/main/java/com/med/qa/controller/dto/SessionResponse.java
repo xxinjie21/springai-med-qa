@@ -2,6 +2,7 @@ package com.med.qa.controller.dto;
 
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
+import io.swagger.v3.oas.annotations.media.Schema;
 import org.springframework.lang.Nullable;
 
 /**
@@ -13,13 +14,21 @@ import org.springframework.lang.Nullable;
  * sensitive enough to require masking.</p>
  */
 public record SessionResponse(
+        @Schema(description = "consultation session identifier", example = "sess-9f2c1a")
         String sessionId,
+        @Schema(description = "hospital / tenant identifier", example = "t-1001")
         String tenantId,
+        @Schema(description = "department identifier", example = "dept-cardio")
         String deptId,
+        @Schema(description = "patient identifier", example = "pat-7731")
         String patientId,
+        @Schema(description = "optional display title, may be null", example = "Post-op follow-up")
         @Nullable String title,
+        @Schema(description = "lifecycle status: ACTIVE, CLOSED or ARCHIVED")
         SessionStatus status,
+        @Schema(description = "creation time, epoch millis", example = "1718000000000")
         long createdAt,
+        @Schema(description = "last update time, epoch millis", example = "1718003600000")
         long updatedAt) {
 
     /**
