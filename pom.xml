@@ -114,6 +114,17 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!--
+            Spring Boot Actuator: the only production readiness component used. It backs the
+            /actuator/health endpoint that the compose stack, the orchestrator probes and the
+            deployment handbook rely on; application.yml exposes health+info only and never shows
+            detail, so no clinical data leaks through it. Version managed by the Spring Boot BOM.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

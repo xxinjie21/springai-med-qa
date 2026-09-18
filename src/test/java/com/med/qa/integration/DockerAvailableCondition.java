@@ -17,6 +17,12 @@ import org.testcontainers.DockerClientFactory;
  *
  * <p>The condition is evaluated before any {@code @BeforeAll} lifecycle method, so the Testcontainers
  * images are never pulled and the middleware is never started when Docker is unavailable.</p>
+ *
+ * <p>Probing the daemon is itself best-effort: on a machine where Docker answers the ping but cannot
+ * pull its support image (offline or restricted registry), Testcontainers raises instead of returning
+ * {@code false}. A container probe that throws is indistinguishable, from the test suite's point of
+ * view, from a machine without Docker -- both mean "cannot run real middleware here" -- so the probe
+ * is wrapped and any failure disables the class instead of failing the build.</p>
  */
 public class DockerAvailableCondition implements ExecutionCondition {
 
@@ -26,7 +32,15 @@ public class DockerAvailableCondition implements ExecutionCondition {
 
     @Override
     public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
-        if (DockerClientFactory.instance().isDockerAvailable()) {
+        boolean available;
+        try {
+            available = DockerClientFactory.instance().isDockerAvailable();
+        } catch (Throwable probeFailure) {
+            // A daemon that cannot be reached or cannot pull its support image is not a usable
+            // Docker environment; report the class as disabled rather than failing the suite.
+            return ConditionEvaluationResult.disabled(DISABLED_REASON + " (" + probeFailure.getClass().getSimpleName() + ")");
+        }
+        if (available) {
             return ConditionEvaluationResult.enabled("Docker available - integration test enabled");
         }
         return ConditionEvaluationResult.disabled(DISABLED_REASON);
