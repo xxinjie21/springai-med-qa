@@ -25,6 +25,10 @@
         <protobuf-maven-plugin.version>3.1.0</protobuf-maven-plugin.version>
         <protobuf-java.version>4.29.3</protobuf-java.version>
         <jacoco-maven-plugin.version>0.8.13</jacoco-maven-plugin.version>
+        <!-- Coverage gate floors enforced by the jacoco-coverage-gate execution on every verify. -->
+        <jacoco.min.instruction>0.90</jacoco.min.instruction>
+        <jacoco.min.branch>0.80</jacoco.min.branch>
+        <jacoco.min.line>0.90</jacoco.min.line>
         <shardingsphere.version>5.5.2</shardingsphere.version>
         <redisson.version>3.45.1</redisson.version>
         <spring-ai.version>1.0.0</spring-ai.version>
@@ -337,6 +341,46 @@
                         <goals>
                             <goal>report</goal>
                         </goals>
+                    </execution>
+                    <!--
+                        Coverage gate (D32): the report above is documentation, this rule is the
+                        actual quality gate. It runs in the same verify phase the CI workflow
+                        invokes, so a pull request that lowers coverage below the configured
+                        floors fails the build instead of silently landing. The floors sit a few
+                        points under the measured baseline of the D1..D31 suite, leaving room for
+                        small additions while still rejecting untested modules.
+                    -->
+                    <execution>
+                        <id>jacoco-coverage-gate</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <haltOnFailure>true</haltOnFailure>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>INSTRUCTION</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>${jacoco.min.instruction}</minimum>
+                                        </limit>
+                                        <limit>
+                                            <counter>BRANCH</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>${jacoco.min.branch}</minimum>
+                                        </limit>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>${jacoco.min.line}</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>

@@ -167,6 +167,13 @@ springai-med-qa/
 | D30 | 集成测试 | Testcontainers：MySQL+Redis 真实环境跑通存储与锁链路 | `test: add testcontainers integration tests for memory layer` |
 | D31 | 文档收尾 | README（架构图/快速开始/徽章）、部署手册 | `docs: complete readme with architecture and deployment guide` |
 
+### 阶段 5：运维加固（D32–D33）
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D32 | 质量门禁与可观测 | JaCoCo `check` 覆盖率门禁（指令 90% / 分支 80% / 行 90%，绑定 `verify`，CI 直接阻断）；`MedStorageHealthIndicator` 探测 ShardingSphere(MySQL) + Redis 并给出分组件原因；`MedComponentInfoContributor` 通过 `/actuator/info` 暴露版本矩阵；开启 K8s liveness/readiness 探针组 | `feat(actuator): add coverage gate and storage health probes` |
+| D33 | 收尾加固 | 真实 `docker build` 验证 / 英文 README / 告警接入 | `chore: finalize operations hardening` |
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

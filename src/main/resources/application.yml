@@ -253,6 +253,11 @@ management:
   endpoint:
     health:
       show-details: never
+      # Expose the /actuator/health/liveness and /actuator/health/readiness groups consumed by the
+      # Kubernetes probes documented in docs/DEPLOYMENT.md. Both groups inherit the aggregate
+      # status, so an unreachable MySQL or Redis store takes the pod out of rotation.
+      probes:
+        enabled: true
 
 logging:
   level:

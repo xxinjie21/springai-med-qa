@@ -119,9 +119,9 @@ flowchart TB
 | 序列化 | Protobuf 4.29.3 | 跨语言统一会话协议，二进制落库 |
 | 脱敏 | Hutool `DesensitizedUtil` 5.8.37 | 身份证 / 手机号 / 病历号字段掩码（Jackson 注解触发） |
 | 接口文档 | SpringDoc OpenAPI 2.8.5 | Swagger UI，chat / session / rag 三组分组 |
-| 健康检查 | Spring Boot Actuator | `/actuator/health`，容器与编排探针 |
+| 健康检查 | Spring Boot Actuator | `/actuator/health`（含 MySQL/Redis 分组件探针）+ `/actuator/info` 版本矩阵，K8s liveness/readiness 探针组 |
 | 测试 | JUnit 5 + Mockito + H2 + Testcontainers | 单测离线全绿；集成测试在无 Docker 时自动跳过 |
-| 覆盖率 | JaCoCo 0.8.13 | 绑定 `verify` 阶段，报告上传为 CI 产物 |
+| 覆盖率 | JaCoCo 0.8.13 | 绑定 `verify` 阶段，报告上传为 CI 产物；`check` 门禁低于阈值即构建失败 |
 
 ---
 
@@ -140,6 +140,7 @@ src/main/java/com/med/qa/
 ├── security/          # ApiKeyAuthFilter、PatientAccessGuard、@RequireDept 科室注解权限
 ├── audit/             # @MedAudit 注解 + AOP 切面 + 审计落库
 ├── privacy/           # @Desensitize 注解 + Jackson 序列化器 + MaskType
+├── actuator/          # MedStorageHealthIndicator（MySQL/Redis 探针）+ MedComponentInfoContributor（版本矩阵）
 ├── controller/        # REST / SSE 接口层 + DTO
 └── MedQaApplication.java
 
@@ -307,10 +308,14 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储与锁链路；无 Docker 时自动禁用 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
+| 覆盖率门禁 | `jacoco-coverage-gate` 执行（`verify` 阶段，`haltOnFailure`）：指令 ≥ 90%、分支 ≥ 80%、行 ≥ 90%，阈值以 `jacoco.min.*` 属性声明；不达标直接 BUILD FAILURE，CI 无法合入 |
 
 ```bash
-./mvnw clean verify
+./mvnw clean verify          # 全量单测 + 覆盖率报告 + 门禁校验
+./mvnw clean test            # 仅跑单测（不触发门禁）
 ```
+
+被门禁守护的构建契约同样有单测覆盖：`com.med.qa.ci.CoverageGateConfigTest` 用 DOM 解析 `pom.xml`，断言门禁执行存在、绑定 `verify`、三个计数器阈值均来自属性且落在 `[0,1]` 区间。
 
 ---
 
@@ -332,7 +337,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 
 ## 迭代进度
 
-按 [`ROADMAP.md`](./ROADMAP.md) 分四阶段共 31 个迭代推进，每日一个迭代「编码 → 单测 → commit → 推送」闭环：
+按 [`ROADMAP.md`](./ROADMAP.md) 分五阶段推进，每日一个迭代「编码 → 单测 → commit → 推送」闭环：
 
 | 阶段 | 迭代 | 状态 |
 |---|---|---|
@@ -341,6 +346,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 | 阶段 2 RAG 检索层 | D13–D18 | 已完成 |
 | 阶段 3 业务能力 | D19–D26 | 已完成 |
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
+| 阶段 5 运维加固 | D32 | 进行中（D32 已完成，D33 待定） |
 
 ---
 

@@ -157,18 +157,29 @@ docker run -d --name med-qa-app \
   ghcr.io/xxinjie21/springai-med-qa:v1.0.0
 ```
 
-Kubernetes 探针可直接使用 Actuator：
+Kubernetes 探针可直接使用 Actuator 的探针组（已通过 `management.endpoint.health.probes.enabled` 开启）：
 
 ```yaml
 readinessProbe:
-  httpGet: { path: /actuator/health, port: 8080 }
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
   initialDelaySeconds: 30
   periodSeconds: 10
 livenessProbe:
-  httpGet: { path: /actuator/health, port: 8080 }
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
   initialDelaySeconds: 60
   periodSeconds: 15
 ```
+
+**健康探针的判定口径**
+
+| 端点 | 语义 |
+|---|---|
+| `/actuator/health` | 聚合状态：MySQL（经 ShardingSphere 数据源执行 `SELECT 1`）与 Redis（`PING`）同时可达才为 `UP` |
+| `/actuator/health/liveness` | 进程存活，任一存储不可用时为 `DOWN`（运维可直接看 `redis` / `mysql` 分组件原因；对外 `show-details: never` 不泄露细节） |
+| `/actuator/health/readiness` | 同上，用于摘除流量 |
+| `/actuator/info` | `components` 版本矩阵：Java / Spring Boot / Spring Framework / Spring AI / ShardingSphere / Redisson / MyBatis / Protobuf，取自 jar manifest，便于现场核对实例版本 |
+
+> 探针只做连通性校验，绝不执行业务 SQL，可安全高频轮询。
 
 ---
 
