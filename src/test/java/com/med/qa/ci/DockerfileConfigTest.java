@@ -119,6 +119,36 @@ class DockerfileConfigTest {
     }
 
     @Test
+    @DisplayName("the extraction passes --launcher, without which the runtime image cannot boot")
+    void extractionIncludesTheLauncher() {
+        // Found the hard way in D33: `jarmode=tools extract --layers` alone writes an EMPTY
+        // spring-boot-loader/ directory, so the shipped image contains no
+        // org.springframework.boot.loader classes and the JarLauncher entrypoint dies with
+        // "Could not find or load main class" before Spring is ever loaded. The flag is what puts
+        // the launcher into the layer the runtime stage copies.
+        assertThat(content).contains("--launcher");
+        assertThat(content).as("the flag must be on the extract command, not somewhere else")
+                .contains("extract --layers --launcher");
+    }
+
+    @Test
+    @DisplayName("the runtime image carries OCI metadata so a registry can identify the artifact")
+    void declaresOciLabels() {
+        // A multi-line LABEL only has its first line matched by directive("LABEL"); the continuation
+        // lines are indented, so the assertions run against the whole file.
+        assertThat(directive("LABEL")).isNotEmpty();
+
+        assertThat(content).contains("org.opencontainers.image.title");
+        assertThat(content).contains("org.opencontainers.image.source");
+        assertThat(content).contains("org.opencontainers.image.licenses");
+        assertThat(content).contains("org.opencontainers.image.revision");
+        assertThat(content).contains("org.opencontainers.image.version");
+        // Supplied by the publishing workflow, so the tag and the recorded revision cannot disagree.
+        assertThat(directive("ARG")).anyMatch(line -> line.contains("REVISION"));
+        assertThat(directive("ARG")).anyMatch(line -> line.contains("VERSION"));
+    }
+
+    @Test
     @DisplayName("all four Spring Boot layers are copied slow-changing -> fast-changing")
     void copiesLayersInCacheOrder() {
         int dependencies = content.indexOf("extracted/dependencies/");

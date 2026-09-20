@@ -129,6 +129,19 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!--
+            Prometheus registry (D33): publishes the Micrometer meters behind /actuator/prometheus,
+            which is the scrape target declared in deploy/prometheus/prometheus.yml. The alert chain
+            in com.med.qa.alert exports med_qa_alert_total through this registry, so the alert rules
+            fire on real application events instead of on a hand-maintained heartbeat. Version is
+            managed by the Spring Boot BOM (Micrometer ships as part of the Boot observability
+            stack), so no explicit version string is needed.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

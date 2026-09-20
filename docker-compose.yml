@@ -13,6 +13,7 @@
 # Usage:
 #   docker compose up -d            # full stack
 #   docker compose up -d redis-stack   # cache/index only, for offline dev
+#   docker compose --profile observability up -d   # + prometheus / alertmanager (D33)
 
 name: springai-med-qa
 
@@ -52,7 +53,9 @@ services:
     environment:
       # Only the root secret is set here; the application database and account are
       # provisioned idempotently by docker/mysql/init/01-create-db.sql on first boot.
-      MYSQL_ROOT_PASSWORD: ${MED_MYSQL_ROOT_PASSWORD:med_qa_root}
+      # Compose interpolation requires the `:-` form for a default; `${VAR:default}` is rejected at
+      # parse time, which would make `docker compose up -d` fail before a single container starts.
+      MYSQL_ROOT_PASSWORD: ${MED_MYSQL_ROOT_PASSWORD:-med_qa_root}
     ports:
       - "3306:3306"
     volumes:
@@ -111,6 +114,66 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------------------------
+  # Observability profile (D33). Not started by a plain `docker compose up -d`: an operator opts in
+  # with `--profile observability`, so a developer machine never pays for two extra containers.
+  # Prometheus scrapes /actuator/prometheus and evaluates the rules in deploy/prometheus; on a
+  # firing rule it notifies Alertmanager, whose routing lives in deploy/alertmanager.
+  # ---------------------------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: med-qa-prometheus
+    profiles: ["observability"]
+    depends_on:
+      app:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 15 days is enough to compare a week-over-week regression without growing the volume forever.
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/med-qa-alerts.yml:/etc/prometheus/rules/med-qa-alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      # 9090 -> Prometheus UI (targets, rules, alerts)
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: med-qa-alertmanager
+    profiles: ["observability"]
+    depends_on:
+      prometheus:
+        condition: service_started
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      # 9093 -> Alertmanager UI; the receiver inside the mounted config is a placeholder that must be
+      # replaced with the team's real relay (see docs/DEPLOYMENT.md section 7).
+      - "9093:9093"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   redis-stack-data:
   mysql-data:
+  prometheus-data:
+  alertmanager-data:

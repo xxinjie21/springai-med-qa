@@ -1,0 +1,43 @@
+# Prometheus scrape configuration for the springai-med-qa stack (D33).
+#
+# Mounted read-only into the `prometheus` service of docker-compose.yml (profile: observability).
+# The only scrape target is the application's Actuator Prometheus endpoint; MySQL and Redis expose
+# no HTTP metrics themselves, and their reachability is already reported by the application's
+# MedStorageHealthIndicator and exported as med_qa_alert_total{code="storage-down"}.
+#
+# Usage:
+#   docker compose --profile observability up -d
+#   open http://localhost:9090/targets
+
+global:
+  # 15s matches the alert rule `for:` windows closely enough that a page is at most ~45s late.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    stack: springai-med-qa
+
+rule_files:
+  - /etc/prometheus/rules/med-qa-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  - job_name: med-qa
+    metrics_path: /actuator/prometheus
+    # The container is reached by its compose service name; the actuator endpoint is served on 8080.
+    static_configs:
+      - targets:
+          - app:8080
+        labels:
+          service: springai-med-qa
+
+  # Self-scrape: lets an operator see whether the evaluation loop itself is alive, which is the
+  # first question when an alert that should have fired did not.
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

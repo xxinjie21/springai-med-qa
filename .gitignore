@@ -6,6 +6,7 @@ target/
 
 # WorkBuddy local workspace data
 .workbuddy/
+.workbuddy-ai/
 
 # Maven wrapper temp
 .mvn/.gradle-enterprise/

@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -114,6 +115,44 @@ class ShardingRuleConfigTest {
         assertEquals("com.mysql.cj.jdbc.Driver", medDs.get("driverClassName"));
         assertTrue(String.valueOf(medDs.get("jdbcUrl")).startsWith("jdbc:mysql://"));
         assertTrue(String.valueOf(medDs.get("jdbcUrl")).contains("$${MED_MYSQL_HOST::127.0.0.1}"));
+    }
+
+    @Test
+    @DisplayName("the JDBC url carries a JAVA charset name, never a MySQL one")
+    void jdbcUrlCharacterEncodingIsAJavaCharset() throws IOException {
+        // Found by the D33 container smoke test: `characterEncoding=utf8mb4` is a MySQL server
+        // charset, not a Java one, so Connector/J throws
+        // java.io.UnsupportedEncodingException: utf8mb4 while building the Hikari pool and the whole
+        // service is unable to reach MySQL -- in every environment. Only a real boot exposes it, so
+        // the value is asserted to be resolvable by java.nio.charset.
+        Map<String, Object> root = loadYaml(MAIN_CONFIG);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> medDs = (Map<String, Object>)
+                ((Map<String, Object>) root.get("dataSources")).get("med_ds");
+        String jdbcUrl = String.valueOf(medDs.get("jdbcUrl"));
+
+        assertTrue(jdbcUrl.contains("characterEncoding=UTF-8"),
+                "expected characterEncoding=UTF-8 in " + jdbcUrl);
+        String encoding = jdbcUrl.replaceAll(".*characterEncoding=([^&]*).*", "$1");
+        assertTrue(Charset.isSupported(encoding),
+                "characterEncoding must be a Java charset name but was: " + encoding);
+    }
+
+    @Test
+    @DisplayName("the integration-test url template matches the production url exactly")
+    void integrationTemplateMatchesProductionUrl() throws IOException {
+        Map<String, Object> main = loadYaml(MAIN_CONFIG);
+        Map<String, Object> integration = loadYaml("sharding/med-sharding-it-template.yaml");
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> mainDs = (Map<String, Object>)
+                ((Map<String, Object>) main.get("dataSources")).get("med_ds");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> itDs = (Map<String, Object>)
+                ((Map<String, Object>) integration.get("dataSources")).get("med_ds");
+
+        assertEquals(mainDs.get("jdbcUrl"), itDs.get("jdbcUrl"),
+                "the integration template must not drift from the production connection string");
     }
 
     @Test

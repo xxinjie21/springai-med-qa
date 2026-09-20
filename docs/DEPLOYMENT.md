@@ -84,6 +84,41 @@ docker build -t springai-med-qa:local .
 
 分层结构保证代码变更只重建最小的 `application` 层，依赖层命中缓存。
 
+镜像携带 OCI 元数据（`org.opencontainers.image.*`），发布流水线会把版本号、Git revision 与构建时间
+通过 `--build-arg` 写入，因此 `docker inspect` 即可确认手上这个镜像来自哪次提交。
+
+### 2.3 真实构建验证（D33）
+
+单测只能解析 `Dockerfile` 文本，不能证明镜像真的能跑起来。仓库提供一键验证脚本：
+
+```bash
+scripts/verify-docker-build.sh                 # 默认 tag springai-med-qa:verify
+scripts/verify-docker-build.sh my-registry/med-qa:check
+```
+
+脚本会执行一次真实 `docker build`，随后逐项断言运行时契约：
+
+| 断言 | 说明 |
+|---|---|
+| OCI 标签齐全 | `title` / `source` / `licenses` / `revision` 非空 |
+| 非 root 运行 | `Config.User` 必须等于 `medqa` |
+| 分层布局 | `BOOT-INF/classes/application.yml`、`BOOT-INF/lib/*.jar`、`org/springframework/boot/loader/**` 均存在 |
+| 入口类 | entrypoint 使用 Spring Boot 3.x `JarLauncher`，且该 class 真的在镜像里 |
+| 启动冒烟 | 真实启动容器一次，要求 Spring Boot 打出启动横幅或失败分析器横幅（不允许出现 `Could not find or load main class`） |
+
+无 Docker 守护或未安装 Docker 时脚本以退出码 `2` 直接跳过，不会阻断流水线；任一项断言失败以退出码 `1` 失败。
+启动冒烟的超时可用环境变量 `BOOT_TIMEOUT`（默认 150 秒）覆盖。
+
+> **这条链路第一次跑就抓到过两个真实缺陷**：
+> 1. D27 的 `Dockerfile` 只写了 `extract --layers` 而漏了 `--launcher`，于是 `spring-boot-loader/` 层是空的、
+>    镜像里根本没有 `JarLauncher`，容器一启动就 `Could not find or load main class`；
+> 2. `sharding/med-sharding.yaml` 的 JDBC URL 写了 `characterEncoding=utf8mb4`。`characterEncoding` 要的是
+>    **Java** 字符集名，`utf8mb4` 是 MySQL 服务端字符集，Connector/J 会直接抛
+>    `UnsupportedEncodingException: utf8mb4`，导致任何环境下都连不上 MySQL。
+>
+> 两处都只有「真实构建 + 真实启动」才暴露（纯文本断言当时全绿）。现已修复，并分别加了
+> `--launcher` 与「characterEncoding 必须是可被 `Charset` 解析的 Java 字符集名」守护断言。
+
 ---
 
 ## 3. Docker Compose 全栈部署
@@ -282,10 +317,51 @@ livenessProbe:
 | 应用存活 | `curl -fsS http://localhost:8080/actuator/health` | HTTP 200 |
 | Compose 服务状态 | `docker compose ps` | `app` / `mysql` / `redis-stack` 均 `healthy` |
 | 向量索引就绪 | `docker exec med-qa-redis-stack redis-cli FT.INFO med-doc-index` | 返回索引信息 |
+| 指标暴露 | `curl -fsS http://localhost:8080/actuator/prometheus` | Prometheus 文本格式指标 |
 | API 文档 | 浏览器打开 `http://localhost:8080/swagger-ui.html` | 可看到 chat / session / rag 三组 |
 
-Actuator 暴露范围由 `application.yml` 控制：`management.endpoints.web.exposure.include=health,info`，
+Actuator 暴露范围由 `application.yml` 控制：`management.endpoints.web.exposure.include=health,info,prometheus`，
 `show-details=never`（不向外部泄露细节）。
+
+### 7.1 告警链路（D33）
+
+Actuator 只能回答「有人来问」时的健康状态。`com.med.qa.alert` 补上了推送侧：
+
+```
+MedStorageAlertMonitor（@Scheduled 轮询既有 MedStorageHealthIndicator）
+        └─> MedAlertNotifier（策略过滤 + Redisson TTL Map 去重）
+                ├─> LoggingMedAlertSink   → 应用日志（key=value 结构化行）
+                └─> MetricsMedAlertSink   → med_qa_alert_total（Micrometer）
+```
+
+- **策略**：`med.alert.*`（开关、轮询间隔、冷却窗口、最低级别、静音码），全部可在 `.env` 覆盖；
+- **去重**：以 `code:component` 为指纹写入 `med:alert:dedupe`（Redisson `RMapCache`，TTL = cooldown），
+  多副本共享同一个抑制窗口，一次故障只响一次；
+- **失败开放**：去重存储不可达时**照常派发**——因为 Redis 挂掉本身就是需要告警的场景；
+- **恢复通知**：组件恢复会补一条 `INFO`（`storage-recovered`），避免「还在坏」与「早已恢复」无法区分。
+
+### 7.2 监控栈（可选）
+
+`docker-compose.yml` 中 Prometheus 与 Alertmanager 位于 `observability` profile，默认**不启动**：
+
+```bash
+docker compose --profile observability up -d
+# Prometheus  UI: http://localhost:9090   （Targets / Rules / Alerts）
+# Alertmanager UI: http://localhost:9093
+```
+
+| 文件 | 作用 |
+|---|---|
+| `deploy/prometheus/prometheus.yml` | 抓取 `app:8080/actuator/prometheus`，15s 间隔，加载规则并指向 Alertmanager |
+| `deploy/prometheus/med-qa-alerts.yml` | 规则：`MedQaTargetDown` / `MedQaStorageUnavailable` / `MedQaStorageProbeFailed` / `MedQaAlertStorm` / `MedQaHighServerErrorRate` / `MedQaConsultationLatencyHigh` / `MedQaRateLimitStorm` |
+| `deploy/alertmanager/alertmanager.yml` | 按 `alertname` + `component` 分组；`critical` 走独立接收器与更短的重复间隔；抑制规则避免「整体不可达」时重复刷屏 |
+
+> **必须替换**：`alertmanager.yml` 中的 `webhook_configs.url` 是占位地址（Alertmanager 不支持在配置里
+> 展开环境变量）。接入企业微信 / 钉钉 / PagerDuty 时改成真实中继地址即可；未替换前告警仍可在
+> Alertmanager UI 看到，只是不会推到手机上。
+
+自定义应用指标：`med_qa_alert_total{severity,code,component}`（计数器）与
+`med_qa_alert_last_epoch_seconds`（最近一次告警时间戳，可用于 dead-man's-switch 规则）。
 
 ---
 

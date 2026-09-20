@@ -13,7 +13,12 @@ dataSources:
   med_ds:
     dataSourceClassName: com.zaxxer.hikari.HikariDataSource
     driverClassName: com.mysql.cj.jdbc.Driver
-    jdbcUrl: jdbc:mysql://$${MED_MYSQL_HOST::127.0.0.1}:$${MED_MYSQL_PORT::3306}/$${MED_MYSQL_DATABASE::med_qa}?useUnicode=true&characterEncoding=utf8mb4&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    # characterEncoding takes a JAVA charset name, not a MySQL one. `utf8mb4` is a MySQL server
+    # charset and Connector/J rejects it outright with
+    # "java.io.UnsupportedEncodingException: utf8mb4" before the connection is ever opened, which
+    # makes the whole service unable to reach MySQL. `UTF-8` is the correct value: the driver then
+    # negotiates utf8mb4 on the wire against the utf8mb4 server configured in docker-compose.yml.
+    jdbcUrl: jdbc:mysql://$${MED_MYSQL_HOST::127.0.0.1}:$${MED_MYSQL_PORT::3306}/$${MED_MYSQL_DATABASE::med_qa}?useUnicode=true&characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
     username: $${MED_MYSQL_USERNAME::med_qa}
     password: $${MED_MYSQL_PASSWORD::med_qa}
     minimumIdle: 4

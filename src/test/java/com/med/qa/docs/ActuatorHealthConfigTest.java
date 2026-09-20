@@ -53,10 +53,12 @@ class ActuatorHealthConfigTest {
     }
 
     @Test
-    @DisplayName("only health and info are exposed, and health never leaks component details")
+    @DisplayName("health, info and prometheus are exposed, and health never leaks component details")
     void managementEndpointsAreNarrowlyExposed() {
         assertThat(applicationYml).contains("exposure:");
-        assertThat(applicationYml).contains("include: health,info");
+        // prometheus joined the exposure list in D33: it is the scrape target of the alerting stack.
+        // Anything beyond these three (env, beans, heapdump, threaddump...) must stay unexposed.
+        assertThat(applicationYml).contains("include: health,info,prometheus");
         assertThat(applicationYml).contains("show-details: never");
     }
 

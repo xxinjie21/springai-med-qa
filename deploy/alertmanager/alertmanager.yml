@@ -1,0 +1,60 @@
+# Alertmanager routing for springai-med-qa (D33).
+#
+# Mounted read-only into the `alertmanager` service of docker-compose.yml (profile: observability).
+#
+# NOTE: the receiver below is a placeholder. Alertmanager does not expand environment variables
+# inside its configuration file, so the real endpoint has to be substituted at deploy time. Replace
+# the `webhook_configs` URL with your on-call relay before relying on this stack - the deployment
+# handbook (docs/DEPLOYMENT.md, section 7) walks through the WeCom / DingTalk / PagerDuty options.
+# Until then alerts are still visible in the Alertmanager UI on http://localhost:9093.
+
+global:
+  # Give a slow relay a chance to answer before the notification is considered failed.
+  resolve_timeout: 5m
+
+route:
+  # Grouping by alert name and component keeps one incident in one notification thread instead of
+  # producing a message per replica.
+  group_by: ["alertname", "component"]
+  group_wait: 30s
+  group_interval: 5m
+  # A still-firing alert repeats every four hours; anything shorter trains people to ignore it.
+  repeat_interval: 4h
+  receiver: default
+  routes:
+    # Critical alerts skip the batching delay and repeat sooner: they are the ones that cost money
+    # or patient safety while nobody is looking.
+    - matchers:
+        - severity = "critical"
+      receiver: critical
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    webhook_configs:
+      # PLACEHOLDER: point this at the team's alert relay.
+      - url: http://alert-relay:8080/alerts
+        send_resolved: true
+
+  - name: critical
+    webhook_configs:
+      # PLACEHOLDER: point this at the paging integration (on-call rotation).
+      - url: http://alert-relay:8080/alerts/critical
+        send_resolved: true
+
+inhibit_rules:
+  # While the whole application is unreachable, the per-component rules are noise: the target-down
+  # alert already says everything an on-call engineer needs to start.
+  - source_matchers:
+      - alertname = "MedQaTargetDown"
+    target_matchers:
+      - severity =~ "critical|warning"
+    equal: ["component"]
+
+  # A storage outage explains the elevated error rate and latency that follow it.
+  - source_matchers:
+      - alertname = "MedQaStorageUnavailable"
+    target_matchers:
+      - alertname =~ "MedQaHighServerErrorRate|MedQaConsultationLatencyHigh"
+    equal: []

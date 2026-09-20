@@ -35,14 +35,38 @@ RUN ./mvnw -B -ntp clean package -DskipTests
 
 # 3) Explode the layered jar with the Spring Boot 3.x tools jarmode into per-layer
 #    directories: dependencies/ spring-boot-loader/ snapshot-dependencies/ application/
+#
+#    `--launcher` is NOT optional. Without it the tools jarmode writes an EMPTY
+#    spring-boot-loader/ directory and the runtime image ships no
+#    org.springframework.boot.loader classes at all -- the ENTRYPOINT below then dies with
+#    "Could not find or load main class ...JarLauncher" before the context ever starts. The D33
+#    verification script (scripts/verify-docker-build.sh) runs a real build and asserts the
+#    launcher class is present, because a text-level check of this file cannot catch that.
 RUN cp target/*.jar application.jar \
-    && java -Djarmode=tools -jar application.jar extract --layers --destination extracted
+    && java -Djarmode=tools -jar application.jar extract --layers --launcher --destination extracted
 
 ##############################
 # Stage 2: minimal JRE runtime
 ##############################
 FROM eclipse-temurin:17-jre-jammy AS runtime
 WORKDIR /app
+
+# OCI image metadata (D33). A registry, a scanner and an operator all need to identify the artifact
+# without pulling it apart, and `docker inspect` is the cheapest place to read that from. The three
+# ARGs are supplied by the publishing workflow (docker-publish.yml) so the pushed tag and the
+# recorded revision can never disagree; the defaults keep a local `docker build .` self-describing.
+ARG VERSION=0.0.1-SNAPSHOT
+ARG REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="springai-med-qa" \
+      org.opencontainers.image.description="Hospital-grade AI consultation backend (Spring Boot 3 / Spring AI)" \
+      org.opencontainers.image.source="https://github.com/xxinjie21/springai-med-qa" \
+      org.opencontainers.image.url="https://github.com/xxinjie21/springai-med-qa" \
+      org.opencontainers.image.documentation="https://github.com/xxinjie21/springai-med-qa/blob/main/docs/DEPLOYMENT.md" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION" \
+      org.opencontainers.image.created="$BUILD_DATE"
 
 # Never run the medical backend as root: create a dedicated system user/group.
 RUN groupadd --system medqa \

@@ -350,9 +350,11 @@ class MedStorageAndLockIntegrationTest {
     }
 
     private static String rawMysqlUrl() {
+        // characterEncoding must be a JAVA charset name; `utf8mb4` is a MySQL server charset and
+        // Connector/J throws UnsupportedEncodingException before opening the connection.
         return "jdbc:mysql://" + mysql.getHost() + ":" + mysql.getMappedPort(MySQLContainer.MYSQL_PORT)
                 + "/" + mysql.getDatabaseName()
-                + "?useUnicode=true&characterEncoding=utf8mb4&useSSL=false"
+                + "?useUnicode=true&characterEncoding=UTF-8&useSSL=false"
                 + "&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai";
     }
 

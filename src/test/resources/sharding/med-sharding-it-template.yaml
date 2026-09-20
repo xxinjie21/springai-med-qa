@@ -13,7 +13,9 @@ dataSources:
   med_ds:
     dataSourceClassName: com.zaxxer.hikari.HikariDataSource
     driverClassName: com.mysql.cj.jdbc.Driver
-    jdbcUrl: jdbc:mysql://$${MED_MYSQL_HOST::127.0.0.1}:$${MED_MYSQL_PORT::3306}/$${MED_MYSQL_DATABASE::med_qa}?useUnicode=true&characterEncoding=utf8mb4&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    # Must stay byte-identical to the production URL: `characterEncoding` takes a Java charset name
+    # (UTF-8), never a MySQL one (utf8mb4), or Connector/J refuses the connection.
+    jdbcUrl: jdbc:mysql://$${MED_MYSQL_HOST::127.0.0.1}:$${MED_MYSQL_PORT::3306}/$${MED_MYSQL_DATABASE::med_qa}?useUnicode=true&characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
     username: $${MED_MYSQL_USERNAME::med_qa}
     password: $${MED_MYSQL_PASSWORD::med_qa}
     minimumIdle: 4

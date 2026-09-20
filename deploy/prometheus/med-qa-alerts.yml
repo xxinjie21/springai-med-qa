@@ -1,0 +1,130 @@
+# Prometheus alerting rules for springai-med-qa (D33).
+#
+# Two families of rules:
+#
+#   * availability -- driven by `up` and by the med_qa_alert_total counter that
+#     com.med.qa.alert.MetricsMedAlertSink publishes. The application already knows when MySQL or
+#     Redis stops answering (MedStorageHealthIndicator), so the rules consume that verdict instead
+#     of duplicating the probe with a second blackbox exporter.
+#   * quality -- driven by the standard Spring Boot HTTP server meter, which is exported with
+#     percentiles-histogram enabled (see the `management.metrics` block of application.yml).
+#
+# Every rule carries a `component` and a `severity` label so alertmanager can route by them and a
+# dashboard can group by them. Keep the label sets small: they end up in the paging path.
+
+groups:
+  - name: med-qa-availability
+    rules:
+      - alert: MedQaTargetDown
+        # `up == 0` means Prometheus could not scrape /actuator/prometheus at all: the process is
+        # gone, the port is closed, or the endpoint stopped responding. The most severe signal.
+        expr: up{job="med-qa"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: app
+        annotations:
+          summary: "springai-med-qa is not scrapeable"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for more than a minute. The
+            process is down, the actuator endpoint is unreachable, or the port is closed.
+          runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
+
+      - alert: MedQaStorageUnavailable
+        # The application itself reported a store outage through the alert chain. `increase` rather
+        # than `> 0` so a counter that reset with a pod restart still fires.
+        expr: increase(med_qa_alert_total{code="storage-down"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: "{{ $labels.component }}"
+        annotations:
+          summary: "Storage component {{ $labels.component }} is unavailable"
+          description: >-
+            MedStorageHealthIndicator reported {{ $labels.component }} as unavailable. Consultation
+            turns will fail to persist or to read the memory cache until it recovers.
+          runbook: "docs/DEPLOYMENT.md#8-日志与故障排查"
+
+      - alert: MedQaStorageProbeFailed
+        # The health probe threw instead of returning a status, which means the probe itself is
+        # broken and every storage signal below it is untrustworthy.
+        expr: increase(med_qa_alert_total{code="storage-probe-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: actuator
+        annotations:
+          summary: "The storage health probe is throwing"
+          description: >-
+            MedStorageHealthIndicator raised an exception instead of reporting a status, so
+            /actuator/health is no longer a reliable readiness signal.
+          runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
+
+      - alert: MedQaAlertStorm
+        # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
+        # would otherwise drown the on-call engineer.
+        expr: sum(increase(med_qa_alert_total[1h])) > 20
+        for: 5m
+        labels:
+          severity: warning
+          component: alerting
+        annotations:
+          summary: "Alert storm: more than 20 alerts in the last hour"
+          description: >-
+            The alert chain emitted {{ $value }} alerts in the last hour. Check for a flapping
+            dependency or a mis-configured med.alert.cooldown before acting on each one.
+
+  - name: med-qa-quality
+    rules:
+      - alert: MedQaHighServerErrorRate
+        # 5xx ratio over the last five minutes, ignoring the low-traffic case where one error out of
+        # three requests is statistically meaningless.
+        expr: >-
+          sum(rate(http_server_requests_seconds_count{application="springai-med-qa",status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(http_server_requests_seconds_count{application="springai-med-qa"}[5m])), 0.1)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "More than 5% of API calls are failing with 5xx"
+          description: >-
+            {{ $value | humanizePercentage }} of requests over the last five minutes returned a 5xx.
+            Check the LLM/embedding gateway and the storage probes first.
+          runbook: "docs/DEPLOYMENT.md#8-日志与故障排查"
+
+      - alert: MedQaConsultationLatencyHigh
+        # p95 of the SSE consultation endpoint. The histogram buckets come from
+        # management.metrics.distribution.percentiles-histogram.http.server.requests.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{application="springai-med-qa",uri="/api/chat/stream"}[5m]))
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: chat
+        annotations:
+          summary: "p95 consultation latency is above 10s"
+          description: >-
+            The 95th percentile of /api/chat/stream has been above 10 seconds for ten minutes.
+            Streamed answers are still correct, but the model gateway is likely degraded.
+
+      - alert: MedQaRateLimitStorm
+        # A sustained 429 rate means either a mis-behaving client or a limit that is too tight for
+        # real clinical traffic - both need a human decision.
+        expr: >-
+          sum(rate(http_server_requests_seconds_count{application="springai-med-qa",status="429"}[10m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: ratelimit
+        annotations:
+          summary: "Sustained rate-limit rejections"
+          description: >-
+            More than one request per second has been rejected with 429 for ten minutes. Review
+            med.rate-limit.default-rate and the per-endpoint @RateLimit settings.
+          runbook: "docs/DEPLOYMENT.md#5-环境变量全表"

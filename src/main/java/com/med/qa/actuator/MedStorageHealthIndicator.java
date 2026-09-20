@@ -37,7 +37,14 @@ public class MedStorageHealthIndicator extends AbstractHealthIndicator {
     /** Trivial statement used to validate a pooled MySQL connection. */
     public static final String VALIDATION_QUERY = "SELECT 1";
 
-    private static final String AVAILABLE = "available";
+    /**
+     * Detail value recorded for a component that answered its probe.
+     *
+     * <p>Public because {@code com.med.qa.alert.MedStorageAlertMonitor} reads the health report back
+     * and must distinguish "the component answered" from "the component is down"; comparing against
+     * a copied literal would let the two sides drift apart silently.</p>
+     */
+    public static final String AVAILABLE = "available";
 
     private final RedisConnectionFactory redisConnectionFactory;
     private final DataSource dataSource;

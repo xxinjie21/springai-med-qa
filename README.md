@@ -12,6 +12,8 @@
 
 基于 **Spring Boot 3 + Spring AI** 的医院生产级 AI 问诊后端服务。
 
+[English](./README.en.md) ｜ **简体中文**
+
 </div>
 
 > 医疗 AI 知识问答 + 分布式会话记忆存储的「前端业务系统」。会话存储规范、字段定义、序列化协议与
@@ -120,6 +122,7 @@ flowchart TB
 | 脱敏 | Hutool `DesensitizedUtil` 5.8.37 | 身份证 / 手机号 / 病历号字段掩码（Jackson 注解触发） |
 | 接口文档 | SpringDoc OpenAPI 2.8.5 | Swagger UI，chat / session / rag 三组分组 |
 | 健康检查 | Spring Boot Actuator | `/actuator/health`（含 MySQL/Redis 分组件探针）+ `/actuator/info` 版本矩阵，K8s liveness/readiness 探针组 |
+| 指标与告警 | Micrometer + Prometheus + Alertmanager | `/actuator/prometheus` 抓取端点；`com.med.qa.alert` 推送告警（日志 + `med_qa_alert_total`），规则与路由见 `deploy/` |
 | 测试 | JUnit 5 + Mockito + H2 + Testcontainers | 单测离线全绿；集成测试在无 Docker 时自动跳过 |
 | 覆盖率 | JaCoCo 0.8.13 | 绑定 `verify` 阶段，报告上传为 CI 产物；`check` 门禁低于阈值即构建失败 |
 
@@ -141,6 +144,7 @@ src/main/java/com/med/qa/
 ├── audit/             # @MedAudit 注解 + AOP 切面 + 审计落库
 ├── privacy/           # @Desensitize 注解 + Jackson 序列化器 + MaskType
 ├── actuator/          # MedStorageHealthIndicator（MySQL/Redis 探针）+ MedComponentInfoContributor（版本矩阵）
+├── alert/             # 告警链路：存储监控 → 策略/去重 → 日志 + Micrometer 双 sink
 ├── controller/        # REST / SSE 接口层 + DTO
 └── MedQaApplication.java
 
@@ -154,6 +158,9 @@ src/main/resources/
 
 docs/                            # 部署手册等运维文档
 docker/mysql/init/               # Compose MySQL 初始化脚本（建库 + 最小权限账号）
+deploy/prometheus/               # Prometheus 抓取配置 + 告警规则
+deploy/alertmanager/             # Alertmanager 路由与抑制规则
+scripts/verify-docker-build.sh   # 真实镜像构建验证
 ```
 
 ---
@@ -189,6 +196,7 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `POST` | `/api/rag/documents/delete` | 按 id 列表或隔离 scope 删除 | |
 | `POST` | `/api/rag/documents/search` | 标签隔离检索预览 | 透传 `topK` / `threshold` / `includeShared` |
 | `GET` | `/actuator/health` | 健康检查 | 容器 / 编排探针 |
+| `GET` | `/actuator/prometheus` | Prometheus 指标 | 监控栈抓取端点 |
 
 统一响应体：
 
@@ -245,6 +253,11 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | 检索参数 |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | 入库上限 |
+| `MED_ALERT_ENABLED` | `true` | 告警链路总开关（`false` 时不注册任何告警 Bean） |
+| `MED_ALERT_CHECK_INTERVAL` / `MED_ALERT_INITIAL_DELAY` | `60s` / `30s` | 存储探针轮询间隔与启动宽限期 |
+| `MED_ALERT_COOLDOWN` | `10m` | 同一 `code:component` 指纹的抑制窗口（`0` 关闭去重） |
+| `MED_ALERT_MINIMUM_SEVERITY` | `INFO` | 告警级别下限（提到 `WARNING` 可静默恢复通知） |
+| `MED_ALERT_KEY_PREFIX` | `med:alert:` | 去重 Map 的 Redis 命名空间 |
 
 完整运维说明见 [部署手册](./docs/DEPLOYMENT.md)。
 
@@ -330,8 +343,14 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 
 ## 部署
 
-完整部署手册（镜像获取、环境变量全表、健康检查、日志排障、备份回滚、安全加固）见
+完整部署手册（镜像获取、环境变量全表、健康检查与告警、日志排障、备份回滚、安全加固）见
 **[`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md)**。
+
+**告警**：`/actuator/prometheus` 为抓取端点，规则与路由在 [`deploy/`](./deploy) 下；
+`docker compose --profile observability up -d` 可拉起 Prometheus + Alertmanager 观测栈（默认不启动）。
+
+**构建验证**：`scripts/verify-docker-build.sh` 执行一次真实 `docker build` 并断言 OCI 标签、非 root 用户、
+分层布局与入口类，无 Docker 守护时自动跳过。
 
 ---
 

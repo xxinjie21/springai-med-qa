@@ -214,6 +214,22 @@ med:
     # med.rag.retrieval.* and MedRetrievalFilters, never here.
     advisor:
       order: ${MED_RAG_ADVISOR_ORDER:1}
+  # Push-based alerting (D33). Actuator answers "am I healthy?" only to whoever asks; the monitor in
+  # com.med.qa.alert polls the same storage probe on a schedule and pushes what it finds through the
+  # log and Micrometer sinks. check-interval / initial-delay are read straight by the @Scheduled
+  # annotation, so slowing the probing down needs no rebuild. cooldown is the shared suppression
+  # window per (code, component) fingerprint, held in a Redisson TTL map so every replica shares it;
+  # zero disables suppression while tuning a rule. minimum-severity is the signal/noise dial - raise
+  # it to WARNING to silence recovery notices. muted-codes is the maintenance-window escape hatch.
+  # enabled=false removes the whole chain, which is what the offline test suite wants.
+  alert:
+    enabled: ${MED_ALERT_ENABLED:true}
+    check-interval: ${MED_ALERT_CHECK_INTERVAL:60s}
+    initial-delay: ${MED_ALERT_INITIAL_DELAY:30s}
+    cooldown: ${MED_ALERT_COOLDOWN:10m}
+    minimum-severity: ${MED_ALERT_MINIMUM_SEVERITY:INFO}
+    key-prefix: ${MED_ALERT_KEY_PREFIX:med:alert:}
+    muted-codes: []
   # Generated API documentation (D26). The api-key-header mirrors med.security.header-name so the
   # Swagger UI "Authorize" button uses the exact header the ApiKeyAuthFilter enforces. The three
   # group paths split the surface into chat / session / rag dropdowns in Swagger UI.
@@ -249,7 +265,10 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        # health/info back the container probe and the version matrix; prometheus (D33) is the
+        # scrape target of deploy/prometheus/prometheus.yml. The alert rules in that directory read
+        # med_qa_alert_total, which only exists because the Prometheus registry is on the classpath.
+        include: health,info,prometheus
   endpoint:
     health:
       show-details: never
@@ -258,6 +277,16 @@ management:
       # status, so an unreachable MySQL or Redis store takes the pod out of rotation.
       probes:
         enabled: true
+  metrics:
+    # Every series carries the application name, so a Prometheus instance scraping several services
+    # can still isolate this one without relying on the job label.
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      # Histogram buckets on the HTTP meter (D33): the MedQaConsultationLatencyHigh rule needs
+      # histogram_quantile, which is only computable from _bucket series.
+      percentiles-histogram:
+        http.server.requests: true
 
 logging:
   level:
