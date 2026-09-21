@@ -237,8 +237,10 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `SPRING_PROFILES_ACTIVE` | `dev` | 生效 profile（`dev` / `prod`） |
 | `SERVER_PORT` | `8080` | 服务端口 |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_DATABASE` | `localhost` / `6379` / `0` | 缓存、锁、限流、向量索引共用 |
-| `MED_MYSQL_HOST` / `MED_MYSQL_PORT` / `MED_MYSQL_DATABASE` | `127.0.0.1` / `3306` / `med_qa` | ShardingSphere 数据源 |
-| `MED_MYSQL_USERNAME` / `MED_MYSQL_PASSWORD` | `med_qa` / `med_qa` | 应用账号 |
+| `MED_MYSQL_HOST` / `MED_MYSQL_PORT` / `MED_MYSQL_DATABASE` | `127.0.0.1` / `3306` / `med_qa` | ShardingSphere 数据源 + Flyway 迁移目标（同一套坐标） |
+| `MED_MYSQL_USERNAME` / `MED_MYSQL_PASSWORD` | `med_qa` / `med_qa` | 应用账号 + 迁移账号 |
+| `MED_MIGRATION_URL` | 空 | 可选，整串 JDBC URL 覆盖（留空则用上面的坐标拼装） |
+| `MED_MIGRATION_LOCATIONS` | `classpath:db/migration` | Flyway 迁移脚本位置 |
 | `OPENAI_BASE_URL` / `OPENAI_API_KEY` | `https://api.openai.com` / 空 | 兼容任意 OpenAI 协议网关 |
 | `MED_EMBEDDING_MODEL` / `MED_EMBEDDING_DIMENSIONS` | `text-embedding-3-small` / `1536` | 需与索引向量宽度一致 |
 | `MED_SECURITY_ENABLED` / `MED_SECURITY_REQUIRE_AUTH` | `true` / `true` | API Key 认证开关 |

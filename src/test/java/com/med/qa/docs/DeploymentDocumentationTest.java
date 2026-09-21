@@ -164,6 +164,16 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the schema chapter explains why the migration must bypass the sharding proxy")
+    void schemaChapterExplainsThePhysicalMigrationTarget() {
+        // An operator who repoints spring.datasource at a real proxy, or who wonders why Boot's own
+        // Flyway auto-configuration is excluded, must be able to read the answer here.
+        assertThat(handbook).contains("MedFlywayConfig");
+        assertThat(handbook).contains("spring.flyway.enabled");
+        assertThat(handbook).contains("1007");
+    }
+
+    @Test
     @DisplayName("the Redis Stack prerequisite matches the image the compose stack runs")
     void redisStackPrerequisiteMatchesComposeImage() {
         assertThat(handbook).contains("redis/redis-stack");

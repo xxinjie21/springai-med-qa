@@ -36,10 +36,19 @@
         <!--
             Testcontainers (D30 integration tests): spins up a real MySQL + Redis Stack so the
             storage and lock chain is exercised against genuine middleware. The boot BOM does not
-            manage Testcontainers, hence the explicit BOM import below. 1.20.x is the GA line that
+            manage Testcontainers, hence the explicit BOM import below. 1.21.x is the GA line that
             targets Java 17 and is compatible with the JUnit 5.11.x shipped by Boot 3.4.
+
+            DO NOT DOWNGRADE BELOW 1.21.0 (D34). Testcontainers hard-codes the Docker API version it
+            speaks when the daemon does not advertise one to the client library. Up to 1.20.6 that
+            fallback was RemoteApiVersion.VERSION_1_32, which Docker Engine 29 rejects with HTTP 400
+            "client version 1.32 is too old" (the floor there is 1.40). The failure surfaces as
+            DockerClientFactory.isDockerAvailable() == false, i.e. it looks exactly like "no Docker on
+            this machine", so the whole D30 integration suite was silently skipped instead of run.
+            1.21.0 raised the fallback to VERSION_1_44, which clears the Docker 29 floor. The
+            regression guard for this lives in TestcontainersVersionTest.
         -->
-        <testcontainers.version>1.20.6</testcontainers.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
         <!--
             SpringDoc OpenAPI 2.8.x is the GA line that supports Spring Boot 3.4 / Spring Framework
             6.2. Earlier 2.5.x releases break at runtime with a NoSuchMethodError on
@@ -170,6 +179,25 @@
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <!--
+            MySQL support for Flyway (D34). Flyway 10 split per-database support out of flyway-core
+            into separate modules, so `flyway-core` alone cannot talk to MySQL: the database-type
+            registry finds no MySQL handler and migration aborts with
+            "FlywayException: Unsupported Database: MySQL 8.0".
+
+            This was a production-blocking gap. application.yml sets no `spring.flyway.*` property,
+            so Boot's FlywayAutoConfiguration is active in production and runs the migrations during
+            context refresh; with only flyway-core on the classpath the service could not start
+            against MySQL at all. Every Spring-context test in this repository pins
+            `spring.flyway.enabled=false` (so the suite stays offline), which is exactly why the
+            missing module stayed invisible until the D30 integration suite finally executed against
+            real MySQL. Version is managed by the Spring Boot BOM, so it always tracks flyway-core.
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
         </dependency>
 
         <!--

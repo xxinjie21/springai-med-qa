@@ -229,12 +229,14 @@ livenessProbe:
 | `REDIS_HOST` | `localhost` | 缓存 / 锁 / 限流 / 向量索引共用 |
 | `REDIS_PORT` | `6379` | |
 | `REDIS_DATABASE` | `0` | |
-| `MED_MYSQL_HOST` | `127.0.0.1` | ShardingSphere 数据源主机 |
+| `MED_MYSQL_HOST` | `127.0.0.1` | ShardingSphere 数据源主机，同时是 Flyway 迁移目标 |
 | `MED_MYSQL_PORT` | `3306` | |
 | `MED_MYSQL_DATABASE` | `med_qa` | 由 init 脚本创建 |
-| `MED_MYSQL_USERNAME` | `med_qa` | 最小权限应用账号 |
+| `MED_MYSQL_USERNAME` | `med_qa` | 最小权限应用账号（需有建表权限，迁移要用） |
 | `MED_MYSQL_PASSWORD` | `med_qa` | **生产必须覆盖** |
 | `MED_MYSQL_ROOT_PASSWORD` | `med_qa_root` | 仅 Compose MySQL 容器使用 |
+| `MED_MIGRATION_URL` | 空 | 可选，整串 JDBC URL 覆盖（留空则用上面的 `MED_MYSQL_*` 坐标拼装） |
+| `MED_MIGRATION_LOCATIONS` | `classpath:db/migration` | Flyway 迁移脚本位置 |
 
 ### 5.2 模型服务
 
@@ -298,7 +300,7 @@ livenessProbe:
 | 层次 | 归属 | 内容 |
 |---|---|---|
 | 数据库 + 账号 | `docker/mysql/init/01-create-db.sql`（Compose 首次启动执行一次，幂等） | 建 `med_qa` 库（utf8mb4）、建 `med_qa@%` / `med_qa@localhost` 账号并授权 |
-| 表结构 | Flyway V1–V3（应用启动时执行） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log` |
+| 表结构 | Flyway V1–V3（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log` |
 | 向量索引 | Spring AI `RedisVectorStore`（`initialize-schema=true`） | RediSearch 索引 `med-doc-index`，TAG 字段 `tenant_id` / `dept_id` / `patient_id` |
 
 分片规则见 `src/main/resources/sharding/med-sharding.yaml`：
@@ -307,6 +309,35 @@ livenessProbe:
 
 > 独立部署（不用 Compose）时，请自行执行 `docker/mysql/init/01-create-db.sql` 等价语句；
 > 表结构无需手工建，Flyway 会迁移。
+
+**迁移为什么直连物理 MySQL，而不是走 `spring.datasource`：** `spring.datasource` 指向的是
+ShardingSphere 代理，它把 `med_message_0..15` 这 16 张物理分表**藏起来**只暴露逻辑表
+`med_message`；而 V1 迁移脚本要建的正是这 16 张物理表。经代理执行会连续失败两次：
+Flyway 先通过代理读 `information_schema` 判断库不存在、于是执行 `CREATE DATABASE`，被 MySQL
+以 `1007 Can't create database ... database exists` 拒绝；即便关掉建库，第一条 `CREATE TABLE`
+也会以 `Load actual table metadata 'med_message_0' failed` 中断。
+因此 Boot 自带的 `FlywayAutoConfiguration` 在 `spring.autoconfigure.exclude` 中被排除，
+改由 `config/MedFlywayConfig` 用一套**独立的迁移连接池**（`med.storage.migration.*`，
+坐标默认与 `MED_MYSQL_*` 同源）执行迁移；该连接池**刻意不注册为 `DataSource` Bean**——
+一旦容器里出现第二个 `DataSource`，MyBatis 的 `@ConditionalOnSingleCandidate(DataSource.class)`
+会失去唯一候选，`SqlSessionTemplate` 无法装配，整个上下文启动失败。
+
+- 迁移开关就是 `spring.flyway.enabled`（默认 `true`，离线测试置 `false`）；
+- 迁移在上下文刷新期执行，**失败即启动失败**，不会带着未迁移的 schema 对外提供服务；
+- 只增不改：回滚到旧版本前请确认旧版本能兼容当前 schema。
+
+> **这条链路第一次真正跑起来（D34）就抓到三个问题**，在此之前它们对构建完全不可见：
+> 1. 依赖里只有 `flyway-core`。Flyway 10 把各数据库支持拆成了独立模块，缺 `flyway-mysql`
+>    时迁移直接 `FlywayException: Unsupported Database: MySQL 8.0`，服务连不上库；
+> 2. 迁移原本走 Boot 自带的 `FlywayAutoConfiguration`，也就是走 ShardingSphere 代理，于是
+>    撞上上面的 `1007` / `Load actual table metadata` 两个失败；
+> 3. Testcontainers 1.20.6 使用的 Docker API 版本回退值低于当前 Docker Engine 的下限，
+>    导致 `DockerAvailableCondition` 判定"本机没有 Docker"，**D30 集成测试整套被静默跳过**——
+>    前两个问题正是因此长期藏在"全绿"的构建里。现已把 Testcontainers 升到 1.21.x，
+>    并由 `TestcontainersVersionTest` 守住版本下限，防止再次退化成"静默跳过"。
+>
+> 三处都只有「真实启动 + 真实中间件」才暴露（纯文本断言当时全绿），
+> 现由 `MedFlywayConfigTest` 与 `MedProductionStartupIntegrationTest` 覆盖。
 
 ---
 

@@ -154,6 +154,8 @@ class ReadmeDocumentationTest {
                 "MED_MYSQL_HOST",
                 "MED_MYSQL_DATABASE",
                 "MED_MYSQL_USERNAME",
+                "MED_MIGRATION_URL",
+                "MED_MIGRATION_LOCATIONS",
                 "OPENAI_BASE_URL",
                 "OPENAI_API_KEY",
                 "MED_EMBEDDING_MODEL",

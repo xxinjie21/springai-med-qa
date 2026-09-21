@@ -35,12 +35,16 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Clock;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.sql.DataSource;
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
 import org.apache.ibatis.mapping.Environment;
@@ -89,6 +93,13 @@ class MedStorageAndLockIntegrationTest {
 
     private static final int SHARD_COUNT = 16;
 
+    /**
+     * ShardingSphere's URL-argument placeholder syntax, mirrored from
+     * {@code URLArgumentLine#PLACEHOLDER_PATTERN}: two dollar signs, the variable name, the {@code ::}
+     * separator and the default value.
+     */
+    private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\$\\{([A-Za-z_][A-Za-z0-9_]*)::([^}]*)}");
+
     private static final String TENANT = "tenant-it";
     private static final String DEPT = "dept-cardiology";
 
@@ -119,14 +130,25 @@ class MedStorageAndLockIntegrationTest {
 
         shardingDs = buildShardingDataSource();
 
-        // Flyway creates the 16 med_message shards + med_session + med_audit_log on the real MySQL
-        // instance, validating the production DDL against a genuine database.
-        Flyway.configure().dataSource(shardingDs).locations("classpath:db/migration").load().migrate();
-
         // Ensure the MySQL JDBC driver is registered (it is a runtime-scoped dependency, so it is on
         // the test classpath but must be loaded before DriverManager accepts the connection URL).
         Class.forName("com.mysql.cj.jdbc.Driver");
-        rawMysql = DriverManager.getConnection(rawMysqlUrl(), mysql.getUsername(), mysql.getPassword());
+        String rawUrl = rawMysqlUrl();
+        rawMysql = DriverManager.getConnection(rawUrl, mysql.getUsername(), mysql.getPassword());
+
+        // Flyway creates the 16 med_message shards + med_session + med_audit_log on the real MySQL
+        // instance, validating the production DDL against a genuine database.
+        //
+        // The migrations must target the raw MySQL server, never the ShardingSphere DataSource. They
+        // create the *physical* shard tables (med_message_0..15), which are precisely the tables the
+        // sharding proxy treats as opaque, so driving them through it breaks twice over: Flyway's
+        // schema-existence probe reads information_schema through the proxy, concludes med_qa is
+        // missing, and the follow-up `CREATE DATABASE med_qa` dies with MySQL error 1007
+        // "database exists". The H2-based mapper tests already migrate through the raw DataSource for
+        // the same reason, and MedFlywayConfig applies the identical rule in production.
+        DataSource migrationDs = new SimpleDriverDataSource(
+                new com.mysql.cj.jdbc.Driver(), rawUrl, mysql.getUsername(), mysql.getPassword());
+        Flyway.configure().dataSource(migrationDs).locations("classpath:db/migration").load().migrate();
 
         Environment environment = new Environment("it", new JdbcTransactionFactory(), shardingDs);
         Configuration configuration = new Configuration(environment);
@@ -313,17 +335,60 @@ class MedStorageAndLockIntegrationTest {
     // ---------------------------------------------------------------------------------------------
 
     private static DataSource buildShardingDataSource() throws IOException {
-        String template = readResource("/sharding/med-sharding-it-template.yaml");
-        String resolved = template
-                .replace("${MED_MYSQL_HOST::127.0.0.1}", mysql.getHost())
-                .replace("${MED_MYSQL_PORT::3306}", String.valueOf(mysql.getMappedPort(MySQLContainer.MYSQL_PORT)))
-                .replace("${MED_MYSQL_DATABASE::med_qa}", mysql.getDatabaseName())
-                .replace("${MED_MYSQL_USERNAME::med_qa}", mysql.getUsername())
-                .replace("${MED_MYSQL_PASSWORD::med_qa}", mysql.getPassword());
+        String resolved = resolveShardingPlaceholders(readResource("/sharding/med-sharding-it-template.yaml"));
         Path tmpYaml = Files.createTempFile("med-sharding-it", ".yaml");
         Files.writeString(tmpYaml, resolved);
-        String url = "jdbc:shardingsphere:file:" + tmpYaml.toAbsolutePath();
+        // The scheme after `jdbc:shardingsphere:` is not free-form: ShardingSphere splits the URL at
+        // its first ':' and looks the resulting type up in the ShardingSphereURLLoader SPI. The
+        // absolute-path loader registers itself as `absolutepath:` (see AbsolutePathURLLoader), NOT
+        // as `file:`; `file:` matches no SPI implementation and the driver aborts with
+        // "SPI-00001: No implementation class load from SPI ... ShardingSphereURLLoader with type
+        // 'file:'". Production uses the sibling `classpath:` scheme. ShardingSphereUrlSchemeTest
+        // pins both against the SPI so the wrong scheme cannot come back.
+        String url = "jdbc:shardingsphere:absolutepath:" + tmpYaml.toAbsolutePath();
         return new SimpleDriverDataSource(new ShardingSphereDriver(), url);
+    }
+
+    /**
+     * Substitutes the {@code $${NAME::default}} placeholders of the integration-test sharding
+     * template with the coordinates of the Testcontainers MySQL instance.
+     *
+     * <p>ShardingSphere's placeholder syntax carries <em>two</em> dollar signs (the pattern is
+     * {@code \$\$\{(.*?)::(.*?)\}} in {@code URLArgumentLine}), and the default lives after the
+     * {@code ::}. Substituting the single-dollar prefix {@code ${NAME::default}} therefore leaves a
+     * stray {@code $} glued to the value -- which is how the port ended up as the unparseable string
+     * {@code "$53140"}. This method matches the full {@code $${...}} token instead, and fails loudly
+     * if the template ever declares a placeholder the test does not know how to fill, so template
+     * drift can never silently leak a literal into the JDBC URL.</p>
+     */
+    private static String resolveShardingPlaceholders(String template) {
+        Map<String, String> values = new LinkedHashMap<>();
+        values.put("MED_MYSQL_HOST", mysql.getHost());
+        values.put("MED_MYSQL_PORT", String.valueOf(mysql.getMappedPort(MySQLContainer.MYSQL_PORT)));
+        values.put("MED_MYSQL_DATABASE", mysql.getDatabaseName());
+        values.put("MED_MYSQL_USERNAME", mysql.getUsername());
+        values.put("MED_MYSQL_PASSWORD", mysql.getPassword());
+
+        Matcher matcher = PLACEHOLDER.matcher(template);
+        Set<String> declared = new LinkedHashSet<>();
+        StringBuilder resolved = new StringBuilder();
+        while (matcher.find()) {
+            String name = matcher.group(1);
+            declared.add(name);
+            String value = values.get(name);
+            if (value == null) {
+                throw new IllegalStateException(
+                        "sharding template declares $${" + name + "::...} but the test cannot supply it");
+            }
+            matcher.appendReplacement(resolved, Matcher.quoteReplacement(value));
+        }
+        matcher.appendTail(resolved);
+
+        if (!declared.equals(values.keySet())) {
+            throw new IllegalStateException("sharding template declares " + declared
+                    + " but the test substitutes " + values.keySet());
+        }
+        return resolved.toString();
     }
 
     private static RedissonClient buildRedissonClient() {

@@ -13,6 +13,11 @@ spring:
       # (this application runs Spring Data Redis on Lettuce) and creates the search index eagerly
       # during context refresh; config/VectorStoreConfig declares the store lazily instead.
       - org.springframework.ai.vectorstore.redis.autoconfigure.RedisVectorStoreAutoConfiguration
+      # Flyway auto-configuration would migrate through the single DataSource bean, which here is the
+      # ShardingSphere proxy - the wrong target for DDL that creates the physical shards. See
+      # med.storage.migration below; config/MedFlywayConfig replaces it with a migration that runs
+      # against the physical MySQL server.
+      - org.springframework.boot.autoconfigure.flyway.FlywayAutoConfiguration
   datasource:
     # All MySQL traffic goes through ShardingSphere-JDBC, which transparently routes
     # med_message writes/reads to med_message_{crc32(session_id) % 16}.
@@ -117,6 +122,35 @@ med:
     default-page-size: ${MED_SESSION_DEFAULT_PAGE_SIZE:20}
     max-page-size: ${MED_SESSION_MAX_PAGE_SIZE:100}
     max-title-length: ${MED_SESSION_MAX_TITLE_LENGTH:200}
+  # Schema migration target (D34). Flyway must talk to the physical MySQL server, never to the
+  # ShardingSphere data source declared under spring.datasource: the migrations create the physical
+  # shard tables med_message_0..15, which are precisely the tables the sharding proxy treats as
+  # opaque. Driven through the proxy they fail twice over - Flyway's schema-existence probe reads
+  # information_schema through it, concludes the schema is missing, issues CREATE DATABASE and dies
+  # with MySQL error 1007 "database exists"; and even with schema creation switched off the first
+  # CREATE TABLE aborts with "Load actual table metadata 'med_message_0' failed", because the proxy
+  # tries to introspect a table that does not exist yet. Boot's Flyway auto-configuration is therefore
+  # excluded in spring.autoconfigure.exclude, and config/MedFlywayConfig migrates through a dedicated
+  # pool instead. The coordinates are the same MED_MYSQL_* variables the sharding file consumes, so
+  # each deployment still has exactly one source of truth.
+  #
+  # The switch is spring.flyway.enabled (MedFlywayConfig honours it): the offline test suite already
+  # pins it to false, so unit tests never reach for a database, while production leaves it unset and
+  # migrates on startup.
+  #
+  # url is an optional full-URL override for targets host/port/database cannot express; leave it
+  # unset in a normal deployment. The migration pool built from these coordinates is intentionally
+  # NOT a DataSource bean: a second DataSource would make the type ambiguous for MyBatis and stop the
+  # context from starting (see config/MedMigrationPool).
+  storage:
+    migration:
+      host: ${MED_MYSQL_HOST:127.0.0.1}
+      port: ${MED_MYSQL_PORT:3306}
+      database: ${MED_MYSQL_DATABASE:med_qa}
+      username: ${MED_MYSQL_USERNAME:med_qa}
+      password: ${MED_MYSQL_PASSWORD:med_qa}
+      url: ${MED_MIGRATION_URL:}
+      locations: ${MED_MIGRATION_LOCATIONS:classpath:db/migration}
   # API-key authentication and patient-session ownership enforcement (D21). The filter is enabled by
   # default and fails closed: until API keys are mounted (per environment, never committed) every
   # request without a valid key is rejected with 401. Local dev / offline tests set

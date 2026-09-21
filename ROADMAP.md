@@ -174,6 +174,19 @@ springai-med-qa/
 | D32 | 质量门禁与可观测 | JaCoCo `check` 覆盖率门禁（指令 90% / 分支 80% / 行 90%，绑定 `verify`，CI 直接阻断）；`MedStorageHealthIndicator` 探测 ShardingSphere(MySQL) + Redis 并给出分组件原因；`MedComponentInfoContributor` 通过 `/actuator/info` 暴露版本矩阵；开启 K8s liveness/readiness 探针组 | `feat(actuator): add coverage gate and storage health probes` |
 | D33 | 收尾加固 | 真实 `docker build` 验证 / 英文 README / 告警接入 | `chore: finalize operations hardening` |
 
+### 阶段 6：生产启动与真实中间件验证（D34–D36）
+
+> 阶段 6 的出发点：D1–D33 的单测全部把 `spring.flyway.enabled` 固定为 `false` 以保证离线可跑，
+> 于是"生产启动路径"从未被任何测试执行过；同时 D30 的 Testcontainers 集成测试因为
+> Testcontainers 1.20.6 与 Docker Engine 的 API 版本下限冲突而被**静默跳过**。
+> 两者叠加，让两个"服务在任何环境都起不来"的缺陷一直通过构建。阶段 6 专门补齐这条链路。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D34 | 生产启动迁移链路修正 | `flyway-mysql`（Flyway 10 拆分出各数据库支持模块，仅 `flyway-core` 会 `Unsupported Database: MySQL`）；Testcontainers 升至 1.21.x（Docker API 版本回退值低于 Engine 下限会让集成测试静默跳过）；`MedMigrationProperties` + `MedMigrationPool` + `MedFlywayConfig` 让 Flyway **直连物理 MySQL**（绕开 ShardingSphere 代理，代理下会 `MySQL 1007` / `Load actual table metadata` 失败），且迁移连接池**不得注册为 `DataSource` Bean**（第二个 `DataSource` 会让 MyBatis `@ConditionalOnSingleCandidate` 失去唯一候选、`SqlSessionTemplate` 无法装配）；`MedProductionStartupIntegrationTest` 用真实 MySQL 验证启动即迁移出 16 张分表 | `feat: daily iteration D34` |
+| D35 | 集成测试纳入 CI | GitHub Actions 增加容器集成测试阶段（Testcontainers 可用的 runner 上真实跑 MySQL + Redis Stack）、镜像层缓存复用，避免集成套件再次静默跳过 | `ci: run the testcontainers suite in the workflow` |
+| D36 | RAG 检索真实中间件验证 | Testcontainers 起 Redis Stack，验证 `RedisVectorStore` + `QuestionAnswerAdvisor` 的科室/患者 TAG 过滤检索与租户隔离（仍只做向量相似度 + 标签过滤，不解析文本） | `test: add redis stack integration test for rag retrieval` |
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）
