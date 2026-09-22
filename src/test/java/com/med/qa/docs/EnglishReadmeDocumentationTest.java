@@ -205,6 +205,17 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the CI chapter documents the integration stage and the mandatory-Docker switch")
+    void ciChapterDocumentsTheIntegrationStage() {
+        assertThat(english).contains("MED_TEST_INTEGRATION_REQUIRED");
+        assertThat(english).contains("med.test.integration.required");
+        assertThat(english).contains("com.med.qa.integration.*IntegrationTest");
+        assertThat(english).contains("CiIntegrationStageConfigTest");
+        assertThat(english).contains("docker save");
+        assertThat(english).contains("continue-on-error");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

@@ -321,16 +321,31 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储与锁链路；无 Docker 时自动禁用 |
+| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储与锁链路 |
+| 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
 | 覆盖率门禁 | `jacoco-coverage-gate` 执行（`verify` 阶段，`haltOnFailure`）：指令 ≥ 90%、分支 ≥ 80%、行 ≥ 90%，阈值以 `jacoco.min.*` 属性声明；不达标直接 BUILD FAILURE，CI 无法合入 |
 
 ```bash
 ./mvnw clean verify          # 全量单测 + 覆盖率报告 + 门禁校验
 ./mvnw clean test            # 仅跑单测（不触发门禁）
+./mvnw test -Dtest='com.med.qa.integration.*IntegrationTest' -DfailIfNoTests=true   # 仅跑集成测试
 ```
 
-被门禁守护的构建契约同样有单测覆盖：`com.med.qa.ci.CoverageGateConfigTest` 用 DOM 解析 `pom.xml`，断言门禁执行存在、绑定 `verify`、三个计数器阈值均来自属性且落在 `[0,1]` 区间。
+### 集成测试「不许静默跳过」开关（D35）
+
+集成套件曾经可以**悄悄把自己跳过**：Docker 探测返回 false 时 `DockerAvailableCondition` 直接把整个测试类标为 skipped，构建依然全绿，真实中间件断言一次都没跑。D34 查出的两个「服务在任何环境都起不来」的缺陷正是这样躲过了每一次构建。
+
+因此跳过行为被显式化：只有**没人声明 Docker 必需**时才允许跳过。
+
+| 开关 | 形式 | 默认 | 说明 |
+|---|---|---|---|
+| `med.test.integration.required` | JVM 系统属性（优先级高） | 未设置 | `-Dmed.test.integration.required=true` 声明 Docker 必需 |
+| `MED_TEST_INTEGRATION_REQUIRED` | 环境变量 | 未设置 | CI 集成阶段用它置位 |
+
+取值 `true` / `1` / `yes` / `on`（大小写不敏感）为真。系统属性一旦出现就覆盖环境变量，所以本机可以用 `-Dmed.test.integration.required=false` 强制退回「可跳过」。声明必需而 Docker 不可用时，集成测试在 `@BeforeAll` 抛出 `IllegalStateException` 并直接点名这个开关，而不是报告 skipped。
+
+被门禁守护的构建契约同样有单测覆盖：`com.med.qa.ci.CoverageGateConfigTest` 用 DOM 解析 `pom.xml`，断言门禁执行存在、绑定 `verify`、三个计数器阈值均来自属性且落在 `[0,1]` 区间；`com.med.qa.ci.CiIntegrationStageConfigTest` 解析 `.github/workflows/ci.yml`，断言集成阶段存在、导出必需开关、限定 `-Dtest` 选择集合并开启 `failIfNoSpecifiedTests` / `failIfNoTests`、镜像层缓存键随镜像坐标变化、且全程没有 `continue-on-error` 逃生口。
 
 ---
 
@@ -338,8 +353,11 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 
 | Workflow | 触发 | 动作 |
 |---|---|---|
-| `ci.yml` | push / PR 到 `main` | Temurin JDK 17 + Maven 缓存 → `./mvnw verify` → 上传 JaCoCo 与 Surefire 报告 |
+| `ci.yml` / `verify` job | push / PR 到 `main` | Temurin JDK 17 + Maven 缓存 → `./mvnw verify` → 上传 JaCoCo 与 Surefire 报告 |
+| `ci.yml` / `integration` job | push / PR 到 `main` | Temurin JDK 17 + 中间件镜像层缓存 → `MED_TEST_INTEGRATION_REQUIRED=true` 下只跑 `com.med.qa.integration.*IntegrationTest`（真实 MySQL 8.0 + Redis Stack），失败即阻断 |
 | `docker-publish.yml` | push tag `v*` / 手动 `workflow_dispatch` | 容器内多阶段构建 → 登录 GHCR → 推送镜像 `ghcr.io/xxinjie21/springai-med-qa` |
+
+集成阶段有三道互相独立的锁，专门堵住「静默跳过」：① 环境变量把「没有 Docker」变成硬失败；② `-Dtest` 限定 + `failIfNoSpecifiedTests` / `failIfNoTests`，测试类被改名或删掉时直接失败；③ runner 用 `ubuntu-latest`，自带 Docker 守护进程。中间件镜像用 `docker save` / `docker load` 归档并走 `actions/cache` 复用镜像层，缓存键里写死了 `mysql-8.0.36` 与 `redis-stack-7.4.0-v3`——镜像 tag 变了而缓存键没变，守护测试会失败。
 
 ---
 
@@ -358,7 +376,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 
 ## 迭代进度
 
-按 [`ROADMAP.md`](./ROADMAP.md) 分五阶段推进，每日一个迭代「编码 → 单测 → commit → 推送」闭环：
+按 [`ROADMAP.md`](./ROADMAP.md) 分阶段推进，每日一个迭代「编码 → 单测 → commit → 推送」闭环：
 
 | 阶段 | 迭代 | 状态 |
 |---|---|---|
@@ -367,7 +385,8 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 | 阶段 2 RAG 检索层 | D13–D18 | 已完成 |
 | 阶段 3 业务能力 | D19–D26 | 已完成 |
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
-| 阶段 5 运维加固 | D32 | 进行中（D32 已完成，D33 待定） |
+| 阶段 5 运维加固 | D32–D33 | 已完成 |
+| 阶段 6 生产启动与真实中间件验证 | D34–D36 | 进行中（D34、D35 已完成，D36 待定） |
 
 ---
 

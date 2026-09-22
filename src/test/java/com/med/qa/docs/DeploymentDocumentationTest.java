@@ -182,6 +182,16 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the CI integration stage and how to reproduce it locally")
+    void integrationStageIsDocumented() {
+        assertThat(handbook).contains("MED_TEST_INTEGRATION_REQUIRED");
+        assertThat(handbook).contains("med.test.integration.required");
+        assertThat(handbook).contains("com.med.qa.integration.*IntegrationTest");
+        assertThat(handbook).contains("docker load");
+        assertThat(handbook).contains("1.21.0");
+    }
+
+    @Test
     @DisplayName("the troubleshooting table explains every business error code an operator can observe")
     void troubleshootingCoversBusinessErrorCodes() {
         assertThat(handbook).contains("401");

@@ -119,6 +119,33 @@ scripts/verify-docker-build.sh my-registry/med-qa:check
 > 两处都只有「真实构建 + 真实启动」才暴露（纯文本断言当时全绿）。现已修复，并分别加了
 > `--launcher` 与「characterEncoding 必须是可被 `Charset` 解析的 Java 字符集名」守护断言。
 
+### 2.4 集成测试阶段与「不许静默跳过」开关（D35）
+
+`ci.yml` 现在有两个互相独立的 job：`verify`（离线全量单测 + JaCoCo 门禁）与 `integration`
+（真实 MySQL 8.0 + Redis Stack）。上线前若想在本地复现集成阶段：
+
+```bash
+# 本机有 Docker：只跑集成测试
+./mvnw test -Dtest='com.med.qa.integration.*IntegrationTest' -DfailIfNoTests=true
+
+# 声明 Docker 必需：Docker 不可用时直接失败，而不是报告 skipped
+./mvnw test -Dtest='com.med.qa.integration.*IntegrationTest' \
+            -DfailIfNoTests=true -Dmed.test.integration.required=true
+```
+
+| 开关 | 形式 | 默认 | 说明 |
+|---|---|---|---|
+| `med.test.integration.required` | JVM 系统属性（优先级高于环境变量） | 未设置 | `true` / `1` / `yes` / `on` 表示 Docker 必需 |
+| `MED_TEST_INTEGRATION_REQUIRED` | 环境变量 | 未设置 | CI 集成阶段置为 `true` |
+
+**排障**：集成阶段报 `Docker is required for the Testcontainers integration suite but no usable
+daemon is reachable` 说明 runner 上没有可用 Docker，或 Testcontainers 版本低于 1.21.0
+（`TestcontainersVersionTest` 守这条下限）。若本机确实没有 Docker，去掉该开关即可退回「可跳过」。
+
+**镜像层缓存**：集成阶段用 `docker save` / `docker load` 归档 `mysql:8.0.36` 与
+`redis/redis-stack:7.4.0-v3` 并交给 `actions/cache` 复用；缓存键里写死了这两个 tag。
+升级镜像版本时**必须同时改缓存键**，否则会还原出旧镜像——`CiIntegrationStageConfigTest` 会拦住这种漂移。
+
 ---
 
 ## 3. Docker Compose 全栈部署

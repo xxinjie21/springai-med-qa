@@ -220,6 +220,23 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the CI chapter documents the container integration stage and its mandatory-Docker switch")
+    void ciChapterDocumentsTheIntegrationStage() throws IOException {
+        assertThat(readme).contains("`integration` job");
+        assertThat(readme).contains("MED_TEST_INTEGRATION_REQUIRED");
+        assertThat(readme).contains("med.test.integration.required");
+        assertThat(readme).contains("com.med.qa.integration.*IntegrationTest");
+        assertThat(readme).contains("CiIntegrationStageConfigTest");
+        assertThat(readme).contains("docker save");
+
+        // The switch the README tells an operator about must be the one the workflow actually
+        // exports; documenting a variable nobody sets would be worse than not documenting it.
+        String workflow = Files.readString(
+                Path.of(System.getProperty("user.dir"), ".github", "workflows", "ci.yml"));
+        assertThat(workflow).contains("MED_TEST_INTEGRATION_REQUIRED");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

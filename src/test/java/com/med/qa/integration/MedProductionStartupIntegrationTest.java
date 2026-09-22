@@ -74,7 +74,11 @@ class MedProductionStartupIntegrationTest {
 
     @BeforeAll
     static void startMysql() {
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0.36"))
+        // D35: a missing daemon fails loudly when Docker is declared mandatory for the run (CI),
+        // instead of the suite silently skipping itself - see IntegrationTestRequirements.
+        IntegrationTestRequirements.verifyDockerAvailableForCurrentRun(DockerAvailabilityProbe.testcontainers());
+
+        mysql = new MySQLContainer<>(DockerImageName.parse(MedIntegrationImages.MYSQL))
                 .withDatabaseName(MIGRATED_SCHEMA)
                 .withUsername("med_qa")
                 .withPassword("med_qa");

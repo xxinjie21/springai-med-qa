@@ -334,18 +334,45 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain; disabled automatically without Docker |
+| Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain |
+| Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
 | Coverage gate | The `jacoco-coverage-gate` execution (bound to `verify`, `haltOnFailure`) enforces instructions at 90 percent or more, branches at 80 percent or more and lines at 90 percent or more, with the floors declared as `jacoco.min.*` properties; falling below fails the build so CI cannot merge it |
 
 ```bash
 ./mvnw clean verify          # full unit suite, coverage report and the gate
 ./mvnw clean test            # unit tests only, without the gate
+./mvnw test -Dtest='com.med.qa.integration.*IntegrationTest' -DfailIfNoTests=true   # integration tests only
 ```
+
+### The "no silent skip" switch for integration tests (D35)
+
+The integration suite used to be able to disable itself quietly. When the Docker probe answered
+false, `DockerAvailableCondition` reported the whole class as skipped, the build stayed green, and
+the real-middleware assertions never ran once. That is exactly how the two defects found in D34 -
+both of which stopped the service from starting in any environment - survived every single build.
+
+Skipping is therefore now an explicit decision: it is only allowed while nobody declares Docker
+mandatory.
+
+| Switch | Form | Default | Meaning |
+|---|---|---|---|
+| `med.test.integration.required` | JVM system property, highest precedence | unset | `-Dmed.test.integration.required=true` declares Docker mandatory |
+| `MED_TEST_INTEGRATION_REQUIRED` | Environment variable | unset | The CI integration stage sets this |
+
+The truthy values are `true`, `1`, `yes` and `on`, case-insensitive. A system property, once present,
+outranks the environment variable, so a developer can force
+`-Dmed.test.integration.required=false` to go back to the skippable behaviour. When Docker is
+declared mandatory and is unavailable, the integration test raises an `IllegalStateException` from its
+`@BeforeAll` naming that switch, instead of reporting itself skipped.
 
 The build contracts guarded by the gate are themselves covered:
 `com.med.qa.ci.CoverageGateConfigTest` parses `pom.xml` with DOM and asserts that the gate exists,
 is bound to `verify`, and takes all three counter floors from properties within `[0,1]`.
+`com.med.qa.ci.CiIntegrationStageConfigTest` parses `.github/workflows/ci.yml` and asserts that the
+integration stage exists, exports the mandatory switch, narrows `-Dtest` while enabling
+`failIfNoSpecifiedTests` and `failIfNoTests`, keeps the image layer cache key in step with the image
+coordinates, and leaves no `continue-on-error` escape hatch anywhere in the workflow.
 
 ---
 
@@ -401,8 +428,17 @@ rule).
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yml` | Push or pull request to `main` | Temurin JDK 17 with Maven caching, then `./mvnw verify`, then uploads the JaCoCo and Surefire reports |
+| `ci.yml`, `verify` job | Push or pull request to `main` | Temurin JDK 17 with Maven caching, then `./mvnw verify`, then uploads the JaCoCo and Surefire reports |
+| `ci.yml`, `integration` job | Push or pull request to `main` | Temurin JDK 17 with a middleware image layer cache, then `com.med.qa.integration.*IntegrationTest` only - against a real MySQL 8.0 and Redis Stack - under `MED_TEST_INTEGRATION_REQUIRED=true`; any failure blocks the change |
 | `docker-publish.yml` | Push of a `v*` tag or manual `workflow_dispatch` | Multi-stage build inside the container, login to GHCR, push `ghcr.io/xxinjie21/springai-med-qa` |
+
+The integration stage uses three independent locks against the silent skip: (1) the environment
+variable turns "no Docker" into a hard failure; (2) a narrowed `-Dtest` plus `failIfNoSpecifiedTests`
+and `failIfNoTests` fails the build when a test class is renamed or deleted; (3) the runner is
+`ubuntu-latest`, which ships a Docker daemon. The middleware images are archived with `docker save`
+and restored with `docker load` through `actions/cache`, and the cache key spells out
+`mysql-8.0.36` and `redis-stack-7.4.0-v3` - bumping a tag without bumping the key fails the guard
+test.
 
 ---
 
@@ -431,6 +467,7 @@ the loop of code, unit tests, commit and push:
 | Phase 3, business capabilities | D19 to D26 | Done |
 | Phase 4, deployment and wrap-up | D27 to D31 | Done |
 | Phase 5, operations hardening | D32 to D33 | Done |
+| Phase 6, production startup and real middleware | D34 to D36 | In progress (D34 and D35 done, D36 pending) |
 
 ---
 

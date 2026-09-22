@@ -118,13 +118,18 @@ class MedStorageAndLockIntegrationTest {
 
     @BeforeAll
     static void startInfrastructure() throws Exception {
-        mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0.36"))
+        // D35: when the run declares Docker mandatory (med.test.integration.required / CI), a missing
+        // daemon must fail here with a message that names the switch, instead of the suite reporting
+        // itself skipped. DockerAvailableCondition deliberately leaves the class enabled in that case.
+        IntegrationTestRequirements.verifyDockerAvailableForCurrentRun(DockerAvailabilityProbe.testcontainers());
+
+        mysql = new MySQLContainer<>(DockerImageName.parse(MedIntegrationImages.MYSQL))
                 .withDatabaseName("med_qa")
                 .withUsername("med_qa")
                 .withPassword("med_qa");
         mysql.start();
 
-        redis = new GenericContainer<>(DockerImageName.parse("redis/redis-stack:7.4.0-v3"))
+        redis = new GenericContainer<>(DockerImageName.parse(MedIntegrationImages.REDIS_STACK))
                 .withExposedPorts(6379);
         redis.start();
 

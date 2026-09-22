@@ -1,9 +1,11 @@
 # Continuous integration: build, test and publish JaCoCo coverage report.
 #
-# Triggered on every push / pull request targeting main. Runs `mvn verify`
-# which executes the full unit test suite and generates the JaCoCo XML/HTML
-# coverage report (bound to the verify phase in pom.xml), then uploads the
-# report as a build artifact.
+# Triggered on every push / pull request targeting main. Two independent jobs:
+#
+#   verify      - `mvn verify` on the full offline suite, plus the JaCoCo coverage gate and the
+#                 coverage / Surefire artefacts. This is the quality gate.
+#   integration - the Testcontainers suite against real MySQL and Redis Stack (D35). This is the
+#                 real-middleware gate, and it is deliberately unable to skip itself.
 name: CI
 
 on:
@@ -50,6 +52,90 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ------------------------------------------------------------------------------------------------
+  # D35: container integration stage.
+  #
+  # The Testcontainers suite used to be able to skip itself without anybody noticing. Below
+  # Testcontainers 1.21.0 the Docker probe answered "no daemon" on a current Docker Engine (the API
+  # version it fell back to was below the engine's floor), DockerAvailableCondition then reported the
+  # whole class as *skipped*, and `mvn verify` stayed green while the real-middleware assertions never
+  # ran. Two production-blocking defects - a missing `flyway-mysql` module and migrations driven
+  # through the ShardingSphere proxy - survived every build that way until D34 finally ran the suite.
+  #
+  # This job makes that silent skip impossible, with three independent locks:
+  #   1. MED_TEST_INTEGRATION_REQUIRED=true turns "no Docker" into a hard failure instead of a skip
+  #      (IntegrationTestRequirements.verifyDockerAvailable, called from each IT's @BeforeAll).
+  #   2. `-Dtest=com.med.qa.integration.*IntegrationTest` with failIfNoSpecifiedTests and
+  #      failIfNoTests fails the build when no integration class is selected at all - the case a
+  #      renamed or deleted test class would otherwise produce.
+  #   3. runs-on ubuntu-latest, which ships a Docker daemon, so lock 1 has something to check.
+  #
+  # The job is intentionally never marked continue-on-error: a red integration stage must block the
+  # change, not decorate it.
+  # ------------------------------------------------------------------------------------------------
+  integration:
+    name: Testcontainers integration stage
+    runs-on: ubuntu-latest
+    env:
+      MED_TEST_INTEGRATION_REQUIRED: 'true'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Grant execute permission for Maven Wrapper
+        run: chmod +x ./mvnw
+
+      # Middleware image layer cache. The Testcontainers containers boot mysql:8.0.36 and
+      # redis/redis-stack:7.4.0-v3 (MedIntegrationImages); pulling them on every run costs more than
+      # the suite itself. The archive is exported with `docker save` and restored with `docker load`,
+      # which reuses the layers verbatim. The cache key repeats the image coordinates so bumping a tag
+      # in MedIntegrationImages also has to bump the key, otherwise a stale archive would be restored.
+      - name: Restore middleware image layer cache
+        id: middleware-images
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/med-qa-middleware-images.tar
+          key: med-qa-middleware-images-mysql-8.0.36-redis-stack-7.4.0-v3
+
+      - name: Load cached middleware images
+        if: steps.middleware-images.outputs.cache-hit == 'true'
+        run: docker load --input "${{ runner.temp }}/med-qa-middleware-images.tar"
+
+      - name: Pull and archive middleware images
+        if: steps.middleware-images.outputs.cache-hit != 'true'
+        run: |
+          docker pull mysql:8.0.36
+          docker pull redis/redis-stack:7.4.0-v3
+          docker save --output "${{ runner.temp }}/med-qa-middleware-images.tar" \
+            mysql:8.0.36 redis/redis-stack:7.4.0-v3
+
+      # Only the integration classes run here; the offline suite and the coverage gate belong to the
+      # verify job, so JaCoCo is skipped to keep this stage fast and focused.
+      - name: Run the Testcontainers integration suite
+        run: >
+          ./mvnw --batch-mode --no-transfer-progress
+          -Djacoco.skip=true
+          -Dtest='com.med.qa.integration.*IntegrationTest'
+          -DfailIfNoTests=true
+          -Dsurefire.failIfNoSpecifiedTests=true
+          test
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
           path: target/surefire-reports/
           if-no-files-found: warn
           retention-days: 7
