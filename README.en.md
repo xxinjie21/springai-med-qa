@@ -217,6 +217,25 @@ Department-level documents use the reserved `patient_id` value `__shared__`; a p
 with `patient_id IN [patient, __shared__]`, while tenant and department are equality conditions
 combined with AND.
 
+#### Identifier escaping (D36)
+
+RediSearch's `TAG` query grammar reserves a set of characters (`-`, `.`, `:` and others), and the
+official `RedisFilterExpressionConverter` writes the values it receives into the query **verbatim**.
+`MedRetrievalFilters` therefore passes every tag value through `escapeTagValue`: reserved characters
+get a backslash, so `patient-1` becomes `patient\-1`.
+
+This is not optional. D36 measured two symptoms against a real Redis Stack:
+
+| Case | Result without escaping |
+|---|---|
+| Equality filter `tenant_id == tenant-rag-a` | Redis rejects the query: `Syntax error at offset 24 near a`, so every retrieval in that department fails |
+| `IN` filter `patient_id IN [patient-rag-1, __shared__]` | **No error at all**, but only `__shared__` comes back: the patient's own record is silently dropped and the answer rests on department guidelines alone |
+
+Escaping applies to the **query** only. The metadata written into the index keeps the raw identifier,
+and the `MedRetrievalFilters.matches` fallback check still compares raw values — the escaping lives
+exactly at the query-syntax boundary. An identifier made of letters, digits and `_` escapes to
+itself, so the common case produces a byte-identical query.
+
 ---
 
 ## Error codes
@@ -334,7 +353,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain |
+| Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
 | Coverage gate | The `jacoco-coverage-gate` execution (bound to `verify`, `haltOnFailure`) enforces instructions at 90 percent or more, branches at 80 percent or more and lines at 90 percent or more, with the floors declared as `jacoco.min.*` properties; falling below fails the build so CI cannot merge it |
@@ -373,6 +392,27 @@ is bound to `verify`, and takes all three counter floors from properties within 
 integration stage exists, exports the mandatory switch, narrows `-Dtest` while enabling
 `failIfNoSpecifiedTests` and `failIfNoTests`, keeps the image layer cache key in step with the image
 coordinates, and leaves no `continue-on-error` escape hatch anywhere in the workflow.
+
+### Real-middleware verification of RAG tag retrieval (D36)
+
+`MedRagRetrievalIntegrationTest` boots a real Redis Stack with Testcontainers and wires the whole RAG
+chain onto it: the official `RedisVectorStore` built by `VectorStoreConfig.buildVectorStore`, the
+index its `FT.CREATE` creates, the JSON documents written into Redis, the `TAG` filters translated by
+the official store, and the official `QuestionAnswerAdvisor` assembled by `MedRagAdvisorFactory`. The
+assertions cover department/patient tag filtering, tenant isolation, cross-department isolation, the
+rule that a department-wide query returns guidelines and never a chart, that `QuestionAnswerAdvisor`
+injects only in-scope evidence into the prompt, and the boundary of `deleteByScope`.
+
+The one collaborator replaced by a double is the embedding gateway
+(`DeterministicEmbeddingModel`): the real `EmbeddingModel` is an HTTP client for an external model
+API, which a test can neither authenticate nor make reproducible. The double performs the single
+transformation the gateway performs - text to vector. Similarity scoring, Top-K selection, ranking
+and filter evaluation all still happen inside Redis Stack, so the retrieval behaviour itself remains
+genuinely verified.
+
+The suite found the tag-escaping defect above on the day it landed: its identifiers contain hyphens
+(`dept-cardio`, `patient-rag-1`), whereas every earlier offline test used identifiers such as `hosp1`
+and `p9001`, which happen to avoid RediSearch's reserved characters entirely.
 
 ---
 
@@ -467,7 +507,7 @@ the loop of code, unit tests, commit and push:
 | Phase 3, business capabilities | D19 to D26 | Done |
 | Phase 4, deployment and wrap-up | D27 to D31 | Done |
 | Phase 5, operations hardening | D32 to D33 | Done |
-| Phase 6, production startup and real middleware | D34 to D36 | In progress (D34 and D35 done, D36 pending) |
+| Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 
 ---
 

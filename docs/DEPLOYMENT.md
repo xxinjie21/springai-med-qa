@@ -146,6 +146,36 @@ daemon is reachable` 说明 runner 上没有可用 Docker，或 Testcontainers �
 `redis/redis-stack:7.4.0-v3` 并交给 `actions/cache` 复用；缓存键里写死了这两个 tag。
 升级镜像版本时**必须同时改缓存键**，否则会还原出旧镜像——`CiIntegrationStageConfigTest` 会拦住这种漂移。
 
+### 2.5 RAG 标签检索的真实中间件验证（D36）
+
+`MedRagRetrievalIntegrationTest` 复用同一个 `redis/redis-stack:7.4.0-v3` 镜像，把 RAG 链路接到真实
+Redis Stack 上：官方 `RedisVectorStore`、它建出来的索引、写进 Redis 的 JSON 文档、官方 store 翻译的
+TAG 过滤，以及 `MedDocumentService` / `MedRetrievalService` / `QuestionAnswerAdvisor`。
+
+唯一被替身顶掉的是 Embedding 网关（`DeterministicEmbeddingModel`）：真实 `EmbeddingModel` 要打外部模型
+API，测试环境既没有凭据也无法保证可复现。替身只做「文本 → 向量」，相似度计算、Top-K、排序与过滤求值
+仍全部发生在 Redis Stack 里。因此**部署到现场时，RAG 检索行为与这条测试验证的是同一套代码路径**，
+但索引里的向量由真实网关生成——两者的差异仅在向量数值本身。
+
+> **这条链路第一次接上真实索引（D36）就抓到一个「检索不可用」的缺陷：标识符未转义。**
+>
+> RediSearch 的 `TAG` 查询语法保留了一批字符（`-`、`.`、`:` 等），而官方
+> `RedisFilterExpressionConverter` 把值原样写进查询串。两种症状都实测到了：
+>
+> | 场景 | 未转义的结果 |
+> |---|---|
+> | 等值过滤 `tenant_id == tenant-rag-a` | `Syntax error at offset 24 near a`，该科室全部检索失败 |
+> | `IN` 过滤 `patient_id IN [patient-rag-1, __shared__]` | **不报错**，但只返回 `__shared__`——患者自己的病历被静默丢弃 |
+>
+> 第二种更危险：医生拿到的答案只基于科室指南，而系统没有任何异常信号。现场标识符（UUID、`dept-cardio`
+> 这类）几乎必然带连字符，也就是说这条路径此前在真实环境里根本不可用。
+> 修复方式是 `MedRetrievalFilters.escapeTagValue`：**只转义查询**，索引里仍写原始标识符，
+> 兜底校验 `MedRetrievalFilters.matches` 也仍按原始值比对。
+>
+> 此前所有离线单测的标识符都是 `hosp1` / `p9001` 这类纯字母数字，恰好绕开了全部保留字符，
+> 所以纯文本断言一直是绿的。现由 `MedRetrievalFiltersTest` 的转义用例与
+> `MedRagRetrievalIntegrationTest` 的连字符标识符共同守住。
+
 ---
 
 ## 3. Docker Compose 全栈部署

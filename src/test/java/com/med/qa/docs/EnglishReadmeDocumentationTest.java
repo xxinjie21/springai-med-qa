@@ -216,6 +216,17 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the RAG chapter documents the RediSearch tag escaping and the defect it prevents")
+    void ragChapterDocumentsTagEscaping() {
+        assertThat(english).contains("escapeTagValue");
+        assertThat(english).contains("MedRetrievalFilters");
+        assertThat(english).contains("RedisFilterExpressionConverter");
+        assertThat(english).contains("Syntax error");
+        assertThat(english).contains("MedRagRetrievalIntegrationTest");
+        assertThat(english).contains("DeterministicEmbeddingModel");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

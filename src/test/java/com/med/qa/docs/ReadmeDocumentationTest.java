@@ -237,6 +237,17 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the RAG chapter documents the RediSearch tag escaping and the defect it prevents")
+    void ragChapterDocumentsTagEscaping() {
+        assertThat(readme).contains("escapeTagValue");
+        assertThat(readme).contains("MedRetrievalFilters");
+        assertThat(readme).contains("RedisFilterExpressionConverter");
+        assertThat(readme).contains("Syntax error");
+        assertThat(readme).contains("MedRagRetrievalIntegrationTest");
+        assertThat(readme).contains("DeterministicEmbeddingModel");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

@@ -170,6 +170,11 @@ public final class MedDocumentScope {
      * silently indexed as two tags and could be matched by a filter it does not belong to.
      * Whitespace is rejected for the same reason: it makes tag escaping ambiguous.</p>
      *
+     * <p>Every other character RediSearch reserves in a {@code TAG} query is <em>accepted</em> here
+     * and escaped when the filter expression is built — see
+     * {@link MedRetrievalFilters#escapeTagValue(String)}. Hyphens and dots are pervasive in real
+     * identifiers (UUIDs, {@code dept-cardio}), so rejecting them would make the layer unusable.</p>
+     *
      * @param value candidate tag value
      * @param field metadata key, used in the error message
      * @return the validated value, never {@code null}

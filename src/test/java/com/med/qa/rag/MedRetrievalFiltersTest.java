@@ -11,6 +11,7 @@ import org.springframework.ai.vectorstore.redis.RedisVectorStore;
 import redis.clients.jedis.search.Schema;
 
 import java.lang.reflect.InvocationTargetException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -341,6 +342,123 @@ class MedRetrievalFiltersTest {
             assertThatIllegalArgumentException()
                     .isThrownBy(() -> MedRetrievalFilters.matches(Map.of(), null, true))
                     .withMessageContaining("scope must not be null");
+        }
+    }
+
+    @Nested
+    @DisplayName("escapeTagValue")
+    class TagEscaping {
+
+        @Test
+        @DisplayName("an identifier made of ordinary characters is returned unchanged")
+        void plainIdentifiersAreUntouched() {
+            assertThat(MedRetrievalFilters.escapeTagValue(TENANT)).isEqualTo(TENANT);
+            assertThat(MedRetrievalFilters.escapeTagValue(DEPT)).isEqualTo(DEPT);
+            assertThat(MedRetrievalFilters.escapeTagValue(PATIENT)).isEqualTo(PATIENT);
+            assertThat(MedRetrievalFilters.escapeTagValue(MedDocumentScope.SHARED_PATIENT_TAG))
+                    .isEqualTo(MedDocumentScope.SHARED_PATIENT_TAG);
+        }
+
+        @Test
+        @DisplayName("every character RediSearch reserves in a TAG query gets a backslash")
+        void everyReservedCharacterIsEscaped() {
+            MedRetrievalFilters.REDISEARCH_TAG_SPECIAL_CHARACTERS.chars().forEach(character -> {
+                String value = String.valueOf((char) character);
+
+                assertThat(MedRetrievalFilters.escapeTagValue(value))
+                        .as("'%s' must be escaped", value)
+                        .isEqualTo("\\" + value);
+            });
+        }
+
+        @Test
+        @DisplayName("a UUID-shaped identifier keeps its hyphens, escaped")
+        void uuidShapedIdentifierIsEscaped() {
+            String uuid = "3f2b8c1e-1a2b-4c5d-8e9f-0123456789ab";
+
+            assertThat(MedRetrievalFilters.escapeTagValue(uuid))
+                    .isEqualTo("3f2b8c1e\\-1a2b\\-4c5d\\-8e9f\\-0123456789ab");
+        }
+
+        @Test
+        @DisplayName("an already escaped value is escaped once more, never interpreted")
+        void backslashItselfIsEscaped() {
+            assertThat(MedRetrievalFilters.escapeTagValue("a\\b")).isEqualTo("a\\\\b");
+        }
+
+        @Test
+        @DisplayName("a null value is a programming error")
+        void nullValueIsRejected() {
+            assertThatIllegalArgumentException()
+                    .isThrownBy(() -> MedRetrievalFilters.escapeTagValue(null))
+                    .withMessageContaining("tag value must not be null");
+        }
+
+        @Test
+        @DisplayName("escapeAllTagValues escapes every entry in order")
+        void allValuesAreEscapedInOrder() {
+            assertThat(MedRetrievalFilters.escapeAllTagValues(List.of("p-1", MedDocumentScope.SHARED_PATIENT_TAG)))
+                    .containsExactly("p\\-1", MedDocumentScope.SHARED_PATIENT_TAG);
+        }
+
+        @Test
+        @DisplayName("escapeAllTagValues rejects a null list or a null entry")
+        void malformedValueListIsRejected() {
+            assertThatIllegalArgumentException()
+                    .isThrownBy(() -> MedRetrievalFilters.escapeAllTagValues(null))
+                    .withMessageContaining("tag values must not be null");
+
+            List<Object> withNull = Arrays.asList("p-1", null);
+            assertThatIllegalArgumentException()
+                    .isThrownBy(() -> MedRetrievalFilters.escapeAllTagValues(withNull))
+                    .withMessageContaining("tag value must not be null");
+        }
+    }
+
+    @Nested
+    @DisplayName("the converted RediSearch query escapes the scope tags")
+    class EscapedRedisQuery {
+
+        private static final String TENANT_WITH_HYPHEN = "tenant-rag-a";
+        private static final String DEPT_WITH_HYPHEN = "dept-cardio";
+        private static final String PATIENT_WITH_HYPHEN = "patient-rag-1";
+
+        @Test
+        @DisplayName("a hyphenated scope produces escaped TAG values, not the raw identifiers")
+        void hyphenatedScopeConvertsToAnEscapedQuery() {
+            String query = toRedisQuery(MedRetrievalFilters.scope(MedDocumentScope.ofPatient(
+                    TENANT_WITH_HYPHEN, DEPT_WITH_HYPHEN, PATIENT_WITH_HYPHEN)));
+
+            // Regression: RediSearch rejects `@tenant_id:{tenant-rag-a}` with "Syntax error", and the
+            // unescaped form inside an IN predicate silently drops the patient's own record. Both were
+            // observed against a real Redis Stack; see MedRagRetrievalIntegrationTest.
+            assertThat(query)
+                    .contains("tenant\\-rag\\-a")
+                    .contains("dept\\-cardio")
+                    .contains("patient\\-rag\\-1")
+                    .doesNotContain(TENANT_WITH_HYPHEN)
+                    .doesNotContain(DEPT_WITH_HYPHEN)
+                    .doesNotContain(PATIENT_WITH_HYPHEN);
+        }
+
+        @Test
+        @DisplayName("the IN predicate of a hyphenated patient scope escapes every operand")
+        void hyphenatedInPredicateIsEscaped() {
+            String query = toRedisQuery(MedRetrievalFilters.scope(
+                    MedDocumentScope.ofPatient(TENANT_WITH_HYPHEN, DEPT_WITH_HYPHEN, PATIENT_WITH_HYPHEN)));
+
+            assertThat(query)
+                    .contains("patient\\-rag\\-1")
+                    .contains(MedDocumentScope.SHARED_PATIENT_TAG);
+        }
+
+        @Test
+        @DisplayName("an ordinary identifier still produces the plain query")
+        void plainScopeQueryIsUnchanged() {
+            String query = toRedisQuery(
+                    MedRetrievalFilters.scope(MedDocumentScope.ofPatient(TENANT, DEPT, PATIENT)));
+
+            assertThat(query).contains(TENANT).contains(DEPT).contains(PATIENT);
         }
     }
 }

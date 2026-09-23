@@ -192,6 +192,16 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the RAG retrieval integration test and the tag-escaping defect")
+    void ragRetrievalVerificationIsDocumented() {
+        assertThat(handbook).contains("MedRagRetrievalIntegrationTest");
+        assertThat(handbook).contains("DeterministicEmbeddingModel");
+        assertThat(handbook).contains("escapeTagValue");
+        assertThat(handbook).contains("RedisFilterExpressionConverter");
+        assertThat(handbook).contains("Syntax error");
+    }
+
+    @Test
     @DisplayName("the troubleshooting table explains every business error code an operator can observe")
     void troubleshootingCoversBusinessErrorCodes() {
         assertThat(handbook).contains("401");

@@ -207,6 +207,24 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 科室级文档的 `patient_id` 使用保留值 `__shared__`；患者检索时过滤表达式为
 `patient_id IN [patient, __shared__]`，租户与科室为等值 AND 条件。
 
+#### 标识符转义（D36）
+
+RediSearch 的 `TAG` 查询语法保留了一批字符（`-`、`.`、`:` 等），而官方
+`RedisFilterExpressionConverter` 会把拿到的值**原样**写进查询串。因此 `MedRetrievalFilters`
+在构造过滤表达式时统一调用 `escapeTagValue`：标识符里的保留字符加反斜杠，
+`patient-1` 变成 `patient\-1`。
+
+这一步不是可选项。D36 在真实 Redis Stack 上实测到两种症状：
+
+| 场景 | 未转义的结果 |
+|---|---|
+| 等值过滤 `tenant_id == tenant-rag-a` | 查询被 RediSearch 拒绝：`Syntax error at offset 24 near a`，整个科室的检索全部失败 |
+| `IN` 过滤 `patient_id IN [patient-rag-1, __shared__]` | **不报错**，但只返回 `__shared__`：患者自己的病历被静默丢掉，医生拿到的答案只基于科室指南 |
+
+转义只作用于**查询**。索引里写入的元数据仍是原始标识符，`MedRetrievalFilters.matches`
+的兜底校验也仍按原始值比对——`escapeTagValue` 的职责边界就在查询语法这一层。
+只由字母、数字、`_` 组成的标识符转义后与原值完全一致，常见场景的查询串没有任何变化。
+
 ---
 
 ## 错误码
@@ -321,7 +339,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储与锁链路 |
+| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）与 RAG 标签检索链路（D36） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
 | 覆盖率门禁 | `jacoco-coverage-gate` 执行（`verify` 阶段，`haltOnFailure`）：指令 ≥ 90%、分支 ≥ 80%、行 ≥ 90%，阈值以 `jacoco.min.*` 属性声明；不达标直接 BUILD FAILURE，CI 无法合入 |
@@ -346,6 +364,14 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 取值 `true` / `1` / `yes` / `on`（大小写不敏感）为真。系统属性一旦出现就覆盖环境变量，所以本机可以用 `-Dmed.test.integration.required=false` 强制退回「可跳过」。声明必需而 Docker 不可用时，集成测试在 `@BeforeAll` 抛出 `IllegalStateException` 并直接点名这个开关，而不是报告 skipped。
 
 被门禁守护的构建契约同样有单测覆盖：`com.med.qa.ci.CoverageGateConfigTest` 用 DOM 解析 `pom.xml`，断言门禁执行存在、绑定 `verify`、三个计数器阈值均来自属性且落在 `[0,1]` 区间；`com.med.qa.ci.CiIntegrationStageConfigTest` 解析 `.github/workflows/ci.yml`，断言集成阶段存在、导出必需开关、限定 `-Dtest` 选择集合并开启 `failIfNoSpecifiedTests` / `failIfNoTests`、镜像层缓存键随镜像坐标变化、且全程没有 `continue-on-error` 逃生口。
+
+### RAG 标签检索的真实中间件验证（D36）
+
+`MedRagRetrievalIntegrationTest` 用 Testcontainers 起一个真实 Redis Stack，把 RAG 链路整条接上去：`VectorStoreConfig.buildVectorStore` 造出的官方 `RedisVectorStore`、它 `FT.CREATE` 出来的索引、写进 Redis 的 JSON 文档、由官方 store 翻译的 TAG 过滤，以及 `MedDocumentService` / `MedRetrievalService` / `MedRagAdvisorFactory` 装配的官方 `QuestionAnswerAdvisor`。断言覆盖：科室/患者 TAG 过滤、租户隔离、跨科室隔离、科室级检索只返回指南不返回病历、`QuestionAnswerAdvisor` 只把范围内的证据拼进提示词、以及 `deleteByScope` 的删除边界。
+
+唯一被替身顶掉的是 Embedding 网关（`DeterministicEmbeddingModel`）：真实 `EmbeddingModel` 是打外部模型 API 的 HTTP 客户端，测试里既拿不到凭据也无法保证可复现。替身只做「文本 → 向量」这一件事，相似度计算、Top-K、排序与过滤求值全部仍然发生在 Redis Stack 里——所以检索行为本身依然是被真实验证的。
+
+这条测试上线当天就查出了上面那个 TAG 转义缺陷：集成用例用的标识符带连字符（`dept-cardio`、`patient-rag-1`），而此前所有离线单测的标识符都是 `hosp1` / `p9001` 这类纯字母数字，恰好绕开了 RediSearch 的保留字符。
 
 ---
 
@@ -386,7 +412,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 | 阶段 3 业务能力 | D19–D26 | 已完成 |
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
-| 阶段 6 生产启动与真实中间件验证 | D34–D36 | 进行中（D34、D35 已完成，D36 待定） |
+| 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 
 ---
 
