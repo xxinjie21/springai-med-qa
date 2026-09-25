@@ -218,6 +218,7 @@ class AlertingStackConfigTest {
                 "MedQaTargetDown",
                 "MedQaStorageUnavailable",
                 "MedQaStorageProbeFailed",
+                "MedQaRagIndexDegraded",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -261,6 +262,34 @@ class AlertingStackConfigTest {
         assertThat(read(ALERT_RULES)).contains("http_server_requests_seconds_bucket");
         assertThat(applicationYml).contains("percentiles-histogram");
         assertThat(applicationYml).contains("http.server.requests: true");
+    }
+
+    @Test
+    @DisplayName("the D37 RAG index rule selects the code the vector-index monitor actually exports")
+    void ragIndexRuleMatchesTheExportedCode() throws IOException {
+        // The rule is worthless if the code string drifts from the one MedVectorIndexAlertMonitor
+        // raises: the metric exists, the rule parses, and it simply never fires.
+        assertThat(read("src/main/java/com/med/qa/alert/MedVectorIndexAlertMonitor.java"))
+                .contains("rag-index-degraded");
+        assertThat(read(ALERT_RULES)).contains("code=\"rag-index-degraded\"");
+        assertThat(read(ALERT_RULES)).contains("component: vector-index");
+        // A degraded index degrades answers but does not stop consultations, so it must not page.
+        assertThat(read(ALERT_RULES)).contains("MedQaRagIndexDegraded");
+    }
+
+    @Test
+    @DisplayName("the vector-index monitoring switches are documented in application.yml")
+    void ragIndexPropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_RAG_INDEX_ENABLED",
+                "MED_RAG_INDEX_CHECK_INTERVAL",
+                "MED_RAG_INDEX_INITIAL_DELAY");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // The expectation the probe compares the live index against has to be declared, not implied.
+        assertThat(applicationYml).contains("expected-tag-fields:");
     }
 
     // ---------------------------------------------------------------- alertmanager

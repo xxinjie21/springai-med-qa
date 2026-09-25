@@ -349,6 +349,8 @@ livenessProbe:
 | `MED_RAG_INGEST_MAX_CONTENT_LENGTH` | `20000` | 单文档字符上限 |
 | `MED_RAG_INGEST_MAX_DOCUMENTS` | `500` | 单次请求文档数上限 |
 | `MED_RAG_ADVISOR_ORDER` | `1` | `QuestionAnswerAdvisor` 链序 |
+| `MED_RAG_INDEX_ENABLED` | `true` | 向量索引健康探针开关（**非 Redis Stack 部署必须置 `false`**，否则 Pod 会被判为不健康） |
+| `MED_RAG_INDEX_CHECK_INTERVAL` / `MED_RAG_INDEX_INITIAL_DELAY` | `5m` / `1m` | 索引探针轮询间隔与启动宽限期 |
 
 ---
 
@@ -411,12 +413,43 @@ Flyway 先通过代理读 `information_schema` 判断库不存在、于是执行
 Actuator 暴露范围由 `application.yml` 控制：`management.endpoints.web.exposure.include=health,info,prometheus`，
 `show-details=never`（不向外部泄露细节）。
 
-### 7.1 告警链路（D33）
+健康组件（`/actuator/health`，`show-details=never` 时只暴露聚合状态，组件明细需 `show-details: always` 才可见）：
+
+| 组件 | 判定 |
+|---|---|
+| `med-storage` | `mysql` / `redis` 各自连通性，明细值 `available` |
+| `med-vector-index`（D37） | RAG 向量索引的存在性与 TAG 字段一致性，`reason` ∈ `index-missing` / `schema-drift` / `unreachable` |
+
+### 7.1 向量索引健康与 Schema 漂移（D37）
+
+`med-storage` 只回答「Redis 通不通」。**Redis 通 ≠ 检索可用**：索引可以被手工删掉，或因为实例不是
+Redis Stack 版而从未建成功；也可以存在、但 TAG 字段与配置漂移（字段改名后旧索引没跟着变）。
+两种情况都**不抛异常**——接口照样 200，只是召回变少——所以任何连通性探针都发现不了。
+
+`MedVectorIndexProbe` 通过官方 Jedis 的 `FT.LIST` / `FT.INFO` 读出索引的存在性、文档数、扫描前缀
+与 TAG 字段（**只读元数据**，不做任何向量或检索计算），`MedVectorIndexHealthIndicator` 据此给出：
+
+| `reason` | 触发条件 | 现场处置 |
+|---|---|---|
+| `index-missing` | `FT.LIST` 未报告索引 | 确认 Redis 是 Redis Stack 版；用 `RagAdminController` 重新入库或执行 D38 的重建 |
+| `schema-drift` | 索引未声明 `med.rag.index.expected-tag-fields` 中的 TAG 字段 | 比对 `med.rag.vector-store.metadata-fields`，重建索引 |
+| `unreachable` | 探针本身抛异常 | 先按 Redis 故障处理，此时索引结论不可信 |
+
+> `med.rag.index.expected-tag-fields`（默认 `tenant_id` / `dept_id` / `patient_id`）必须与
+> `med.rag.vector-store.metadata-fields` 中的 `TAG` 项保持一致——探针只能发现「你让它去找」的漂移。
+> 只监控、不重建：重建属 D38，探针永远不会写 Redis。
+
+`MedVectorIndexAlertMonitor` 复用 `med.alert.*` 链路推送：降级 `WARNING`（`rag-index-degraded`）、
+恢复 `INFO`（`rag-index-recovered`）、探针异常 `CRITICAL`（`rag-index-probe-failed`）。
+Prometheus 规则 `MedQaRagIndexDegraded` 消费 `med_qa_alert_total{code="rag-index-degraded"}`。
+
+### 7.2 告警链路（D33）
 
 Actuator 只能回答「有人来问」时的健康状态。`com.med.qa.alert` 补上了推送侧：
 
 ```
 MedStorageAlertMonitor（@Scheduled 轮询既有 MedStorageHealthIndicator）
+MedVectorIndexAlertMonitor（@Scheduled 轮询 MedVectorIndexHealthIndicator，D37）
         └─> MedAlertNotifier（策略过滤 + Redisson TTL Map 去重）
                 ├─> LoggingMedAlertSink   → 应用日志（key=value 结构化行）
                 └─> MetricsMedAlertSink   → med_qa_alert_total（Micrometer）
@@ -426,9 +459,10 @@ MedStorageAlertMonitor（@Scheduled 轮询既有 MedStorageHealthIndicator）
 - **去重**：以 `code:component` 为指纹写入 `med:alert:dedupe`（Redisson `RMapCache`，TTL = cooldown），
   多副本共享同一个抑制窗口，一次故障只响一次；
 - **失败开放**：去重存储不可达时**照常派发**——因为 Redis 挂掉本身就是需要告警的场景；
-- **恢复通知**：组件恢复会补一条 `INFO`（`storage-recovered`），避免「还在坏」与「早已恢复」无法区分。
+- **恢复通知**：组件恢复会补一条 `INFO`（`storage-recovered` / `rag-index-recovered`），
+  避免「还在坏」与「早已恢复」无法区分。
 
-### 7.2 监控栈（可选）
+### 7.3 监控栈（可选）
 
 `docker-compose.yml` 中 Prometheus 与 Alertmanager 位于 `observability` profile，默认**不启动**：
 
@@ -441,7 +475,7 @@ docker compose --profile observability up -d
 | 文件 | 作用 |
 |---|---|
 | `deploy/prometheus/prometheus.yml` | 抓取 `app:8080/actuator/prometheus`，15s 间隔，加载规则并指向 Alertmanager |
-| `deploy/prometheus/med-qa-alerts.yml` | 规则：`MedQaTargetDown` / `MedQaStorageUnavailable` / `MedQaStorageProbeFailed` / `MedQaAlertStorm` / `MedQaHighServerErrorRate` / `MedQaConsultationLatencyHigh` / `MedQaRateLimitStorm` |
+| `deploy/prometheus/med-qa-alerts.yml` | 规则：`MedQaTargetDown` / `MedQaStorageUnavailable` / `MedQaStorageProbeFailed` / `MedQaRagIndexDegraded` / `MedQaAlertStorm` / `MedQaHighServerErrorRate` / `MedQaConsultationLatencyHigh` / `MedQaRateLimitStorm` |
 | `deploy/alertmanager/alertmanager.yml` | 按 `alertname` + `component` 分组；`critical` 走独立接收器与更短的重复间隔；抑制规则避免「整体不可达」时重复刷屏 |
 
 > **必须替换**：`alertmanager.yml` 中的 `webhook_configs.url` 是占位地址（Alertmanager 不支持在配置里

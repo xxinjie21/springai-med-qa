@@ -1,12 +1,15 @@
 package com.med.qa.config;
 
 import com.med.qa.actuator.MedStorageHealthIndicator;
+import com.med.qa.actuator.MedVectorIndexHealthIndicator;
 import com.med.qa.alert.LoggingMedAlertSink;
 import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertProperties;
 import com.med.qa.alert.MedAlertSink;
 import com.med.qa.alert.MedStorageAlertMonitor;
+import com.med.qa.alert.MedVectorIndexAlertMonitor;
 import com.med.qa.alert.MetricsMedAlertSink;
+import com.med.qa.rag.MedRagIndexProperties;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.ObjectProvider;
@@ -20,7 +23,11 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import java.util.List;
 
 /**
- * Wires the alert chain: log sink + metrics sink -> notifier -> storage monitor.
+ * Wires the alert chain: log sink + metrics sink -> notifier -> monitors.
+ *
+ * <p>Two monitors feed the chain: the storage monitor (MySQL / Redis reachability) and the RAG
+ * vector-index monitor (index existence and TAG schema). The second is additionally gated by
+ * {@code med.rag.index.enabled}.</p>
  *
  * <p>The whole configuration is gated by {@code med.alert.enabled} (default {@code true}). Setting
  * it to {@code false} removes every alert bean, which is what the offline test slices and a
@@ -48,6 +55,9 @@ public class MedAlertConfig {
 
     /** Bean name of the scheduled storage monitor. */
     public static final String STORAGE_MONITOR = "medStorageAlertMonitor";
+
+    /** Bean name of the scheduled RAG vector-index monitor. */
+    public static final String VECTOR_INDEX_MONITOR = "medVectorIndexAlertMonitor";
 
     /**
      * Contributes the sink that always works, even when every remote collector is down.
@@ -107,5 +117,28 @@ public class MedAlertConfig {
             ObjectProvider<MedStorageHealthIndicator> healthIndicators,
             MedAlertNotifier notifier) {
         return new MedStorageAlertMonitor(healthIndicators, notifier);
+    }
+
+    /**
+     * Contributes the scheduled RAG vector-index monitor.
+     *
+     * <p>Gated by the same switch as the probe it reads: {@code med.rag.index.enabled=false} removes
+     * both the health component and this monitor, so a deployment without Redis Stack neither reports
+     * an unhealthy index nor pages about one.</p>
+     *
+     * <p>The probe arrives as an {@link ObjectProvider} for the same reason as the storage monitor's:
+     * the context must still refresh when the indicator was not contributed.</p>
+     *
+     * @param healthIndicators provider of the {@link MedVectorIndexHealthIndicator}
+     * @param notifier         the alert dispatcher
+     * @return the vector-index monitor
+     */
+    @Bean(VECTOR_INDEX_MONITOR)
+    @ConditionalOnProperty(prefix = MedRagIndexProperties.PREFIX, name = "enabled",
+            havingValue = "true", matchIfMissing = true)
+    public MedVectorIndexAlertMonitor medVectorIndexAlertMonitor(
+            ObjectProvider<MedVectorIndexHealthIndicator> healthIndicators,
+            MedAlertNotifier notifier) {
+        return new MedVectorIndexAlertMonitor(healthIndicators, notifier);
     }
 }

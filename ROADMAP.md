@@ -187,6 +187,22 @@ springai-med-qa/
 | D35 | 集成测试纳入 CI | GitHub Actions 增加容器集成测试阶段（Testcontainers 可用的 runner 上真实跑 MySQL + Redis Stack）、镜像层缓存复用，避免集成套件再次静默跳过 | `ci: run the testcontainers suite in the workflow` |
 | D36 | RAG 检索真实中间件验证 | Testcontainers 起 Redis Stack，验证 `RedisVectorStore` + `QuestionAnswerAdvisor` 的科室/患者 TAG 过滤检索与租户隔离（仍只做向量相似度 + 标签过滤，不解析文本） | `test: add redis stack integration test for rag retrieval` |
 
+### 阶段 7：RAG 索引运维与检索可观测（D37–D39）
+
+> 阶段 7 的出发点：阶段 6 证明了 RAG 链路在真实 Redis Stack 上**能**工作，但没有任何机制回答
+> 「此刻它**是否还**在工作」。D36 暴露的 TAG 转义缺陷有两个共同特征——**不抛异常**、**只让检索
+> 悄悄少返回数据**；索引被误删、`FT.CREATE` 因 Redis 不是 Stack 版而没建成、配置改了
+> `metadata-fields` 而旧索引的 TAG 字段没跟着变，这三类事故的现场表现与它完全一样：服务健康、
+> 接口 200、医生拿到一个只用指南拼出来的答案。`/actuator/health` 目前只探 MySQL 与 Redis 的
+> 连通性，向量索引的**存在性**与**Schema 一致性**从未被任何探针或告警覆盖。
+> 阶段 7 把「检索层可用」变成可观测、可告警、可回归的运维对象。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D37 | RAG 索引健康与 Schema 漂移检测 | `MedVectorIndexProbe` 通过官方 Jedis `FT.LIST` / `FT.INFO` 读出索引的存在性、文档数与 TAG 字段（只读元数据，不做任何向量或检索计算）；`MedVectorIndexReport` 把 `FT.INFO` 的嵌套交替列表解码为可断言的值对象并算出「配置声明但索引里没有」的 TAG 字段；`MedVectorIndexHealthIndicator` 把结果并入 `/actuator/health`（`up` / `index-missing` / `schema-drift` / `unreachable` 四种结论，文档数一并暴露）；`MedVectorIndexAlertMonitor` 复用既有 `MedAlertNotifier` 链路把降级与恢复推给日志与 Prometheus（`rag-index-degraded` / `rag-index-recovered` / `rag-index-probe-failed`）；`med.rag.index.*` 配置开关与期望 TAG 字段清单；`MedVectorIndexProbeIntegrationTest` 在真实 Redis Stack 上验证探针读到的正是 `RedisVectorStore` 建出的索引 | `feat(rag): add vector index health probe with schema drift detection` |
+| D38 | 索引重建编排 | 计划中：在 D37 的探针之上提供受控的索引重建（`FT.DROPINDEX` + 重新入库），带分布式互斥与进度上报 | 计划中 |
+| D39 | 检索质量回归基线 | 计划中：固定金标问题集 + 期望命中集合，把检索质量变成可在 CI 中回归的断言 | 计划中 |
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

@@ -179,7 +179,10 @@ class ReadmeDocumentationTest {
                 "MED_RAG_MAX_TOP_K",
                 "MED_RAG_SIMILARITY_THRESHOLD",
                 "MED_RAG_INGEST_BATCH_SIZE",
-                "MED_RAG_INGEST_MAX_DOCUMENTS");
+                "MED_RAG_INGEST_MAX_DOCUMENTS",
+                "MED_RAG_INDEX_ENABLED",
+                "MED_RAG_INDEX_CHECK_INTERVAL",
+                "MED_RAG_INDEX_INITIAL_DELAY");
 
         String configuration = applicationYml + compose + sharding;
         variables.forEach(variable -> {
@@ -245,6 +248,22 @@ class ReadmeDocumentationTest {
         assertThat(readme).contains("Syntax error");
         assertThat(readme).contains("MedRagRetrievalIntegrationTest");
         assertThat(readme).contains("DeterministicEmbeddingModel");
+    }
+
+    @Test
+    @DisplayName("the README documents the D37 vector-index probe and its two silent failure modes")
+    void ragChapterDocumentsTheVectorIndexProbe() {
+        assertThat(readme).contains("MedVectorIndexProbe");
+        assertThat(readme).contains("MedVectorIndexHealthIndicator");
+        assertThat(readme).contains("MedVectorIndexAlertMonitor");
+        assertThat(readme).contains("MedVectorIndexProbeIntegrationTest");
+        // Both failure modes must be named: a reader has to be able to recognise the symptom.
+        assertThat(readme).contains("index-missing");
+        assertThat(readme).contains("schema-drift");
+        assertThat(readme).contains("expected-tag-fields");
+        // The switch that keeps a non-Redis-Stack deployment healthy must be documented.
+        assertThat(readme).contains("MED_RAG_INDEX_ENABLED");
+        assertThat(readme).contains("FT.INFO");
     }
 
     @Test

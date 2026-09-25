@@ -227,6 +227,22 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D37 vector-index probe and its two silent failure modes")
+    void ragChapterDocumentsTheVectorIndexProbe() {
+        assertThat(english).contains("MedVectorIndexProbe");
+        assertThat(english).contains("MedVectorIndexHealthIndicator");
+        assertThat(english).contains("MedVectorIndexAlertMonitor");
+        assertThat(english).contains("MedVectorIndexProbeIntegrationTest");
+        assertThat(english).contains("index-missing");
+        assertThat(english).contains("schema-drift");
+        assertThat(english).contains("expected-tag-fields");
+        assertThat(english).contains("MED_RAG_INDEX_ENABLED");
+        assertThat(english).contains("FT.INFO");
+        // The deployment note matters: without the switch a plain-Redis deployment would be unhealthy.
+        assertThat(english).contains("Redis Stack");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

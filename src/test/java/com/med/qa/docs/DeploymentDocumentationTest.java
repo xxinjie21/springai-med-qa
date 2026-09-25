@@ -202,6 +202,22 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D37 vector-index health component and how to react to each reason")
+    void vectorIndexHealthComponentIsDocumented() {
+        assertThat(handbook).contains("med-vector-index");
+        assertThat(handbook).contains("MedVectorIndexProbe");
+        assertThat(handbook).contains("MedVectorIndexHealthIndicator");
+        assertThat(handbook).contains("MedVectorIndexAlertMonitor");
+        // Every reason the component can report must have a documented operator response.
+        assertThat(handbook).contains("index-missing");
+        assertThat(handbook).contains("schema-drift");
+        assertThat(handbook).contains("unreachable");
+        assertThat(handbook).contains("MED_RAG_INDEX_ENABLED");
+        assertThat(handbook).contains("rag-index-degraded");
+        assertThat(handbook).contains("MedQaRagIndexDegraded");
+    }
+
+    @Test
     @DisplayName("the troubleshooting table explains every business error code an operator can observe")
     void troubleshootingCoversBusinessErrorCodes() {
         assertThat(handbook).contains("401");

@@ -285,6 +285,8 @@ itself, so the common case produces a byte-identical query.
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | Retrieval parameters |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | Ingestion limits |
+| `MED_RAG_INDEX_ENABLED` | `true` | Vector-index health probe switch (a non-Redis-Stack deployment must set `false`) |
+| `MED_RAG_INDEX_CHECK_INTERVAL` / `MED_RAG_INDEX_INITIAL_DELAY` | `5m` / `1m` | Index probe period and startup grace period |
 | `MED_ALERT_ENABLED` | `true` | Master switch of the alert chain (no alert bean exists when `false`) |
 | `MED_ALERT_CHECK_INTERVAL` / `MED_ALERT_INITIAL_DELAY` | `60s` / `30s` | Storage probe period and startup grace period |
 | `MED_ALERT_COOLDOWN` | `10m` | Suppression window per `code:component` fingerprint (`0` disables deduplication) |
@@ -414,6 +416,48 @@ The suite found the tag-escaping defect above on the day it landed: its identifi
 (`dept-cardio`, `patient-rag-1`), whereas every earlier offline test used identifiers such as `hosp1`
 and `p9001`, which happen to avoid RediSearch's reserved characters entirely.
 
+### Vector-index health and schema-drift detection (D37)
+
+D36 proved the RAG chain **can** work against a real Redis Stack. Nothing answered the next question:
+is it **still** working? `MedStorageHealthIndicator` only answers "is Redis reachable", and that is not
+the same question — the gap between the two is exactly where the retrieval layer fails without
+raising anything:
+
+| Situation | Symptom | What the clinician sees |
+|---|---|---|
+| The index is absent (dropped by hand, or `FT.CREATE` never succeeded because the instance is not a Redis Stack build) | HTTP 200, nothing retrieved | An answer assembled from the model's own knowledge |
+| The index exists but its TAG schema drifted from the configuration (a field was renamed or added after the index was created) | HTTP 200, the filter expression matches no document | The same |
+
+Neither throws, so no connectivity probe can ever notice them. `MedVectorIndexProbe` reads the
+index's **existence, document count, scanned prefixes and TAG fields** through the official Jedis
+`FT.LIST` / `FT.INFO` commands — metadata only, no vector or search computation — and
+`MedVectorIndexHealthIndicator` turns it into an explicit health component:
+
+| `reason` | Raised when |
+|---|---|
+| `index-missing` | `FT.LIST` does not report the index |
+| `schema-drift` | the index exists but does not declare one of `med.rag.index.expected-tag-fields` |
+| `unreachable` | the probe itself threw, so no verdict could be reached |
+
+`MedVectorIndexAlertMonitor` pushes the transitions through the existing `MedAlertNotifier` chain:
+degradation as `WARNING` (consultations still work, only the evidence shrinks — it must not page),
+recovery as `INFO`, a throwing probe as `CRITICAL`. The Prometheus rule `MedQaRagIndexDegraded`
+consumes `med_qa_alert_total{code="rag-index-degraded"}`.
+
+> `med.rag.index.expected-tag-fields` must stay in step with the `TAG` entries of
+> `med.rag.vector-store.metadata-fields` — the probe can only detect the drift it is told to look for.
+> A deployment running the cache on a plain Redis build must set `MED_RAG_INDEX_ENABLED=false`: on such
+> a deployment the RAG layer genuinely cannot work, and the probe would honestly report the pod as
+> unhealthy.
+
+`MedVectorIndexProbeIntegrationTest` verifies against a real Redis Stack that the probe reads back the
+very index the official `RedisVectorStore` created (TAG fields, prefix, and a document count that
+tracks ingestion), and that dropping the index with `FT.DROPINDEX` flips the verdict to
+`index-missing` instead of raising. There is a second reason that suite exists: `FT.INFO`'s nested
+structures come back from Jedis 5.x as **flat alternating lists**, not maps, so a hand-written offline
+reply cannot prove the decoder matches the real client — and if the two ever diverge, every index reads
+as "zero TAG fields", which is indistinguishable from the drift the probe is meant to catch.
+
 ---
 
 ## Alerting
@@ -492,11 +536,16 @@ alerting, troubleshooting, backup and rollback, security hardening) is
 then asserts the OCI labels, the non-root user, the layered layout and the launcher entrypoint. It
 exits cleanly with code 2 when no Docker daemon is available, so it never blocks a pipeline.
 
+**Health components**: besides MySQL and Redis reachability, `/actuator/health` carries
+`med-vector-index` (D37) — index existence and TAG field consistency. Its `reason` is one of
+`index-missing`, `schema-drift` or `unreachable`; a deployment without Redis Stack removes the
+component with `MED_RAG_INDEX_ENABLED=false`.
+
 ---
 
 ## Roadmap progress
 
-Delivery follows the five phases in [`ROADMAP.md`](./ROADMAP.md), one iteration per day, each closing
+Delivery follows the phases in [`ROADMAP.md`](./ROADMAP.md), one iteration per day, each closing
 the loop of code, unit tests, commit and push:
 
 | Phase | Iterations | Status |
@@ -508,6 +557,7 @@ the loop of code, unit tests, commit and push:
 | Phase 4, deployment and wrap-up | D27 to D31 | Done |
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
+| Phase 7, RAG index operations and retrieval observability | D37 to D39 | In progress (D37 index health and drift detection done; D38 index rebuild and D39 retrieval-quality regression baseline planned) |
 
 ---
 

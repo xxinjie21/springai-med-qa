@@ -273,6 +273,8 @@ RediSearch 的 `TAG` 查询语法保留了一批字符（`-`、`.`、`:` 等）�
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | 检索参数 |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | 入库上限 |
+| `MED_RAG_INDEX_ENABLED` | `true` | 向量索引健康探针开关（非 Redis Stack 部署必须置 `false`） |
+| `MED_RAG_INDEX_CHECK_INTERVAL` / `MED_RAG_INDEX_INITIAL_DELAY` | `5m` / `1m` | 索引探针轮询间隔与启动宽限期 |
 | `MED_ALERT_ENABLED` | `true` | 告警链路总开关（`false` 时不注册任何告警 Bean） |
 | `MED_ALERT_CHECK_INTERVAL` / `MED_ALERT_INITIAL_DELAY` | `60s` / `30s` | 存储探针轮询间隔与启动宽限期 |
 | `MED_ALERT_COOLDOWN` | `10m` | 同一 `code:component` 指纹的抑制窗口（`0` 关闭去重） |
@@ -339,7 +341,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）与 RAG 标签检索链路（D36） |
+| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）与向量索引健康探针（D37） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
 | 覆盖率门禁 | `jacoco-coverage-gate` 执行（`verify` 阶段，`haltOnFailure`）：指令 ≥ 90%、分支 ≥ 80%、行 ≥ 90%，阈值以 `jacoco.min.*` 属性声明；不达标直接 BUILD FAILURE，CI 无法合入 |
@@ -373,6 +375,30 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 
 这条测试上线当天就查出了上面那个 TAG 转义缺陷：集成用例用的标识符带连字符（`dept-cardio`、`patient-rag-1`），而此前所有离线单测的标识符都是 `hosp1` / `p9001` 这类纯字母数字，恰好绕开了 RediSearch 的保留字符。
 
+### 向量索引健康与 Schema 漂移检测（D37）
+
+D36 证明了 RAG 链路在真实 Redis Stack 上**能**工作，但没有任何机制回答「此刻它**是否还**在工作」。`MedStorageHealthIndicator` 只回答「Redis 通不通」——这两件事并不等价，而它们之间的空隙正是检索层失败时**不报错**的地方：
+
+| 现场 | 表现 | 医生看到什么 |
+|---|---|---|
+| 索引不存在（被手工删除，或 Redis 不是 Stack 版导致 `FT.CREATE` 从未成功） | 接口 200，检索为空 | 只用模型自身知识拼出来的答案 |
+| 索引存在但 TAG 字段与配置漂移（字段改名/新增后旧索引没跟着变） | 接口 200，过滤表达式匹配不到任何文档 | 同上 |
+
+两者都不抛异常，所以永远不会被任何连通性探针发现。`MedVectorIndexProbe` 通过官方 Jedis 的 `FT.LIST` / `FT.INFO` 读出索引的**存在性、文档数、扫描前缀与 TAG 字段**（只读元数据，不做任何向量或检索计算），`MedVectorIndexHealthIndicator` 把它变成一个显式的健康组件：
+
+| `reason` | 触发条件 |
+|---|---|
+| `index-missing` | `FT.LIST` 未报告该索引 |
+| `schema-drift` | 索引存在，但未声明 `med.rag.index.expected-tag-fields` 中的某个 TAG 字段 |
+| `unreachable` | 探针本身抛异常，无法得出结论 |
+
+`MedVectorIndexAlertMonitor` 复用既有 `MedAlertNotifier` 链路把状态变化推出去：降级为 `WARNING`（问诊仍可用，只是证据变少，不该直接呼叫值班）、恢复为 `INFO`、探针异常为 `CRITICAL`；Prometheus 规则 `MedQaRagIndexDegraded` 消费 `med_qa_alert_total{code="rag-index-degraded"}`。
+
+> `med.rag.index.expected-tag-fields` 必须与 `med.rag.vector-store.metadata-fields` 里的 `TAG` 项保持一致——探针只能发现「你让它去找」的漂移。
+> 缓存跑在非 Redis Stack 版 Redis 上的部署必须置 `MED_RAG_INDEX_ENABLED=false`：该部署下 RAG 本就不可用，探针会如实把 Pod 判为不健康。
+
+`MedVectorIndexProbeIntegrationTest` 在真实 Redis Stack 上验证探针读到的正是官方 `RedisVectorStore` 建出的索引（TAG 字段、前缀、文档数随入库增长），并断言索引被 `FT.DROPINDEX` 后结论翻转为 `index-missing` 而不是抛异常。这条用例存在的另一个理由：`FT.INFO` 的嵌套结构在 Jedis 5.x 里返回的是**扁平交替列表**而非 Map，只用离线手写报文无法证明解码器匹配真实客户端；一旦两者错位，所有索引都会被读成「零个 TAG 字段」，与要检测的漂移无法区分。
+
 ---
 
 ## CI/CD
@@ -395,6 +421,10 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 **告警**：`/actuator/prometheus` 为抓取端点，规则与路由在 [`deploy/`](./deploy) 下；
 `docker compose --profile observability up -d` 可拉起 Prometheus + Alertmanager 观测栈（默认不启动）。
 
+**健康组件**：`/actuator/health` 除 MySQL / Redis 连通性外，还包含 `med-vector-index`（D37）——
+索引存在性与 TAG 字段一致性。`reason` 取值 `index-missing` / `schema-drift` / `unreachable`，
+非 Redis Stack 部署用 `MED_RAG_INDEX_ENABLED=false` 移除该组件。
+
 **构建验证**：`scripts/verify-docker-build.sh` 执行一次真实 `docker build` 并断言 OCI 标签、非 root 用户、
 分层布局与入口类，无 Docker 守护时自动跳过。
 
@@ -413,6 +443,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
+| 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 进行中（D37 索引健康与漂移检测已完成，D38 索引重建、D39 检索质量回归基线计划中） |
 
 ---
 

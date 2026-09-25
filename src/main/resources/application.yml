@@ -248,6 +248,23 @@ med:
     # med.rag.retrieval.* and MedRetrievalFilters, never here.
     advisor:
       order: ${MED_RAG_ADVISOR_ORDER:1}
+    # Vector-index health monitoring (D37). A reachable Redis does not imply a usable RediSearch
+    # index: the index can be absent (dropped, or FT.CREATE never succeeded because the instance is
+    # not a Redis Stack build) or present with a TAG schema that drifted from the configuration above.
+    # Neither case throws - the consultation endpoint keeps returning HTTP 200 and simply retrieves
+    # less - so both are turned into an explicit /actuator/health component and a pushed alert.
+    # expected-tag-fields MUST stay in step with the TAG entries of vector-store.metadata-fields
+    # above: the probe can only detect the drift it is told to look for.
+    # enabled=false removes both the health component and the alert monitor, which is what a
+    # deployment running the cache on a plain Redis build (no RediSearch) has to set.
+    index:
+      enabled: ${MED_RAG_INDEX_ENABLED:true}
+      check-interval: ${MED_RAG_INDEX_CHECK_INTERVAL:5m}
+      initial-delay: ${MED_RAG_INDEX_INITIAL_DELAY:1m}
+      expected-tag-fields:
+        - tenant_id
+        - dept_id
+        - patient_id
   # Push-based alerting (D33). Actuator answers "am I healthy?" only to whoever asks; the monitor in
   # com.med.qa.alert polls the same storage probe on a schedule and pushes what it finds through the
   # log and Micrometer sinks. check-interval / initial-delay are read straight by the @Scheduled

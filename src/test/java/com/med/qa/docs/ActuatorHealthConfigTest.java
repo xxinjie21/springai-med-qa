@@ -68,4 +68,34 @@ class ActuatorHealthConfigTest {
         assertThat(compose).contains("/actuator/health");
         assertThat(compose).contains("condition: service_healthy");
     }
+
+    @Test
+    @DisplayName("the RAG vector-index component is contributed and can be switched off (D37)")
+    void vectorIndexComponentIsContributedAndSwitchable() throws IOException {
+        // The component answers a question the storage probe cannot: reachable Redis does not imply a
+        // usable RediSearch index. It must be wired behind the documented switch, because a deployment
+        // running the cache on a plain Redis build has to be able to remove it -- otherwise the pod
+        // would be reported unhealthy for a capability that deployment does not offer.
+        String config = Files.readString(
+                Path.of(System.getProperty("user.dir"))
+                        .resolve("src/main/java/com/med/qa/config/ActuatorObservabilityConfig.java"));
+
+        assertThat(config).contains("MedVectorIndexHealthIndicator");
+        assertThat(config).contains("med.rag.index");
+        assertThat(config).contains("@ConditionalOnProperty");
+        // The Jedis client opens a pool, so resolving it eagerly would break middleware-less startup.
+        assertThat(config).contains("@Lazy JedisPooled");
+
+        assertThat(applicationYml).contains("expected-tag-fields:");
+        assertThat(applicationYml).contains("MED_RAG_INDEX_ENABLED");
+    }
+
+    @Test
+    @DisplayName("boundary: the health details stay behind show-details: never, so no index metadata leaks")
+    void healthDetailsAreNotExposedToAnonymousCallers() {
+        // Both the storage probe and the vector-index probe record details (index name, document count,
+        // TAG field names). They are operational metadata, not clinical data, but they still describe
+        // internal topology -- so the endpoint must keep reporting status only.
+        assertThat(applicationYml).contains("show-details: never");
+    }
 }

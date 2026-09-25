@@ -2,6 +2,7 @@ package com.med.qa.config;
 
 import com.med.qa.rag.MedDocumentIngestionProperties;
 import com.med.qa.rag.MedRagAdvisorProperties;
+import com.med.qa.rag.MedRagIndexProperties;
 import com.med.qa.rag.MedRetrievalProperties;
 import com.med.qa.rag.MedVectorStoreProperties;
 import com.med.qa.rag.MedVectorStoreProperties.MetadataFieldSpec;
@@ -57,6 +58,7 @@ import redis.clients.jedis.search.Schema;
         MedDocumentIngestionProperties.class,
         MedRetrievalProperties.class,
         MedRagAdvisorProperties.class,
+        MedRagIndexProperties.class,
         RedisProperties.class
 })
 public class VectorStoreConfig {

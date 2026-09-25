@@ -5,6 +5,7 @@ import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertProperties;
 import com.med.qa.alert.MedAlertSink;
 import com.med.qa.alert.MedStorageAlertMonitor;
+import com.med.qa.alert.MedVectorIndexAlertMonitor;
 import com.med.qa.alert.MetricsMedAlertSink;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -13,7 +14,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.Scheduled;
 
+import java.lang.reflect.Method;
 import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -24,7 +27,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>The alert chain is the one part of the service that must never take the application down with
  * it, so the interesting assertions are the negative ones: the chain disappears entirely when the
  * master switch is off, it starts without a Redis connection (the Redisson dependency is lazy), and
- * the monitor degrades to a no-op when the storage probe is absent.</p>
+ * each monitor degrades to a no-op when its probe is absent. The D37 vector-index monitor adds a
+ * second switch ({@code med.rag.index.enabled}) that must remove only its own half of the chain.</p>
  */
 class MedAlertConfigTest {
 
@@ -104,6 +108,51 @@ class MedAlertConfigTest {
             assertThat(context).doesNotHaveBean(MedAlertProperties.class);
             assertThat(context.getBeanNamesForType(MedAlertSink.class)).isEmpty();
         });
+    }
+
+    // ---------------------------------------------------------------- RAG vector-index monitor (D37)
+
+    @Test
+    @DisplayName("the D37 vector-index monitor is wired alongside the storage monitor")
+    void wiresTheVectorIndexMonitor() {
+        runner.run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context.getBean(MedAlertConfig.VECTOR_INDEX_MONITOR))
+                    .isInstanceOf(MedVectorIndexAlertMonitor.class);
+            assertThat(context.getBean(MedVectorIndexAlertMonitor.class)).isNotNull();
+        });
+    }
+
+    @Test
+    @DisplayName("the vector-index monitor is a no-op when its probe was not contributed")
+    void vectorIndexMonitorDegradesToANoop() {
+        // No MedVectorIndexHealthIndicator bean exists in this slice, which is the situation on a
+        // deployment that switched the index monitoring off. The monitor must not fail the refresh.
+        runner.run(context -> assertThat(
+                context.getBean(MedVectorIndexAlertMonitor.class).checkNow()).isFalse());
+    }
+
+    @Test
+    @DisplayName("boundary: med.rag.index.enabled=false removes the monitor without touching the storage chain")
+    void disablingTheIndexProbeRemovesItsMonitor() {
+        runner.withPropertyValues("med.rag.index.enabled=false").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).doesNotHaveBean(MedVectorIndexAlertMonitor.class);
+            // The storage half of the chain is governed by its own switch and must survive.
+            assertThat(context).hasSingleBean(MedStorageAlertMonitor.class);
+            assertThat(context).hasSingleBean(MedAlertNotifier.class);
+        });
+    }
+
+    @Test
+    @DisplayName("the monitor's schedule is driven by the med.rag.index properties, not a literal")
+    void vectorIndexMonitorScheduleIsConfigurable() throws NoSuchMethodException {
+        Method scheduled = MedVectorIndexAlertMonitor.class.getMethod("scheduledCheck");
+        Scheduled annotation = scheduled.getAnnotation(Scheduled.class);
+
+        assertThat(annotation).isNotNull();
+        assertThat(annotation.fixedDelayString()).contains("med.rag.index.check-interval");
+        assertThat(annotation.initialDelayString()).contains("med.rag.index.initial-delay");
     }
 
     /**

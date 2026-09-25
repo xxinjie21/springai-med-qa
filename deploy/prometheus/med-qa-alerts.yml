@@ -60,6 +60,24 @@ groups:
             /actuator/health is no longer a reliable readiness signal.
           runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
 
+      - alert: MedQaRagIndexDegraded
+        # D37. The application reported that the RediSearch index behind medical RAG is missing or
+        # that its TAG schema drifted. Consultations keep returning 200, they just retrieve less, so
+        # this is a warning rather than a page - but it must not be missed either: the first symptom
+        # otherwise is a clinician reading an answer built from an incomplete corpus.
+        expr: increase(med_qa_alert_total{code="rag-index-degraded"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: vector-index
+        annotations:
+          summary: "Medical RAG vector index is degraded"
+          description: >-
+            MedVectorIndexHealthIndicator reported the vector index as missing or schema-drifted
+            (component {{ $labels.component }}). Scoped retrieval cannot be trusted until
+            /actuator/health reports the med-vector-index component as UP again.
+          runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.
