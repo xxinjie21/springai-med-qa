@@ -78,6 +78,26 @@ groups:
             /actuator/health reports the med-vector-index component as UP again.
           runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
 
+      - alert: MedQaRagIndexRebuildFailed
+        # D38. A rebuild is an operator-triggered repair of the index D37 watches. When it fails, the
+        # index may be gone, empty or half built - which is strictly worse than the drift it was
+        # meant to repair - so unlike the degradation notice above this one pages: every consultation
+        # keeps returning 200 while retrieving nothing.
+        expr: increase(med_qa_alert_total{code="rag-index-rebuild-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: vector-index
+        annotations:
+          summary: "A medical RAG vector index rebuild failed"
+          description: >-
+            MedVectorIndexRebuilder reported outcome=failed or outcome=verification-failed for the
+            vector index. The index may now be missing or empty, so scoped retrieval returns nothing
+            until it is rebuilt successfully. Check /actuator/health (med-vector-index) and re-run the
+            rebuild with MedIndexRebuildMode.INDEX_ONLY, which repairs the schema without touching
+            documents.
+          runbook: "docs/DEPLOYMENT.md#72-索引重建d38"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.

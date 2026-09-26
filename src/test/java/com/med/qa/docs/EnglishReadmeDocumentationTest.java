@@ -243,6 +243,22 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D38 controlled rebuild and why the safe mode is the default")
+    void ragChapterDocumentsTheControlledRebuild() {
+        assertThat(english).contains("MedVectorIndexRebuilder");
+        assertThat(english).contains("MedIndexRebuildReport");
+        assertThat(english).contains("MedIndexRebuildIntegrationTest");
+        assertThat(english).contains("FT.DROPINDEX");
+        assertThat(english).contains("INDEX_ONLY");
+        assertThat(english).contains("DROP_AND_REINGEST");
+        assertThat(english).contains("MED_RAG_INDEX_REBUILD_ENABLED");
+        assertThat(english).contains("MED_RAG_INDEX_REBUILD_ALLOW_DELETE");
+        assertThat(english).contains("med:lock:rag:index:rebuild:");
+        // The reason the capability is off by default has to be stated, not implied.
+        assertThat(english).contains("off by default");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

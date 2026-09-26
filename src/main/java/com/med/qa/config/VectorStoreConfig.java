@@ -1,16 +1,22 @@
 package com.med.qa.config;
 
+import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.rag.MedDocumentIngestionProperties;
+import com.med.qa.rag.MedDocumentService;
+import com.med.qa.rag.MedIndexRebuildProperties;
 import com.med.qa.rag.MedRagAdvisorProperties;
 import com.med.qa.rag.MedRagIndexProperties;
 import com.med.qa.rag.MedRetrievalProperties;
+import com.med.qa.rag.MedVectorIndexRebuilder;
 import com.med.qa.rag.MedVectorStoreProperties;
 import com.med.qa.rag.MedVectorStoreProperties.MetadataFieldSpec;
+import org.redisson.api.RedissonClient;
 import org.springframework.ai.embedding.BatchingStrategy;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.redis.RedisVectorStore;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.data.redis.RedisProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -19,6 +25,7 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.lang.Nullable;
 import org.springframework.util.StringUtils;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -59,6 +66,7 @@ import redis.clients.jedis.search.Schema;
         MedRetrievalProperties.class,
         MedRagAdvisorProperties.class,
         MedRagIndexProperties.class,
+        MedIndexRebuildProperties.class,
         RedisProperties.class
 })
 public class VectorStoreConfig {
@@ -68,6 +76,9 @@ public class VectorStoreConfig {
 
     /** Bean name of the medical document vector store. */
     public static final String VECTOR_STORE = "medVectorStore";
+
+    /** Bean name of the RAG index rebuilder. */
+    public static final String INDEX_REBUILDER = "medVectorIndexRebuilder";
 
     /**
      * The only distance metric the official {@code RedisVectorStore} creates its index with; it is
@@ -99,6 +110,13 @@ public class VectorStoreConfig {
      * to Redis, and the {@link EmbeddingModel} it depends on is contributed by a later iteration.
      * Until then the bean simply is never instantiated, which keeps the context bootable.</p>
      *
+     * <p>The declared type is the concrete {@link RedisVectorStore} rather than the
+     * {@link VectorStore} interface: the RAG index rebuilder needs the store's own
+     * {@code afterPropertiesSet()} lifecycle hook to recreate the index after a drop, and reaching it
+     * through a cast on an interface-typed bean would turn a wiring mistake into a runtime failure.
+     * Injection points that only search or write still ask for {@code VectorStore} and resolve this
+     * bean unchanged.</p>
+     *
      * @param jedis                   lazily created Jedis client, must not be {@code null}
      * @param embeddingModelProvider  provider of the embedding model; resolution is deferred so a
      *                                missing model fails on first retrieval with a clear message
@@ -111,10 +129,10 @@ public class VectorStoreConfig {
      */
     @Bean(name = VECTOR_STORE)
     @Lazy
-    public VectorStore medVectorStore(@Lazy JedisPooled jedis,
-                                      ObjectProvider<EmbeddingModel> embeddingModelProvider,
-                                      MedVectorStoreProperties properties,
-                                      ObjectProvider<BatchingStrategy> batchingStrategyProvider) {
+    public RedisVectorStore medVectorStore(@Lazy JedisPooled jedis,
+                                           ObjectProvider<EmbeddingModel> embeddingModelProvider,
+                                           MedVectorStoreProperties properties,
+                                           ObjectProvider<BatchingStrategy> batchingStrategyProvider) {
         EmbeddingModel embeddingModel = embeddingModelProvider.getIfAvailable();
         if (embeddingModel == null) {
             throw new IllegalStateException(
@@ -123,6 +141,75 @@ public class VectorStoreConfig {
         }
         return buildVectorStore(jedis, embeddingModel, properties, batchingStrategyProvider.getIfAvailable());
     }
+
+    /**
+     * Contributes the RAG index rebuilder (D38).
+     *
+     * <p>Gated by {@code med.rag.index.rebuild.enabled}, which defaults to {@code false}: this is the
+     * only bean in the service that can drop a search index, and with
+     * {@link com.med.qa.rag.MedIndexRebuildMode#DROP_AND_REINGEST} the only one that can delete
+     * indexed documents. Keeping it absent unless an operator asks for it means a misconfigured
+     * deployment has no rebuild code path at all, rather than a guarded one.</p>
+     *
+     * <p>Two consistency checks run here instead of mid-rebuild, because both contradictions are
+     * configuration errors that must fail at startup:</p>
+     * <ul>
+     *   <li>the rebuild batch size must not exceed
+     *       {@code med.rag.ingestion.max-documents-per-request} — the write-back goes through the
+     *       ordinary ingestion path, which enforces that limit and would reject the first batch;</li>
+     *   <li>a destructive rebuild is only meaningful when the store still initializes its schema:
+     *       with {@code initialize-schema=false} nothing recreates the index after the drop.</li>
+     * </ul>
+     *
+     * <p>Every injected middleware client is {@link Lazy} or an {@link ObjectProvider}: creating the
+     * Jedis pool, the Redisson connection or the alert chain during context refresh would break the
+     * invariant that the context boots without middleware.</p>
+     *
+     * @param vectorStore        the official store, source of the schema-creation hook
+     * @param jedis              lazily resolved Jedis client dedicated to the vector index
+     * @param storeProperties    index topology
+     * @param indexProperties    expected TAG fields, the acceptance criterion of a rebuild
+     * @param rebuildProperties  the {@code med.rag.index.rebuild.*} policy
+     * @param ingestionProperties ingestion limits, cross-checked against the batch size
+     * @param documentService    ingestion path used for the write-back
+     * @param notifierProvider   provider of the alert dispatcher; empty when alerting is off
+     * @param redissonClient     lazily resolved lock provider
+     * @return the rebuilder, never {@code null}
+     * @throws IllegalStateException if the rebuild batch size exceeds the ingestion limit, or the
+     *                               rebuild is enabled while schema initialization is switched off
+     */
+    @Bean(INDEX_REBUILDER)
+    @ConditionalOnProperty(prefix = MedIndexRebuildProperties.PREFIX, name = "enabled",
+            havingValue = "true")
+    public MedVectorIndexRebuilder medVectorIndexRebuilder(@Lazy RedisVectorStore vectorStore,
+                                                           @Lazy JedisPooled jedis,
+                                                           MedVectorStoreProperties storeProperties,
+                                                           MedRagIndexProperties indexProperties,
+                                                           MedIndexRebuildProperties rebuildProperties,
+                                                           MedDocumentIngestionProperties ingestionProperties,
+                                                           MedDocumentService documentService,
+                                                           ObjectProvider<MedAlertNotifier> notifierProvider,
+                                                           @Lazy RedissonClient redissonClient) {
+        int batchSize = rebuildProperties.getBatchSize();
+        int ingestionLimit = ingestionProperties.getMaxDocumentsPerRequest();
+        if (batchSize > ingestionLimit) {
+            throw new IllegalStateException(
+                    MedIndexRebuildProperties.PREFIX + ".batch-size=" + batchSize
+                            + " exceeds " + MedDocumentIngestionProperties.PREFIX
+                            + ".max-documents-per-request=" + ingestionLimit
+                            + "; every rebuild batch is written through the ordinary ingestion path, "
+                            + "which rejects the first batch of such a rebuild");
+        }
+        if (!storeProperties.isInitializeSchema()) {
+            throw new IllegalStateException(
+                    MedIndexRebuildProperties.PREFIX + ".enabled is true but "
+                            + MedVectorStoreProperties.PREFIX + ".initialize-schema is false: nothing "
+                            + "would recreate the index after it is dropped");
+        }
+        return new MedVectorIndexRebuilder(vectorStore, jedis, storeProperties, indexProperties,
+                rebuildProperties, documentService, notifierProvider, redissonClient, Clock.systemUTC());
+    }
+
 
     /**
      * Builds the official {@code RedisVectorStore} from the externalized index settings.

@@ -265,6 +265,29 @@ med:
         - tenant_id
         - dept_id
         - patient_id
+      # Controlled index rebuild (D38). D37 makes a broken index visible; this is the repair. The
+      # rebuild drops the RediSearch index, recreates it from vector-store.* through the official
+      # store's own FT.CREATE, optionally writes a corpus back through the ordinary ingestion path,
+      # and then requires the probe to report the index as scoped-retrieval ready. A cluster-wide
+      # Redisson lock (med:lock:rag:index:rebuild:{index}) keeps two pods from rebuilding at once.
+      #
+      # enabled defaults to FALSE, unlike every other RAG switch: this is the only code path that can
+      # drop a search index, and the only one that can delete indexed documents, so its presence is a
+      # deliberate deployment decision rather than a default. allow-document-deletion is a second,
+      # independent key: enabling the rebuild is the routine repair of a drifted index, while
+      # authorising the deletion of the whole corpus is not, and the destructive mode
+      # (DROP_AND_REINGEST) is refused - without contacting Redis - unless it is set.
+      # lock-lease-time 0 would hand renewal to the Redisson watchdog; the default 10m covers an
+      # embedding-heavy corpus while still releasing a dead pod's mutex. batch-size must not exceed
+      # ingestion.max-documents-per-request, and max-documents bounds the cost of one rebuild; both
+      # contradictions fail at startup.
+      rebuild:
+        enabled: ${MED_RAG_INDEX_REBUILD_ENABLED:false}
+        allow-document-deletion: ${MED_RAG_INDEX_REBUILD_ALLOW_DELETE:false}
+        lock-wait-time: ${MED_RAG_INDEX_REBUILD_LOCK_WAIT:5s}
+        lock-lease-time: ${MED_RAG_INDEX_REBUILD_LOCK_LEASE:10m}
+        batch-size: ${MED_RAG_INDEX_REBUILD_BATCH_SIZE:50}
+        max-documents: ${MED_RAG_INDEX_REBUILD_MAX_DOCUMENTS:5000}
   # Push-based alerting (D33). Actuator answers "am I healthy?" only to whoever asks; the monitor in
   # com.med.qa.alert polls the same storage probe on a schedule and pushes what it finds through the
   # log and Micrometer sinks. check-interval / initial-delay are read straight by the @Scheduled

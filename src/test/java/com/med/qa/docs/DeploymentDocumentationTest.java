@@ -218,6 +218,24 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D38 controlled rebuild and how to react to a degraded index")
+    void vectorIndexRebuildIsDocumented() {
+        assertThat(handbook).contains("MedVectorIndexRebuilder");
+        assertThat(handbook).contains("MedIndexRebuildReport");
+        assertThat(handbook).contains("med:lock:rag:index:rebuild:");
+        assertThat(handbook).contains("FT.DROPINDEX");
+        assertThat(handbook).contains("INDEX_ONLY");
+        assertThat(handbook).contains("DROP_AND_REINGEST");
+        assertThat(handbook).contains("MED_RAG_INDEX_REBUILD_ENABLED");
+        assertThat(handbook).contains("MED_RAG_INDEX_REBUILD_ALLOW_DELETE");
+        // Every alert code the rebuild raises must be listed with its severity.
+        assertThat(handbook).contains("rag-index-rebuild-completed");
+        assertThat(handbook).contains("rag-index-rebuild-skipped");
+        assertThat(handbook).contains("rag-index-rebuild-failed");
+        assertThat(handbook).contains("MedQaRagIndexRebuildFailed");
+    }
+
+    @Test
     @DisplayName("the troubleshooting table explains every business error code an operator can observe")
     void troubleshootingCoversBusinessErrorCodes() {
         assertThat(handbook).contains("401");

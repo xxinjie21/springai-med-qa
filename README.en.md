@@ -458,6 +458,63 @@ structures come back from Jedis 5.x as **flat alternating lists**, not maps, so 
 reply cannot prove the decoder matches the real client — and if the two ever diverge, every index reads
 as "zero TAG fields", which is indistinguishable from the drift the probe is meant to catch.
 
+### Controlled index rebuild (D38)
+
+D37 makes a broken index **visible**. It does not make it **repairable**. Both failures it detects —
+the index is absent, or its TAG schema drifted — have the same repair: drop the index and recreate it
+from the current configuration. Until this iteration that meant an operator typing `FT.DROPINDEX` into
+a production Redis by hand, with no mutual exclusion (two operators, or an operator and a cron job,
+both dropping), no check that the new index actually works, and no record of who did it.
+
+`MedVectorIndexRebuilder` turns that into an operation with a mutex, a verification step and a report,
+and it reuses the official components rather than re-implementing anything:
+
+| Step | Component reused |
+|---|---|
+| Mutual exclusion | Redisson `RLock`, key `med:lock:rag:index:rebuild:{index}` (a namespace of its own, distinct from the `med:lock:chat:` session lock) |
+| Dropping the index | the official Jedis `FT.DROPINDEX` / `FT.DROPINDEX … DD` |
+| Recreating the schema | `RedisVectorStore#afterPropertiesSet()` — the official lifecycle hook, which issues `FT.CREATE` from `med.rag.vector-store.*`; there is no hand-written `FT.CREATE` anywhere in this project |
+| Writing the corpus back | `MedDocumentService.ingestAll`, i.e. the ordinary ingestion path, so embedding and tagging are identical |
+| Acceptance | `MedVectorIndexProbe` — success is the same "can it still answer a scoped query" test `/actuator/health` uses |
+
+Two modes, and the safe one is the default:
+
+| Mode | Action | Purpose |
+|---|---|---|
+| `INDEX_ONLY` (default) | `FT.DROPINDEX`, documents **kept** | Repairing schema drift. RediSearch re-indexes every existing JSON document under the prefix when the index is recreated, so **not a single document is lost and not a single embedding call is made** |
+| `DROP_AND_REINGEST` | `FT.DROPINDEX … DD`, documents deleted, then a caller-supplied corpus is written back | A corrupted or superseded corpus. **Destructive**, so it needs two switches: the request must ask for the mode explicitly, and the deployment must set `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true` |
+
+The rebuild is **off by default** (`MED_RAG_INDEX_REBUILD_ENABLED` defaults to `false`) — the opposite
+of every other RAG switch here. It is the only code path in the service that can drop a search index
+and the only one that can delete indexed documents, so a misconfigured deployment should have no such
+path at all rather than a guarded one. `allow-document-deletion` is a **second, independent key**:
+enabling the rebuild is the routine repair of a drifted index, authorising the deletion of the whole
+corpus is not, and whoever can trigger a rebuild must not acquire the second permission through the
+first.
+
+The outcome comes back as a `MedIndexRebuildReport` (`outcome` is one of `completed`,
+`verification-failed`, `failed`, `skipped-lock-held` or `refused`, carrying `documentsBefore →
+documentsAfter`, documents written back, batches and duration) and is pushed through the existing
+`MedAlertNotifier` chain: `INFO` on success, `WARNING` when it was skipped or refused, `CRITICAL` on
+failure — a failed rebuild can leave the index gone or empty, which is worse than the drift it was
+repairing, so that rule pages. The Prometheus rule `MedQaRagIndexRebuildFailed` consumes
+`med_qa_alert_total{code="rag-index-rebuild-failed"}`. Every stage and every batch publishes a
+`MedIndexRebuildProgress` snapshot (`currentProgress()`) carrying counts and stage names only, so it
+is safe to log.
+
+> The rebuild is deliberately **not exposed over HTTP**: writing the corpus back needs the corpus, and
+> the corpus does not live in this service's database — the documents exist only in the vector index,
+> which is the very thing being dropped. How to trigger it is the caller's decision and an endpoint
+> belongs to a later iteration; that also avoids widening the attack surface of `RagAdminController`
+> before its authorisation boundary is repaired.
+
+`MedIndexRebuildIntegrationTest` verifies against a real Redis Stack the half a mock cannot prove:
+after `FT.DROPINDEX` (without `DD`) an `INDEX_ONLY` rebuild leaves the documents in Redis, `FT.CREATE`
+re-indexes all of them, and tag-scoped retrieval answers the same query again; after
+`DROP_AND_REINGEST` the old document keys are really gone and the new corpus is retrievable; and while
+another Redisson client holds the mutex the rebuild returns `skipped-lock-held` without changing a
+single byte of the index.
+
 ---
 
 ## Alerting
@@ -541,6 +598,11 @@ exits cleanly with code 2 when no Docker daemon is available, so it never blocks
 `index-missing`, `schema-drift` or `unreachable`; a deployment without Redis Stack removes the
 component with `MED_RAG_INDEX_ENABLED=false`.
 
+**Index rebuild**: `MedVectorIndexRebuilder` is only wired when
+`MED_RAG_INDEX_REBUILD_ENABLED=true` (off by default). The `INDEX_ONLY` mode drops the index but keeps
+its documents and is the recommended repair for schema drift; `DROP_AND_REINGEST` deletes the indexed
+documents and additionally requires `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true`.
+
 ---
 
 ## Roadmap progress
@@ -557,7 +619,7 @@ the loop of code, unit tests, commit and push:
 | Phase 4, deployment and wrap-up | D27 to D31 | Done |
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
-| Phase 7, RAG index operations and retrieval observability | D37 to D39 | In progress (D37 index health and drift detection done; D38 index rebuild and D39 retrieval-quality regression baseline planned) |
+| Phase 7, RAG index operations and retrieval observability | D37 to D39 | In progress (D37 index health and drift detection and D38 controlled index rebuild done; D39 retrieval-quality regression baseline planned) |
 
 ---
 

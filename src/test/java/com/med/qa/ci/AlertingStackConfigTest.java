@@ -219,6 +219,7 @@ class AlertingStackConfigTest {
                 "MedQaStorageUnavailable",
                 "MedQaStorageProbeFailed",
                 "MedQaRagIndexDegraded",
+                "MedQaRagIndexRebuildFailed",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -290,6 +291,42 @@ class AlertingStackConfigTest {
                 .contains(variable));
         // The expectation the probe compares the live index against has to be declared, not implied.
         assertThat(applicationYml).contains("expected-tag-fields:");
+    }
+
+    @Test
+    @DisplayName("the D38 rebuild rule selects the code the rebuilder actually exports")
+    void rebuildRuleMatchesTheExportedCode() throws IOException {
+        // Same trap as the degradation rule: the code string in the rule and the constant the
+        // rebuilder raises are two separate literals that have to agree. A drifted one leaves a rule
+        // that parses, scrapes and never fires - exactly during the incident it exists for.
+        assertThat(read("src/main/java/com/med/qa/rag/MedVectorIndexRebuilder.java"))
+                .contains("rag-index-rebuild-failed");
+        assertThat(read(ALERT_RULES)).contains("code=\"rag-index-rebuild-failed\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaRagIndexRebuildFailed");
+        // A failed rebuild can leave the index unusable, which is worse than the drift it repaired,
+        // so this rule must page rather than warn.
+        assertThat(read(ALERT_RULES)).contains("severity: critical");
+    }
+
+    @Test
+    @DisplayName("the rebuild switches are declared in application.yml and default to off")
+    void rebuildPropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_RAG_INDEX_REBUILD_ENABLED",
+                "MED_RAG_INDEX_REBUILD_ALLOW_DELETE",
+                "MED_RAG_INDEX_REBUILD_LOCK_WAIT",
+                "MED_RAG_INDEX_REBUILD_LOCK_LEASE",
+                "MED_RAG_INDEX_REBUILD_BATCH_SIZE",
+                "MED_RAG_INDEX_REBUILD_MAX_DOCUMENTS");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // The only code path that can drop a search index must not be on by default, and the
+        // destructive mode must need a second, independent key.
+        assertThat(applicationYml).contains("enabled: ${MED_RAG_INDEX_REBUILD_ENABLED:false}");
+        assertThat(applicationYml)
+                .contains("allow-document-deletion: ${MED_RAG_INDEX_REBUILD_ALLOW_DELETE:false}");
     }
 
     // ---------------------------------------------------------------- alertmanager

@@ -267,6 +267,23 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D38 controlled rebuild and why the safe mode is the default")
+    void ragChapterDocumentsTheControlledRebuild() {
+        assertThat(readme).contains("MedVectorIndexRebuilder");
+        assertThat(readme).contains("MedIndexRebuildReport");
+        assertThat(readme).contains("MedIndexRebuildIntegrationTest");
+        assertThat(readme).contains("FT.DROPINDEX");
+        // Both modes must be named: a reader has to be able to pick the non-destructive one.
+        assertThat(readme).contains("INDEX_ONLY");
+        assertThat(readme).contains("DROP_AND_REINGEST");
+        // The two switches that gate the destructive path must be documented together with the fact
+        // that the capability is off by default.
+        assertThat(readme).contains("MED_RAG_INDEX_REBUILD_ENABLED");
+        assertThat(readme).contains("MED_RAG_INDEX_REBUILD_ALLOW_DELETE");
+        assertThat(readme).contains("med:lock:rag:index:rebuild:");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

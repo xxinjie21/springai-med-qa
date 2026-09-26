@@ -341,7 +341,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）与向量索引健康探针（D37） |
+| 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
 | 覆盖率门禁 | `jacoco-coverage-gate` 执行（`verify` 阶段，`haltOnFailure`）：指令 ≥ 90%、分支 ≥ 80%、行 ≥ 90%，阈值以 `jacoco.min.*` 属性声明；不达标直接 BUILD FAILURE，CI 无法合入 |
@@ -399,6 +399,35 @@ D36 证明了 RAG 链路在真实 Redis Stack 上**能**工作，但没有任何
 
 `MedVectorIndexProbeIntegrationTest` 在真实 Redis Stack 上验证探针读到的正是官方 `RedisVectorStore` 建出的索引（TAG 字段、前缀、文档数随入库增长），并断言索引被 `FT.DROPINDEX` 后结论翻转为 `index-missing` 而不是抛异常。这条用例存在的另一个理由：`FT.INFO` 的嵌套结构在 Jedis 5.x 里返回的是**扁平交替列表**而非 Map，只用离线手写报文无法证明解码器匹配真实客户端；一旦两者错位，所有索引都会被读成「零个 TAG 字段」，与要检测的漂移无法区分。
 
+### 受控的索引重建（D38）
+
+D37 让坏掉的索引**可见**，但没有让它**可修**。它检测到的两种故障（索引不存在 / TAG Schema 漂移）修复动作是同一个：把索引删掉、按当前配置重建。在此之前这只能由运维手工在生产 Redis 上敲 `FT.DROPINDEX`——没有互斥（两个运维、或运维与定时任务同时删）、没有「重建后是否真的可用」的校验、也没有任何记录说明是谁删的。
+
+`MedVectorIndexRebuilder` 把这件事变成一个有互斥、有校验、有报告的操作，全程复用官方组件而不是自研：
+
+| 步骤 | 复用的组件 |
+|---|---|
+| 加锁 | Redisson `RLock`，键 `med:lock:rag:index:rebuild:{index}`（与 `med:lock:chat:` 会话锁不同命名空间） |
+| 删除索引 | 官方 Jedis `FT.DROPINDEX` / `FT.DROPINDEX … DD` |
+| 重建 Schema | `RedisVectorStore#afterPropertiesSet()`——官方生命周期钩子，由 `med.rag.vector-store.*` 发出 `FT.CREATE`；项目内没有一处手写 `FT.CREATE` |
+| 回写入库 | `MedDocumentService.ingestAll`，即普通入库路径，Embedding 与 TAG 打标完全一致 |
+| 验收 | `MedVectorIndexProbe`——重建成功的判据与 `/actuator/health` 用的是同一个「能否按标签检索」 |
+
+两种模式，安全的那种是默认：
+
+| 模式 | 动作 | 用途 |
+|---|---|---|
+| `INDEX_ONLY`（默认） | `FT.DROPINDEX`，**保留文档** | 修复 Schema 漂移。重建索引时 RediSearch 会把前缀下已存在的 JSON 文档全部重新索引，所以**一条文档不丢、一次 Embedding 也不调** |
+| `DROP_AND_REINGEST` | `FT.DROPINDEX … DD`，连文档一起删，再回写调用方给的语料 | 语料本身损坏或被替换。**破坏性**，因此需要两道开关：请求显式指定该模式，且部署置 `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true` |
+
+重建能力默认是**关闭**的（`MED_RAG_INDEX_REBUILD_ENABLED` 默认 `false`）——与项目里其它 RAG 开关相反。理由是它是服务里唯一能删除搜索索引、也是唯一能删除已入库文档的代码路径：默认不装配意味着一个配错的部署根本不存在这条路径，而不是存在一条有防护的路径。`allow-document-deletion` 与 `enabled` 是**两把独立的钥匙**——启用重建是修复漂移的常规动作，授权删除整份语料不是，能触发重建的人不应该因此获得第二项权限。
+
+结果通过 `MedIndexRebuildReport` 返回（`outcome` ∈ `completed` / `verification-failed` / `failed` / `skipped-lock-held` / `refused`，并带 `documentsBefore → documentsAfter`、回写条数、批次数与耗时），同时经既有 `MedAlertNotifier` 链路推出：成功 `INFO`、被跳过/被拒绝 `WARNING`、失败 `CRITICAL`（失败可能让索引消失或为空，比它要修的漂移更糟，所以这条规则直接呼叫值班）。Prometheus 规则 `MedQaRagIndexRebuildFailed` 消费 `med_qa_alert_total{code="rag-index-rebuild-failed"}`。重建过程中每个阶段与每个批次都会发布一个 `MedIndexRebuildProgress` 快照（`currentProgress()`），只含计数与阶段名，可安全打日志。
+
+> 重建**不经过 HTTP 暴露**：回写语料需要语料本身，而语料不在本服务的库里（文档只存在于向量索引中，也就是正要被删掉的那个对象）。触发方式由调用方决定，触发入口属于后续迭代——同时它也避免了在 `RagAdminController` 的授权边界修复之前扩大攻击面。
+
+`MedIndexRebuildIntegrationTest` 在真实 Redis Stack 上验证的是「单测证明不了」的那一半：把索引 `FT.DROPINDEX`（不带 `DD`）后用 `INDEX_ONLY` 重建，文档仍在 Redis 中、`FT.CREATE` 把它们全部重新索引、按科室/患者标签的检索恢复可用；`DROP_AND_REINGEST` 后旧文档的键确实消失、新语料可检索；另一个 Redisson 客户端持锁时重建返回 `skipped-lock-held` 且索引状态一字未改。
+
 ---
 
 ## CI/CD
@@ -425,6 +454,10 @@ D36 证明了 RAG 链路在真实 Redis Stack 上**能**工作，但没有任何
 索引存在性与 TAG 字段一致性。`reason` 取值 `index-missing` / `schema-drift` / `unreachable`，
 非 Redis Stack 部署用 `MED_RAG_INDEX_ENABLED=false` 移除该组件。
 
+**索引重建**：`MED_RAG_INDEX_REBUILD_ENABLED=true` 才会装配 `MedVectorIndexRebuilder`（默认关闭）。
+`INDEX_ONLY` 模式删索引但保留文档，是修复 Schema 漂移的推荐动作；`DROP_AND_REINGEST` 会删除已入库文档，
+另需 `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true`。
+
 **构建验证**：`scripts/verify-docker-build.sh` 执行一次真实 `docker build` 并断言 OCI 标签、非 root 用户、
 分层布局与入口类，无 Docker 守护时自动跳过。
 
@@ -443,7 +476,7 @@ D36 证明了 RAG 链路在真实 Redis Stack 上**能**工作，但没有任何
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
-| 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 进行中（D37 索引健康与漂移检测已完成，D38 索引重建、D39 检索质量回归基线计划中） |
+| 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 进行中（D37 索引健康与漂移检测、D38 受控索引重建已完成，D39 检索质量回归基线计划中） |
 
 ---
 

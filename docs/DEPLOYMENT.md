@@ -351,6 +351,11 @@ livenessProbe:
 | `MED_RAG_ADVISOR_ORDER` | `1` | `QuestionAnswerAdvisor` 链序 |
 | `MED_RAG_INDEX_ENABLED` | `true` | 向量索引健康探针开关（**非 Redis Stack 部署必须置 `false`**，否则 Pod 会被判为不健康） |
 | `MED_RAG_INDEX_CHECK_INTERVAL` / `MED_RAG_INDEX_INITIAL_DELAY` | `5m` / `1m` | 索引探针轮询间隔与启动宽限期 |
+| `MED_RAG_INDEX_REBUILD_ENABLED` | `false` | 受控索引重建开关（D38）。**默认关闭**：这是唯一能删除搜索索引的代码路径，需要时再显式打开 |
+| `MED_RAG_INDEX_REBUILD_ALLOW_DELETE` | `false` | 是否允许 `DROP_AND_REINGEST`（连已入库文档一起删）。与上一项独立，默认拒绝 |
+| `MED_RAG_INDEX_REBUILD_BATCH_SIZE` | `50` | 重建回写批大小；不得超过 `MED_RAG_INGEST_MAX_DOCUMENTS`（矛盾在启动时报错） |
+| `MED_RAG_INDEX_REBUILD_MAX_DOCUMENTS` | `5000` | 单次重建语料上限，超出即拒绝（避免误触发全量重嵌入） |
+| `MED_RAG_INDEX_REBUILD_LOCK_WAIT` / `..._LOCK_LEASE` | `5s` / `10m` | 重建互斥等待与租约；租约 `0` 表示交给 Redisson 看门狗续期 |
 
 ---
 
@@ -443,7 +448,64 @@ Redis Stack 版而从未建成功；也可以存在、但 TAG 字段与配置漂
 恢复 `INFO`（`rag-index-recovered`）、探针异常 `CRITICAL`（`rag-index-probe-failed`）。
 Prometheus 规则 `MedQaRagIndexDegraded` 消费 `med_qa_alert_total{code="rag-index-degraded"}`。
 
-### 7.2 告警链路（D33）
+### 7.2 索引重建（D38）
+
+D37 只监控、不重建；D38 补上受控的修复动作。`MedVectorIndexRebuilder` 把「删索引 → 按当前配置重建 → 回写语料
+→ 校验」变成一次带分布式互斥、带验收、带报告的操作，全部复用官方组件：
+
+| 步骤 | 复用组件 |
+|---|---|
+| 互斥 | Redisson `RLock`，键 `med:lock:rag:index:rebuild:{index}` |
+| 删除 | 官方 Jedis `FT.DROPINDEX`（保留文档）或 `FT.DROPINDEX … DD`（连文档一起删） |
+| 重建 Schema | `RedisVectorStore#afterPropertiesSet()`，即官方生命周期钩子，由 `med.rag.vector-store.*` 发 `FT.CREATE` |
+| 回写 | `MedDocumentService.ingestAll`（普通入库路径，Embedding 与 TAG 打标一致） |
+| 验收 | `MedVectorIndexProbe`：重建成功的判据与 `/actuator/health` 相同 |
+
+两种模式：
+
+| 模式 | 动作 | 用途 / 风险 |
+|---|---|---|
+| `INDEX_ONLY`（默认） | 删索引、**保留文档** | 修复 Schema 漂移。重建时 RediSearch 会重新索引前缀下已存在的 JSON 文档，因此**不丢文档、不调 Embedding** |
+| `DROP_AND_REINGEST` | 删索引 + 删文档，再回写调用方给的语料 | 语料损坏/替换。**破坏性**，需要 `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true`，否则请求在接触 Redis 之前就被拒绝 |
+
+```bash
+# 打开重建能力（默认关闭）
+MED_RAG_INDEX_REBUILD_ENABLED=true
+# 仅在确实要整体替换语料时才打开第二把钥匙
+MED_RAG_INDEX_REBUILD_ALLOW_DELETE=false
+# 批大小不得超过 MED_RAG_INGEST_MAX_DOCUMENTS（默认 50 vs 500），矛盾会在启动时直接失败
+MED_RAG_INDEX_REBUILD_BATCH_SIZE=50
+# 单次重建语料上限与互斥等待/租约
+MED_RAG_INDEX_REBUILD_MAX_DOCUMENTS=5000
+MED_RAG_INDEX_REBUILD_LOCK_WAIT=5s
+MED_RAG_INDEX_REBUILD_LOCK_LEASE=10m
+```
+
+现场处置（对应 `MedVectorIndexHealthIndicator` 的三种 `reason`）：
+
+| `reason` | 动作 |
+|---|---|
+| `index-missing` | 先确认 Redis 是 Redis Stack 版；再以 `INDEX_ONLY` 重建（索引不存在时它就是「建索引」，不会删除任何东西） |
+| `schema-drift` | 用 `INDEX_ONLY` 重建：删掉旧索引、按当前 `med.rag.vector-store.metadata-fields` 重新 `FT.CREATE`，已入库文档会被自动重新索引，**无需重新入库** |
+| `unreachable` | 按 Redis 故障处理；此时不要重建（连不上就无法加锁，重建会直接以 `failed` 收尾） |
+
+结果与告警：
+
+- `MedIndexRebuildReport.outcome` ∈ `completed` / `verification-failed` / `failed` / `skipped-lock-held` / `refused`，
+  并带 `documentsBefore → documentsAfter`、回写条数、批次数与耗时；
+- 告警码：`rag-index-rebuild-completed`（INFO）、`rag-index-rebuild-skipped`（WARNING，含被拒绝）、
+  `rag-index-rebuild-failed`（CRITICAL）；
+- Prometheus 规则 `MedQaRagIndexRebuildFailed`（`severity: critical`）：重建失败可能让索引消失或为空，
+  比它要修的漂移更糟，因此直接呼叫值班；
+- 进度：每个阶段与每个批次发布一个 `MedIndexRebuildProgress` 快照（`currentProgress()`），
+  只含计数与阶段名，可安全打日志。
+
+> **重建不经 HTTP 暴露**：回写语料需要语料本身，而语料不在本服务库里（文档只存在于向量索引中）。
+> 触发方式由调用方决定；同时这也避免了在 `RagAdminController` 的授权边界修复前扩大攻击面。
+> **重建前请先确认 `med.rag.vector-store.initialize-schema=true`**：置 `false` 时没有任何东西会在删除后
+> 重建索引，该组合会在启动时直接失败，而不是等到重建时才报错。
+
+### 7.3 告警链路（D33）
 
 Actuator 只能回答「有人来问」时的健康状态。`com.med.qa.alert` 补上了推送侧：
 
@@ -462,7 +524,7 @@ MedVectorIndexAlertMonitor（@Scheduled 轮询 MedVectorIndexHealthIndicator，D
 - **恢复通知**：组件恢复会补一条 `INFO`（`storage-recovered` / `rag-index-recovered`），
   避免「还在坏」与「早已恢复」无法区分。
 
-### 7.3 监控栈（可选）
+### 7.4 监控栈（可选）
 
 `docker-compose.yml` 中 Prometheus 与 Alertmanager 位于 `observability` profile，默认**不启动**：
 
