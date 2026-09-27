@@ -259,6 +259,29 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D39 retrieval-quality baseline and its three assertions")
+    void ragChapterDocumentsTheRetrievalQualityBaseline() {
+        assertThat(english).contains("MedRetrievalBaselineEvaluator");
+        assertThat(english).contains("MedRetrievalBaselineLoader");
+        assertThat(english).contains("MedRetrievalBaselineReport");
+        assertThat(english).contains("MedRetrievalBaselineIntegrationTest");
+        assertThat(english).contains("MedRetrievalBaselineResourceTest");
+        assertThat(english).contains("retrieval-baseline.json");
+        // All three assertions a case can make have to be named, so a reader can pick the right one.
+        assertThat(english).contains("expectedDocumentIds");
+        assertThat(english).contains("expectedTopDocumentId");
+        assertThat(english).contains("forbiddenDocumentIds");
+        assertThat(english).contains("minRecall");
+        // Why the loader refuses unknown fields must be stated: it is the difference between a broken
+        // golden set failing and one silently asserting nothing.
+        assertThat(english).contains("unknown fields");
+        // The evaluator measures, it does not retrieve - and a failure propagates instead of being
+        // reported as zero recall.
+        assertThat(english).contains("document identifiers only");
+        assertThat(english).contains("zero recall");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

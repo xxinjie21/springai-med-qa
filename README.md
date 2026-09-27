@@ -428,6 +428,41 @@ D37 让坏掉的索引**可见**，但没有让它**可修**。它检测到的�
 
 `MedIndexRebuildIntegrationTest` 在真实 Redis Stack 上验证的是「单测证明不了」的那一半：把索引 `FT.DROPINDEX`（不带 `DD`）后用 `INDEX_ONLY` 重建，文档仍在 Redis 中、`FT.CREATE` 把它们全部重新索引、按科室/患者标签的检索恢复可用；`DROP_AND_REINGEST` 后旧文档的键确实消失、新语料可检索；另一个 Redisson 客户端持锁时重建返回 `skipped-lock-held` 且索引状态一字未改。
 
+### 检索质量回归基线（D39）
+
+D37 让坏索引**可见**、D38 让它**可修**，但两者回答的都是「索引这一层是否正常」。真正交付给医生的是**检索质量**：同一个问题，昨天能召回的病历今天还在不在、排序有没有变差、范围内该返回的是不是还在。这三件事出问题时，不会有任何探针变红——服务健康、接口 200、索引存在且 TAG Schema 一致，只是召回的证据少了或排序塌了。
+
+D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题集**（`src/test/resources/rag/retrieval-baseline.json`）配一份**冻结的语料**（`MedRetrievalBaselineIntegrationTest` 内的 corpus），在真实 Redis Stack 上把整个集合跑一遍，任何一条不达预期就让构建失败。
+
+每个用例可以断言三件事，分别对应一类不会报错的回归：
+
+| 断言 | 字段 | 防的是哪一类回归 |
+|---|---|---|
+| 召回 | `expectedDocumentIds` + `minRecall` | 过滤条件吃掉本该返回的文档（D36 的 `IN` 静默丢弃病历就是这一类） |
+| 排序 | `expectedTopDocumentId` | 文档都在，但最相关的那条不在第一位——只看「有没有」的基线抓不到 |
+| 隔离 | `forbiddenDocumentIds` | 不该出现的文档出现了（跨患者 / 跨科室 / 跨租户泄漏） |
+
+`expectedDocumentIds` 为空是合法的，那是**反向用例**：只断言「什么都别返回」。它必须同时声明 `minRecall: 0.0` 与非空的 `forbiddenDocumentIds`，否则它什么也没断言。这类用例专门抓「标签过滤失效」——一旦过滤条件不再生效，该作用域会突然返回别的租户或科室的文档。
+
+组件分工（沿用「不自研底层组件」，全部只做测量）：
+
+| 类 | 职责 |
+|---|---|
+| `MedRetrievalBaselineCase` / `MedRetrievalBaseline` | 金标用例与集合；不可变值对象，构造即校验 |
+| `MedRetrievalBaselineLoader` | 读 JSON；**拒绝未知字段**（Jackson 默认是忽略，那会让写错的键名静默退化成「没有断言」），错误信息带 JSON 路径如 `$.cases[3].minRecall` |
+| `MedRetrievalBaselineEvaluator` | 把每个用例交给生产的 `MedRetrievalService` 执行，再把结果交给结果对象比对；不做任何相似度计算 |
+| `MedRetrievalBaselineCaseResult` / `MedRetrievalBaselineReport` | 召回率、首个命中排名、MRR、泄漏列表与失败摘要 |
+
+> 相似度、Top-K、排序与过滤求值仍然全部由官方 `RedisVectorStore` 在 Redis 内完成；评测器只比较**文档 ID**，不读文档内容、不看分数、不重排。检索本身出错（Embedding 不可用、Redis 报错、返回越权文档）会直接向上抛，而不是记成「召回率 0」——故障与质量回归必须区分开。
+
+用例里的问题文本**不会**出现在日志、报告或 `toString()` 里（与 `MedRetrievalQuery` 同一条规则）：金标集可能被指向真实问诊问题，而问题文本一旦落盘就是患者数据，报告只用用例名定位。
+
+三条防「基线退化」的自检在 `MedRetrievalBaselineResourceTest` 里离线运行：① 集合结构合法（有名字、有版本、用例名唯一、至少 5 条）；② **每条用例都能失败**（期望或禁止非空，且每条至少禁止一份文档）；③ **集合不是空转的**——用「什么都不返回」与「返回全部」两个替身各跑一遍，必须失败。
+
+`MedRetrievalBaselineIntegrationTest` 另外守住「金标集与语料不漂移」：用生产的 `MedRetrievalFilters.matches` 逐条校验期望文档确实落在该用例的作用域内、禁止文档确实落在作用域外。ID 写错或作用域写反会在这里直接失败，而不是伪装成一次「检索质量暴跌」。
+
+跑法：`.\mvnw.cmd "-Dtest=MedRetrievalBaselineIntegrationTest" test`（需要 Docker；CI 的 `integration` job 已经会跑到它）。
+
 ---
 
 ## CI/CD
@@ -476,7 +511,7 @@ D37 让坏掉的索引**可见**，但没有让它**可修**。它检测到的�
 | 阶段 4 部署与收尾 | D27–D31 | 已完成 |
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
-| 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 进行中（D37 索引健康与漂移检测、D38 受控索引重建已完成，D39 检索质量回归基线计划中） |
+| 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 
 ---
 

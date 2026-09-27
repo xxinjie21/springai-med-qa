@@ -1,0 +1,146 @@
+{
+  "name": "rag-retrieval-baseline",
+  "version": "1",
+  "cases": [
+    {
+      "name": "patient-scope-returns-own-record-and-department-guidelines",
+      "tenantId": "tenant-a",
+      "deptId": "dept-cardio",
+      "patientId": "patient-1",
+      "query": "高血压 首选 药物",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [
+        "doc-baseline-guide-hypertension",
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-record-patient-1"
+      ],
+      "expectedTopDocumentId": "doc-baseline-guide-hypertension",
+      "forbiddenDocumentIds": [
+        "doc-baseline-record-patient-2",
+        "doc-baseline-guide-stroke",
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "minRecall": 1.0
+    },
+    {
+      "name": "patient-scope-can-exclude-department-guidelines",
+      "tenantId": "tenant-a",
+      "deptId": "dept-cardio",
+      "patientId": "patient-1",
+      "query": "钙通道阻滞剂 依从性 用药",
+      "topK": 10,
+      "includeSharedDocuments": false,
+      "expectedDocumentIds": [
+        "doc-baseline-record-patient-1"
+      ],
+      "expectedTopDocumentId": "doc-baseline-record-patient-1",
+      "forbiddenDocumentIds": [
+        "doc-baseline-guide-hypertension",
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-record-patient-2"
+      ],
+      "minRecall": 1.0
+    },
+    {
+      "name": "department-wide-scope-returns-guidelines-only",
+      "tenantId": "tenant-a",
+      "deptId": "dept-cardio",
+      "query": "糖尿病 诊疗 指南 首选 药物",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-guide-hypertension"
+      ],
+      "expectedTopDocumentId": "doc-baseline-guide-diabetes",
+      "forbiddenDocumentIds": [
+        "doc-baseline-record-patient-1",
+        "doc-baseline-record-patient-2",
+        "doc-baseline-guide-stroke",
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "minRecall": 1.0
+    },
+    {
+      "name": "another-tenant-stays-invisible",
+      "tenantId": "tenant-b",
+      "deptId": "dept-cardio",
+      "patientId": "patient-1",
+      "query": "高血压 首选 药物",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "expectedTopDocumentId": "doc-baseline-guide-hypertension-b",
+      "forbiddenDocumentIds": [
+        "doc-baseline-guide-hypertension",
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-record-patient-1",
+        "doc-baseline-guide-stroke"
+      ],
+      "minRecall": 1.0
+    },
+    {
+      "name": "another-department-stays-invisible",
+      "tenantId": "tenant-a",
+      "deptId": "dept-neuro",
+      "patientId": "patient-1",
+      "query": "脑卒中 首选 药物 抗血小板",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [
+        "doc-baseline-guide-stroke"
+      ],
+      "expectedTopDocumentId": "doc-baseline-guide-stroke",
+      "forbiddenDocumentIds": [
+        "doc-baseline-guide-hypertension",
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-record-patient-1",
+        "doc-baseline-record-patient-2",
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "minRecall": 1.0
+    },
+    {
+      "name": "unknown-scope-returns-nothing",
+      "tenantId": "tenant-a",
+      "deptId": "dept-oncology",
+      "patientId": "patient-1",
+      "query": "高血压 首选 药物",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [],
+      "forbiddenDocumentIds": [
+        "doc-baseline-guide-hypertension",
+        "doc-baseline-record-patient-1",
+        "doc-baseline-record-patient-2",
+        "doc-baseline-guide-diabetes",
+        "doc-baseline-guide-stroke",
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "minRecall": 0.0
+    },
+    {
+      "name": "patient-record-outranks-the-guideline",
+      "tenantId": "tenant-a",
+      "deptId": "dept-cardio",
+      "patientId": "patient-1",
+      "query": "患者 用药 记录 钙通道阻滞剂 依从性",
+      "topK": 10,
+      "includeSharedDocuments": true,
+      "expectedDocumentIds": [
+        "doc-baseline-record-patient-1",
+        "doc-baseline-guide-hypertension"
+      ],
+      "expectedTopDocumentId": "doc-baseline-record-patient-1",
+      "forbiddenDocumentIds": [
+        "doc-baseline-record-patient-2",
+        "doc-baseline-guide-stroke",
+        "doc-baseline-guide-hypertension-b"
+      ],
+      "minRecall": 1.0
+    }
+  ]
+}

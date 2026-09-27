@@ -284,6 +284,27 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D39 retrieval-quality baseline and its three assertions")
+    void ragChapterDocumentsTheRetrievalQualityBaseline() {
+        assertThat(readme).contains("MedRetrievalBaselineLoader");
+        assertThat(readme).contains("MedRetrievalBaselineEvaluator");
+        assertThat(readme).contains("MedRetrievalBaselineReport");
+        assertThat(readme).contains("MedRetrievalBaselineIntegrationTest");
+        assertThat(readme).contains("MedRetrievalBaselineResourceTest");
+        assertThat(readme).contains("retrieval-baseline.json");
+        // All three assertions a case can make have to be named, so a reader can pick the right one.
+        assertThat(readme).contains("expectedDocumentIds");
+        assertThat(readme).contains("expectedTopDocumentId");
+        assertThat(readme).contains("forbiddenDocumentIds");
+        assertThat(readme).contains("minRecall");
+        // Why the loader refuses unknown fields must be stated: it is the difference between a broken
+        // golden set failing and one silently asserting nothing.
+        assertThat(readme).contains("拒绝未知字段");
+        // The drift check between the golden set and the corpus uses the production predicate.
+        assertThat(readme).contains("MedRetrievalFilters.matches");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

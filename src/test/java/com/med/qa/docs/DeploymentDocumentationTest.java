@@ -236,6 +236,21 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D39 retrieval-quality baseline and how to triage each failure shape")
+    void retrievalQualityBaselineIsDocumented() {
+        assertThat(handbook).contains("MedRetrievalBaselineIntegrationTest");
+        assertThat(handbook).contains("MedRetrievalBaselineResourceTest");
+        assertThat(handbook).contains("retrieval-baseline.json");
+        assertThat(handbook).contains("minRecall");
+        // Every failure shape of the baseline must carry the keyword an operator will see and a
+        // pointer to what to inspect first.
+        assertThat(handbook).contains("is below the required");
+        assertThat(handbook).contains("best-ranked document is");
+        assertThat(handbook).contains("out-of-scope documents were returned");
+        assertThat(handbook).contains("vector-algorithm");
+    }
+
+    @Test
     @DisplayName("the troubleshooting table explains every business error code an operator can observe")
     void troubleshootingCoversBusinessErrorCodes() {
         assertThat(handbook).contains("401");

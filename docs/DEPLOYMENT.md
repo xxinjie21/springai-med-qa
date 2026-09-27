@@ -176,6 +176,37 @@ API，测试环境既没有凭据也无法保证可复现。替身只做「文�
 > 所以纯文本断言一直是绿的。现由 `MedRetrievalFiltersTest` 的转义用例与
 > `MedRagRetrievalIntegrationTest` 的连字符标识符共同守住。
 
+### 2.6 检索质量回归基线（D39）
+
+D36 证明 RAG 链路**能**工作，D37/D38 守住索引这一层；D39 守住真正交付的东西——**检索质量**。同一个问题，
+昨天能召回的病历今天还在不在、最相关的那条还在不在第一位、范围内不该出现的文档有没有冒出来。这三类变化
+都不会让任何探针变红：服务健康、接口 200、索引存在且 TAG Schema 一致。
+
+金标集固定在 `src/test/resources/rag/retrieval-baseline.json`，语料固定在同名集成测试里，两者一起构成
+「这个语料 + 这些问题 = 这些答案」的冻结契约。**改动检索路径（索引拓扑、入库元数据、过滤表达式）后必须重跑它**：
+
+```bash
+# 需要 Docker（Testcontainers 起真实 Redis Stack）
+./mvnw -Dtest=MedRetrievalBaselineIntegrationTest test
+
+# Windows PowerShell：每个 -D 参数都要加双引号
+$env:JAVA_HOME="F:\jdk17"; .\mvnw.cmd "-Dtest=MedRetrievalBaselineIntegrationTest" test
+```
+
+失败时的排查顺序：
+
+| 失败形态 | 失败摘要里的关键字 | 先看哪里 |
+|---|---|---|
+| 召回下降 | `recall ... is below the required ...; missing [...]` | 该用例作用域内是否有文档被过滤条件吃掉；确认 `med.rag.vector-store.metadata-fields` 与入库时写入的元数据键一致 |
+| 排序变化 | `the best-ranked document is '...' but '...' was expected` | 换过 Embedding 模型或向量算法（`vector-algorithm` / `distance-metric`）都会改变排序；确认是有意为之再更新金标集 |
+| 越权泄漏 | `out-of-scope documents were returned: [...]` | **最高优先级**：过滤表达式或索引 TAG 定义出了问题，等价于 D36 的静默丢弃缺陷，先按 §7.1 检查索引健康 |
+
+> 金标集是**数据**，更新它是正常的迭代动作（加问题、加禁止文档、收紧 `minRecall`）；但一次「因为改了检索
+> 实现所以顺手改了期望」的更新，必须同时把 `version` 递增，让 CI 历史里能区分「基线推进」与「基线被迁就」。
+>
+> 集合本身的结构自检（`MedRetrievalBaselineResourceTest`）离线运行，不需要 Docker：它保证用例都能失败、
+> 集合不是空转的，以及租户/科室两个隔离维度都有覆盖。
+
 ---
 
 ## 3. Docker Compose 全栈部署

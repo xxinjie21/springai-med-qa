@@ -515,6 +515,65 @@ re-indexes all of them, and tag-scoped retrieval answers the same query again; a
 another Redisson client holds the mutex the rebuild returns `skipped-lock-held` without changing a
 single byte of the index.
 
+### Retrieval-quality regression baseline (D39)
+
+D37 makes a broken index **visible** and D38 makes it **repairable**, but both answer a question about
+the index layer. What actually reaches a clinician is **retrieval quality**: the record that came back
+yesterday, the order the evidence arrives in, and the documents that must never appear. None of those
+failures turns a probe red — the service is healthy, the endpoint returns 200, the index exists with
+the configured TAG schema; the answers simply rest on less evidence, or on evidence in the wrong order.
+
+D39 turns that into an assertion CI can fail on: a **frozen golden question set**
+(`src/test/resources/rag/retrieval-baseline.json`) plus a **frozen corpus** (the fixture inside
+`MedRetrievalBaselineIntegrationTest`), evaluated end to end against a real Redis Stack. One case below
+its expectations fails the build.
+
+Each case asserts up to three things, one per silent failure mode:
+
+| Assertion | Fields | The regression it catches |
+|---|---|---|
+| Recall | `expectedDocumentIds` + `minRecall` | A filter eating documents that should have come back (the D36 `IN` predicate silently dropping a patient's own record) |
+| Ranking | `expectedTopDocumentId` | Every document present, but the most relevant one is not first — a presence-only baseline cannot see this |
+| Isolation | `forbiddenDocumentIds` | A document that must never appear, appearing: a cross-patient, cross-department or cross-tenant leak |
+
+An empty `expectedDocumentIds` is legal and means a **negative case**: assert that nothing comes back.
+Such a case has to declare `minRecall: 0.0` and a non-empty `forbiddenDocumentIds`, otherwise it
+asserts nothing at all. It is what catches a tag filter that stopped filtering: the moment the
+predicate stops working, that scope starts returning another tenant's or department's documents.
+
+The pieces, all of them measuring rather than retrieving:
+
+| Class | Responsibility |
+|---|---|
+| `MedRetrievalBaselineCase` / `MedRetrievalBaseline` | The case and the set; immutable value objects that validate on construction |
+| `MedRetrievalBaselineLoader` | Reads the JSON and **rejects unknown fields** (Jackson's default is to ignore them, which would let a mistyped key silently become "no assertion"); errors carry the JSON path, e.g. `$.cases[3].minRecall` |
+| `MedRetrievalBaselineEvaluator` | Runs each case through the production `MedRetrievalService` and hands the identifiers to the result object; it computes no similarity of its own |
+| `MedRetrievalBaselineCaseResult` / `MedRetrievalBaselineReport` | Recall, first-hit rank, mean reciprocal rank, leaked identifiers and a failure summary |
+
+> Similarity, Top-K, ranking and filter evaluation still happen entirely inside Redis, performed by the
+> official `RedisVectorStore`; the evaluator compares **document identifiers only** and never reads
+> document text, scores or an ordering of its own. A retrieval that *fails* — the embedding gateway is
+> down, Redis errors, a document outside the requested scope comes back — propagates instead of being
+> recorded as "zero recall", because an outage and a quality regression are not the same thing.
+
+The question text of a case never appears in a log, a report or a `toString()` (the same rule
+`MedRetrievalQuery` follows): a golden set may be pointed at real consultation questions, and a written
+question is patient data. Reports identify cases by name.
+
+Three self-checks keep the baseline from quietly decaying, and they run offline in
+`MedRetrievalBaselineResourceTest`: (1) the set is well formed — named, versioned, uniquely named cases,
+at least five of them; (2) **every case can fail** — it expects something or forbids something, and every
+case forbids at least one document; (3) **the set is not vacuous** — evaluated against a retriever that
+returns nothing and one that returns everything, it must fail both times.
+
+`MedRetrievalBaselineIntegrationTest` additionally keeps the golden set and the corpus from drifting
+apart: using the production `MedRetrievalFilters.matches` predicate it checks that every expected
+document really sits inside its case's scope and every forbidden one really sits outside it. A mistyped
+identifier or an inverted scope fails there, instead of masquerading as a collapse in retrieval quality.
+
+Run it with `.\mvnw.cmd "-Dtest=MedRetrievalBaselineIntegrationTest" test` (Docker required; the CI
+`integration` job already covers it).
+
 ---
 
 ## Alerting
@@ -619,7 +678,7 @@ the loop of code, unit tests, commit and push:
 | Phase 4, deployment and wrap-up | D27 to D31 | Done |
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
-| Phase 7, RAG index operations and retrieval observability | D37 to D39 | In progress (D37 index health and drift detection and D38 controlled index rebuild done; D39 retrieval-quality regression baseline planned) |
+| Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
 
 ---
 

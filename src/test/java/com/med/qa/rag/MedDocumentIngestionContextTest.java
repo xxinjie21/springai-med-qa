@@ -17,9 +17,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * vector store it writes to opens a Redis connection and creates the search index on first use.
  * These tests pin that wiring the service does not drag the store into the startup path, which is
  * what keeps the whole suite runnable without middleware.</p>
+ *
+ * <p>The alert chain is switched off here on purpose. {@code MedVectorIndexAlertMonitor} is a
+ * scheduled bean that polls the vector-index health indicator, and that probe resolves the lazy Jedis
+ * client — one minute into the context's life, whenever that happens to be. Without the switch these
+ * assertions would be measuring elapsed wall-clock time instead of the laziness of the wiring, and
+ * they would fail as soon as this shared context outlived the monitor's initial delay.</p>
  */
 @SpringBootTest
-@TestPropertySource(properties = "spring.flyway.enabled=false")
+@TestPropertySource(properties = {"spring.flyway.enabled=false", "med.alert.enabled=false"})
 class MedDocumentIngestionContextTest {
 
     @Autowired
