@@ -449,6 +449,18 @@ Flyway 先通过代理读 `information_schema` 判断库不存在、于是执行
 Actuator 暴露范围由 `application.yml` 控制：`management.endpoints.web.exposure.include=health,info,prometheus`，
 `show-details=never`（不向外部泄露细节）。
 
+> **D40：profile 里的暴露列表是「覆盖」而不是「合并」。** Spring Boot 对 list 属性不做合并——只要
+> `application-prod.yml` 重新声明了 `management.endpoints.web.exposure.include`，base 里那一份就被整段替换。
+> 而 `Dockerfile`（`ENV SPRING_PROFILES_ACTIVE="prod"`）与 `docker-compose.yml`（`SPRING_PROFILES_ACTIVE: prod`）
+> 激活的都是 `prod`，所以**生产环境的暴露列表实际由 `application-prod.yml` 决定**。此前该文件写的是
+> `include: health,info`，于是 `/actuator/prometheus` 在生产环境返回 404，Prometheus 抓不到
+> `med_qa_alert_total`，`deploy/prometheus/med-qa-alerts.yml` 里**全部**告警规则永不触发——整条可观测性
+> 链路静默失效，而服务看起来一切正常。现已修正为 `health,info,prometheus`，并由跨文件契约测试
+> `ApplicationProfileContractTest` 守住：它用 Spring Boot 自己的 `YamlPropertySourceLoader` 按 profile
+> 优先级合并配置、再用 `Binder` 绑定**实际生效值**，断言「任何 profile 都不得移除 base 已暴露的端点」，
+> 同时锁定 profile 集合与镜像/compose 实际激活的 profile，避免断言因 profile 改名而空转。
+> 改动任一 profile 文件前请先跑 `mvnw.cmd test "-Dtest=ApplicationProfileContractTest"`。
+
 健康组件（`/actuator/health`，`show-details=never` 时只暴露聚合状态，组件明细需 `show-details: always` 才可见）：
 
 | 组件 | 判定 |

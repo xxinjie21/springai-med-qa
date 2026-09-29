@@ -622,6 +622,15 @@ Custom meters: `med_qa_alert_total{severity,code,component}` (counter) and
 `med_qa_alert_last_epoch_seconds` (timestamp of the most recent alert, usable for a dead-man's-switch
 rule).
 
+> **A profile replaces a list property, it does not merge it (D40).** Spring Boot overwrites a list
+> value wholesale when a profile re-declares it, and both the `Dockerfile` and `docker-compose.yml`
+> activate `prod` — so the exposure list that governs production is the one in
+> `application-prod.yml`. Omitting `prometheus` there makes `/actuator/prometheus` a 404, Prometheus
+> can no longer scrape `med_qa_alert_total`, and every rule under `deploy/prometheus/` is
+> unreachable: the service keeps answering 200 while the failure stays completely silent.
+> `ApplicationProfileContractTest` guards the contract by overlaying the files in profile precedence
+> and binding the value that would really take effect.
+
 ---
 
 ## CI/CD
@@ -679,6 +688,7 @@ the loop of code, unit tests, commit and push:
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
+| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 streaming identity, D42 RAG admin authorization, D43 alert delivery ordering) |
 
 ---
 

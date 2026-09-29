@@ -485,6 +485,12 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 **告警**：`/actuator/prometheus` 为抓取端点，规则与路由在 [`deploy/`](./deploy) 下；
 `docker compose --profile observability up -d` 可拉起 Prometheus + Alertmanager 观测栈（默认不启动）。
 
+> **profile 里的暴露列表是「覆盖」而非「合并」（D40）**：Spring Boot 对 list 属性不做合并，而
+> `Dockerfile` 与 `docker-compose.yml` 都激活 `prod`，所以生产环境的暴露列表实际由
+> `application-prod.yml` 决定。它一旦漏掉 `prometheus`，Prometheus 就抓不到 `med_qa_alert_total`，
+> `deploy/prometheus/` 下全部告警规则永不触发——服务照常返回 200，故障完全静默。
+> 该契约由 `ApplicationProfileContractTest` 守住（按 profile 优先级合并配置后绑定实际生效值）。
+
 **健康组件**：`/actuator/health` 除 MySQL / Redis 连通性外，还包含 `med-vector-index`（D37）——
 索引存在性与 TAG 字段一致性。`reason` 取值 `index-missing` / `schema-drift` / `unreachable`，
 非 Redis Stack 部署用 `MED_RAG_INDEX_ENABLED=false` 移除该组件。
@@ -512,6 +518,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
+| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 流式问诊身份收敛、D42 RAG 管理端授权、D43 告警投递顺序） |
 
 ---
 

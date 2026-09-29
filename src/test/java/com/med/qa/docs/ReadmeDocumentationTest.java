@@ -305,6 +305,14 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D40 prod-profile exposure contract")
+    void deploymentChapterDocumentsTheProfileExposureContract() {
+        assertThat(readme).contains("application-prod.yml");
+        assertThat(readme).contains("ApplicationProfileContractTest");
+        assertThat(readme).contains("med_qa_alert_total");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

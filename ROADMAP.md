@@ -203,6 +203,29 @@ springai-med-qa/
 | D38 | 索引重建编排 | `MedVectorIndexRebuilder` 把「删索引 → 按配置重建 → 回写语料 → 验收」变成一次受控操作：Redisson `RLock`（`med:lock:rag:index:rebuild:{index}`）保证集群内互斥；删除走官方 Jedis `FT.DROPINDEX`（保留文档）或 `FT.DROPINDEX … DD`（连文档一起删）；Schema 重建**复用官方 `RedisVectorStore#afterPropertiesSet()`**（项目内无一处手写 `FT.CREATE`）；回写走普通入库路径 `MedDocumentService.ingestAll`；验收用 `MedVectorIndexProbe` 的「能否按标签检索」判据。`MedIndexRebuildMode.INDEX_ONLY` 为默认安全模式（RediSearch 会在重建时重新索引已存在的文档，因此不丢文档、不调 Embedding），`DROP_AND_REINGEST` 为破坏性模式，需 `MED_RAG_INDEX_REBUILD_ENABLED=true` **且** `MED_RAG_INDEX_REBUILD_ALLOW_DELETE=true`（能力默认关闭）；`MedIndexRebuildReport` 给出 `completed` / `verification-failed` / `failed` / `skipped-lock-held` / `refused` 与前后文档数、批次数、耗时，`MedIndexRebuildProgress` 上报阶段与批次进度，告警码 `rag-index-rebuild-completed` / `-skipped` / `-failed`（Prometheus 规则 `MedQaRagIndexRebuildFailed`）；`MedIndexRebuildIntegrationTest` 在真实 Redis Stack 上证明 `INDEX_ONLY` 确实不丢文档、`DROP_AND_REINGEST` 确实替换语料、外部持锁时重建零改动 | `feat(rag): add controlled vector index rebuild with distributed mutex` |
 | D39 | 检索质量回归基线 | 冻结的**金标问题集**（`src/test/resources/rag/retrieval-baseline.json`）配冻结语料，把「检索质量」变成 CI 里会失败的断言：每条用例可断言召回（`expectedDocumentIds` + `minRecall`）、排序（`expectedTopDocumentId`）与隔离（`forbiddenDocumentIds`）三件事，`expectedDocumentIds` 为空即**反向用例**（只断言「什么都别返回」，必须显式声明 `minRecall: 0.0` 且给出非空禁止集合，专门抓标签过滤失效）。`MedRetrievalBaselineLoader` 读 JSON 并**拒绝未知字段**（Jackson 默认忽略，会让写错的键名静默退化成「没有断言」），错误信息带 JSON 路径；`MedRetrievalBaselineEvaluator` 把每个用例交给生产的 `MedRetrievalService` 执行、只比对**文档 ID**（不算相似度、不重排、不读文档内容），检索本身出错则向上抛而不是记成「召回 0」；`MedRetrievalBaselineCaseResult` / `MedRetrievalBaselineReport` 给出召回率、首个命中排名、MRR、泄漏列表与失败摘要；`MedRetrievalBaselineResourceTest` 离线守住「每条用例都能失败」与「集合不是空转的」；`MedRetrievalBaselineIntegrationTest` 在真实 Redis Stack 上跑完整集合，并用生产 `MedRetrievalFilters.matches` 校验金标集与语料不漂移 | `feat: daily iteration D39` |
 
+### 阶段 8：安全边界与生产配置契约（D40–D43）
+
+> 阶段 8 的出发点：2026-09-25 的全量代码审查（报告见 `.workbuddy-ai/reports/CODE_REVIEW_2026-09-25.md`）
+> 在 1389 个测试全绿的前提下查出 **3 处 P0 + 6 处 P1**，三者同属一类偏差——**组件写好了但没接进调用链**、
+> **注释/文档承诺的行为与代码实际行为相反**、**守护测试用前缀/范围断言，恰好放过真实缺陷**。
+> 三处 P0 分别是：① `application-prod.yml` 的 `management.endpoints.web.exposure.include` 覆盖掉 base 的
+> `prometheus`（Dockerfile 与 compose 都激活 `prod`，于是生产环境整条告警链静默失效）；
+> ② `/api/chat/stream` 的会话身份与 RAG scope 全部取自**未校验的请求体**（患者 A 填患者 B 的
+> tenant/dept/session 即可越权读写他人会话）；③ `RagAdminController` 的 scope 同样取自请求体，
+> 且 `MedDocumentService.deleteByIds` 没有任何 scope 谓词（任意 STAFF Key 可跨科室增删向量）。
+> 阶段 8 逐条收敛这些边界，并把「跨组件契约」从注释承诺变成可执行断言。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D40 | 生产配置契约与守护断言校正 | `application-prod.yml` 的暴露列表修正为 `health,info,prometheus`（Spring Boot 的 list 属性在 profile 里是**覆盖**而非合并，收窄即等于生产环境 404 掉 `/actuator/prometheus`，Prometheus 抓不到 `med_qa_alert_total`、`deploy/prometheus/med-qa-alerts.yml` 里全部规则永不触发）；新增跨文件契约测试 `ApplicationProfileContractTest`——用 Spring Boot 自己的 `YamlPropertySourceLoader` 按 profile 优先级合并 base 与 `application-<profile>.yml`，再用 `Binder` 绑定**实际生效值**，断言「任何 profile 都不得移除 base 已暴露的端点」，并锁定 profile 集合与 Dockerfile/compose 实际激活的 profile，使断言不会因 profile 改名而空转；`DeploymentDocumentationTest` 的前缀断言 `include: health,info` 改为完整串（前缀断言正是 P0-1 的漏网原因）并补 `application-prod.yml` 断言；`CoverageGateConfigTest` 的 `isBetween(0.0, 1.0)` 改为显式下限（把门禁调到 0.01 也能通过的守卫等于不守） | `fix(config): keep prometheus exposed in the prod profile` |
+| D41 | 流式问诊身份来源收敛 | `/api/chat/stream` 的 tenant/dept/patient 一律取自已认证的 `MedPrincipal`，请求体中的身份字段降级为**一致性校验**（不匹配即 403），`ChatStreamService` 在追加轮次前先过 `PatientAccessGuard` 与 `MedChatSessionService.requireWritableSession`（该方法此前零生产调用点，注释却声称流式路径会调它，已关闭/归档的会话因此仍可增长） | `fix(security): derive streaming consultation identity from the principal` |
+| D42 | RAG 管理端授权与按 scope 删除 | `RagAdminController` 的 ingest / delete / search 三处 scope 全部由 principal 推导，请求体只作一致性校验；删除统一改走已有的 `deleteByScope(MedDocumentScope)`（或为 `deleteByIds` 增加 scope 谓词），消除「猜到 documentId 即可跨科室物理删除向量」 | `fix(rag): scope rag admin operations to the caller` |
+| D43 | 告警投递顺序与探测失败信号 | `MedAlertNotifier` 改为**投递成功后才写冷却指纹**（现实现先 `putIfAbsent` 再 `dispatch`，所有 sink 同时失败时该告警在冷却窗口内被静默丢弃）；`MedVectorIndexAlertMonitor` 的 `INDEX_PROBE_FAILED`（CRITICAL）分支当前不可达——`AbstractHealthIndicator#health()` 是 final 且把异常吞成 `DOWN`，需把「探测本身失败」做成显式信号，否则 Redis 全挂只报 WARNING | `fix(alert): stop marking an alert as delivered before it is` |
+
+> 阶段 8 之后仍待处理（留给后续阶段）：P1-1 `metadata-mode: EMBED` 实际**包含**元数据（与上方注释相反，
+> 隔离标签会被写进向量）、P1-2 MySQL 只保存 `MessageWindowChatMemory` 的 20 条滚动窗口（javadoc 却称其为
+> "authoritative copy"）、P1-3 记忆写路径无锁且非事务、以及 P2-1/P2-3/P2-4 的注释与部署前置条件校正。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

@@ -282,6 +282,18 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D40 prod-profile exposure contract")
+    void deploymentChapterDocumentsTheProfileExposureContract() {
+        assertThat(english).contains("application-prod.yml");
+        assertThat(english).contains("ApplicationProfileContractTest");
+        assertThat(english).contains("med_qa_alert_total");
+        // The mechanism has to be named: a profile replaces a list property instead of merging it.
+        // Without that sentence the paragraph reads as an arbitrary rule rather than a Spring Boot
+        // behaviour an operator can verify.
+        assertThat(english).contains("replaces a list property");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

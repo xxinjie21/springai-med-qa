@@ -31,6 +31,16 @@ class DeploymentDocumentationTest {
     /** Full {@code application.yml} text: the source of truth for environment placeholders. */
     private static String applicationYml;
 
+    /**
+     * Full {@code application-prod.yml} text.
+     *
+     * <p>Both the {@code Dockerfile} and {@code docker-compose.yml} activate the {@code prod} profile,
+     * so this file -- not {@code application.yml} -- decides the production runtime behaviour. Until
+     * D40 no test referenced it at all, which is how a narrowing
+     * {@code management.endpoints.web.exposure.include} shipped.</p>
+     */
+    private static String applicationProdYml;
+
     /** Full {@code sharding/med-sharding.yaml} text: owner of the MySQL placeholders. */
     private static String sharding;
 
@@ -43,6 +53,7 @@ class DeploymentDocumentationTest {
         handbook = Files.readString(root.resolve("docs/DEPLOYMENT.md"));
         compose = Files.readString(root.resolve("docker-compose.yml"));
         applicationYml = Files.readString(root.resolve("src/main/resources/application.yml"));
+        applicationProdYml = Files.readString(root.resolve("src/main/resources/application-prod.yml"));
         sharding = Files.readString(root.resolve("src/main/resources/sharding/med-sharding.yaml"));
         publishWorkflow = Files.readString(root.resolve(".github/workflows/docker-publish.yml"));
     }
@@ -96,7 +107,23 @@ class DeploymentDocumentationTest {
     void documentedHealthEndpointMatchesComposeProbe() {
         assertThat(handbook).contains("/actuator/health");
         assertThat(compose).contains("/actuator/health");
-        assertThat(applicationYml).contains("include: health,info");
+        // Assert the full list, never a prefix: "include: health,info" is satisfied by
+        // "include: health,info,prometheus" and by the truncated production override that D40 fixed.
+        assertThat(applicationYml).contains("include: health,info,prometheus");
+    }
+
+    @Test
+    @DisplayName("the handbook documents that the prod profile must keep the scrape endpoint exposed (D40)")
+    void prodProfileExposureContractIsDocumented() {
+        // Both the Dockerfile and docker-compose.yml run the prod profile, so the production
+        // exposure list is the one in application-prod.yml. An operator who edits it must be told
+        // that Spring Boot replaces a list property rather than merging it, and that dropping
+        // prometheus silently kills every rule under deploy/prometheus/.
+        assertThat(applicationProdYml).contains("include: health,info,prometheus");
+        assertThat(handbook).contains("application-prod.yml");
+        assertThat(handbook).contains("ApplicationProfileContractTest");
+        assertThat(handbook).contains("覆盖");
+        assertThat(handbook).contains("med_qa_alert_total");
     }
 
     @Test

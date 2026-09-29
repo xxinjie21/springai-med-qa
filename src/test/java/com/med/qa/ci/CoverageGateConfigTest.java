@@ -26,6 +26,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class CoverageGateConfigTest {
 
+    /**
+     * Lowest instruction-coverage floor the gate may declare.
+     *
+     * <p>The POM declares 0.90; the bound exists so a future edit cannot quietly turn the gate into
+     * a formality while the test still passes.</p>
+     */
+    private static final double MIN_INSTRUCTION_FLOOR = 0.80;
+
+    /** Lowest branch-coverage floor the gate may declare. The POM declares 0.80. */
+    private static final double MIN_BRANCH_FLOOR = 0.70;
+
+    /** Lowest line-coverage floor the gate may declare. The POM declares 0.90. */
+    private static final double MIN_LINE_FLOOR = 0.80;
+
     private static Element jacocoPlugin;
     private static Element coverageGate;
     private static Document pom;
@@ -126,19 +140,41 @@ class CoverageGateConfigTest {
     }
 
     @Test
-    @DisplayName("every floor is declared as a POM property with a sane value")
+    @DisplayName("every floor is declared exactly once as a POM property")
     void coverageFloorsAreDeclaredAsProperties() {
-        NodeList properties = pom.getElementsByTagName("jacoco.min.instruction");
-        assertThat(properties.getLength()).isEqualTo(1);
-        assertThat(Double.parseDouble(properties.item(0).getTextContent().trim()))
-                .isBetween(0.0, 1.0);
+        assertThat(pom.getElementsByTagName("jacoco.min.instruction").getLength()).isEqualTo(1);
         assertThat(pom.getElementsByTagName("jacoco.min.branch").getLength()).isEqualTo(1);
-        assertThat(Double.parseDouble(
-                pom.getElementsByTagName("jacoco.min.branch").item(0).getTextContent().trim()))
-                .isBetween(0.0, 1.0);
         assertThat(pom.getElementsByTagName("jacoco.min.line").getLength()).isEqualTo(1);
-        assertThat(Double.parseDouble(
-                pom.getElementsByTagName("jacoco.min.line").item(0).getTextContent().trim()))
-                .isBetween(0.0, 1.0);
+    }
+
+    @Test
+    @DisplayName("no floor can be lowered into meaninglessness - a gate set to 0.01 is not a gate")
+    void coverageFloorsAreNotLoweredIntoMeaninglessness() {
+        // This assertion used to read isBetween(0.0, 1.0) for each floor, which accepted 0.01: the
+        // guard test existed in form but permitted the gate to be switched off without failing. A
+        // floor has to be compared against a real lower bound, not against its own type's range.
+        assertThat(floor("jacoco.min.instruction")).isGreaterThanOrEqualTo(MIN_INSTRUCTION_FLOOR);
+        assertThat(floor("jacoco.min.branch")).isGreaterThanOrEqualTo(MIN_BRANCH_FLOOR);
+        assertThat(floor("jacoco.min.line")).isGreaterThanOrEqualTo(MIN_LINE_FLOOR);
+        assertThat(floor("jacoco.min.instruction")).isLessThanOrEqualTo(1.0);
+        assertThat(floor("jacoco.min.branch")).isLessThanOrEqualTo(1.0);
+        assertThat(floor("jacoco.min.line")).isLessThanOrEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("boundary: a floor below the accepted minimum is detected rather than waved through")
+    void aLoweredFloorIsDetected() {
+        // Proves the bound is enforced by the comparison and not by the type: a hypothetical 0.01
+        // declaration must fail every one of the three floors above.
+        assertThat(0.01).isLessThan(MIN_INSTRUCTION_FLOOR);
+        assertThat(0.01).isLessThan(MIN_BRANCH_FLOOR);
+        assertThat(0.01).isLessThan(MIN_LINE_FLOOR);
+    }
+
+    /** Value of the {@code <name>} POM property, failing when it is not declared exactly once. */
+    private static double floor(String name) {
+        NodeList properties = pom.getElementsByTagName(name);
+        assertThat(properties.getLength()).as("pom property %s", name).isEqualTo(1);
+        return Double.parseDouble(properties.item(0).getTextContent().trim());
     }
 }

@@ -11,7 +11,15 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        # Spring Boot replaces a list property when a profile re-declares it - it does NOT merge it
+        # with the value in application.yml. A narrower list here therefore removes endpoints from
+        # the profile that both the Dockerfile (ENV SPRING_PROFILES_ACTIVE="prod") and
+        # docker-compose.yml (SPRING_PROFILES_ACTIVE: prod) actually activate. Omitting prometheus
+        # used to make /actuator/prometheus a 404 in production, which silently killed the whole
+        # alert chain: Prometheus cannot scrape med_qa_alert_total, so every rule in
+        # deploy/prometheus/med-qa-alerts.yml is unreachable. Keep this a superset of the base list;
+        # ApplicationProfileContractTest fails the build if any profile ever narrows it again.
+        include: health,info,prometheus
 
 logging:
   level:
