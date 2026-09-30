@@ -195,7 +195,7 @@ Swagger UI: `http://localhost:8080/swagger-ui.html`. OpenAPI document: `/v3/api-
 
 | Method | Path | Purpose | Notes |
 |---|---|---|---|
-| `POST` | `/api/chat/stream` | SSE streaming consultation (`text/event-stream`) | `@RateLimit` plus department-scoped RAG |
+| `POST` | `/api/chat/stream` | SSE streaming consultation (`text/event-stream`) | `@RateLimit` plus an identity taken from the API key (D41) |
 | `POST` | `/api/sessions` | Create a consultation session | `@RateLimit` |
 | `GET` | `/api/sessions/{sessionId}` | Read one session | Patients may only read their own |
 | `POST` | `/api/sessions/{sessionId}/close` | Close a session (idempotent) | |
@@ -236,6 +236,52 @@ and the `MedRetrievalFilters.matches` fallback check still compares raw values �
 exactly at the query-syntax boundary. An identifier made of letters, digits and `_` escapes to
 itself, so the common case produces a byte-identical query.
 
+#### Where a streaming consultation gets its identity (D41)
+
+The tenant / department / patient of `POST /api/chat/stream` come from the **authenticated principal,
+never from the request body**. `ApiKeyAuthFilter` resolves the API key into a `MedPrincipal`,
+`ChatStreamService` builds the session coordinate (`med:chat:{tenant}:{dept}:{session}`) and the RAG
+isolation scope from it, and the body's `tenant` / `dept` / `patientId` are demoted to *consistency
+claims* checked by `RequestIdentityGuard`:
+
+| Claim in the body | Outcome |
+|---|---|
+| absent or blank | Accepted. The principal already carries the identity, so a client never has to repeat itself |
+| matches the principal (surrounding whitespace ignored) | Accepted; the turn runs in the principal's scope |
+| contradicts the principal | **403** (`tenant mismatch` / `department mismatch` / `patient mismatch`) |
+
+The details: STAFF is department-scoped, so it may name any patient of its own department (that is how
+a clinician opens a patient's consultation); PATIENT may only name itself, and a patient principal that
+carries no patient id at all is refused rather than quietly widened into a department-wide scope. The
+outcome collapses into one value object, `MedCallerScope` (the tenant/department/patient triple), from
+which both the session coordinate and the RAG isolation scope are built — so the two can never end up
+sourced from different identities.
+
+Before the model is reached the endpoint also runs `PatientAccessGuard.assertScope` (scope-level
+authorization) and `MedChatSessionService.requireWritableSession` (the session exists, belongs to the
+caller and still accepts messages — a closed or archived transcript must never grow). Authorization
+runs **before** capability: no refusal ever pays for an LLM call.
+
+Every synchronous failure is answered before the SSE stream opens, with the matching status and a
+single `error` event, instead of falling through to the global advice: `403` (identity or ownership),
+`404` (unknown session), `400` (missing `session`/`message`, invalid scope combination) and `503` (no
+model configured). The reason is practical — a `text/event-stream` response cannot render the advice's
+JSON envelope, so letting it through would surface as an opaque content-negotiation error. The
+cross-component contract is guarded by `StreamingIdentityContractTest`, which runs the real
+API key → principal → controller → service → guards chain and asserts both that a body claiming
+someone else's identity is refused and that, when the body claims nothing, the coordinates reaching the
+session layer are the **principal's**. That is exactly the class of defect the review found when 1389
+single-component tests could not notice that a guard was never called.
+
+**That contract test immediately caught a defect (D41).** `ChatStreamService`'s javadoc promised that a
+deployment without a `ChatClient.Builder` is rejected with `LLM_SERVICE_ERROR`, but Spring AI declares
+that builder with a **mandatory** `ChatModel` parameter and `ObjectProvider.getIfAvailable()` does not
+swallow an instantiation failure — so a deployment with no model received a bean-creation stack trace
+and a `500` instead of the documented 503. The fix folds `BeansException` and "returned null" into the
+same business error (`resolveChatClientBuilder`). This is precisely the "the comment promises one thing,
+the code does another" category the review named, and it is only visible to a test that drives the
+**real** `ObjectProvider` — a mock always returns null, which is why 1389 tests never saw it.
+
 ---
 
 ## Error codes
@@ -243,9 +289,9 @@ itself, so the common case produces a byte-identical query.
 | Code | Meaning | Typical situation |
 |---|---|---|
 | `0` | Success | |
-| `40000` | Validation failed | Missing identity triple, `topK` out of range |
+| `40000` | Validation failed | Missing `session` / `message`, `topK` out of range (the identity fields are optional claims, see D41) |
 | `40100` | Unauthenticated | Missing or invalid `X-API-Key` |
-| `40300` | Forbidden | Patient reading another patient's session, cross-department access |
+| `40300` | Forbidden | Patient reading another patient's session, cross-department access, or a body identity that contradicts the API key (D41) |
 | `40400` | Not found | Unknown session |
 | `40500` | Method not allowed | |
 | `40900` | Session lock held | Concurrent writes to one session, retry shortly |
@@ -355,6 +401,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40) and `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -688,7 +735,7 @@ the loop of code, unit tests, commit and push:
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
-| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 streaming identity, D42 RAG admin authorization, D43 alert delivery ordering) |
+| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 done: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest` cross-component contract test; D42 RAG admin authorization, D43 alert delivery ordering) |
 
 ---
 

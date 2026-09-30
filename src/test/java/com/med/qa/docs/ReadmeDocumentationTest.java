@@ -313,6 +313,30 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D41 streaming identity contract and its cross-component guard")
+    void apiChapterDocumentsTheStreamingIdentityContract() {
+        // The defect this guards: the streaming path used to take its scope from the request body, so a
+        // caller could read and write another patient's transcript. The README must state where the
+        // authority now lives, which refusals a caller can see, and which test crosses the boundary.
+        assertThat(readme).contains("RequestIdentityGuard");
+        assertThat(readme).contains("MedCallerScope");
+        assertThat(readme).contains("StreamingIdentityContractTest");
+        assertThat(readme).contains("MedChatSessionService.requireWritableSession");
+        assertThat(readme).contains("PatientAccessGuard.assertScope");
+        assertThat(readme).contains("一致性声明");
+        assertThat(readme).contains("tenant mismatch");
+        assertThat(readme).contains("department mismatch");
+        assertThat(readme).contains("patient mismatch");
+        // The statuses a caller can see before the stream opens must all be named.
+        assertThat(readme).contains("503");
+        assertThat(readme).contains("text/event-stream");
+        // D41's cross-component test found a defect on its first run; the project's convention is to
+        // write down what real verification caught, so a later reader knows why the catch exists.
+        assertThat(readme).contains("BeansException");
+        assertThat(readme).contains("ObjectProvider");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

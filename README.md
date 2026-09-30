@@ -186,7 +186,7 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 
 | 方法 | 路径 | 说明 | 备注 |
 |---|---|---|---|
-| `POST` | `/api/chat/stream` | SSE 流式问诊（`text/event-stream`） | `@RateLimit` + 科室 RAG 隔离 |
+| `POST` | `/api/chat/stream` | SSE 流式问诊（`text/event-stream`） | `@RateLimit` + 身份取自 API Key（D41） |
 | `POST` | `/api/sessions` | 创建问诊会话 | `@RateLimit` |
 | `GET` | `/api/sessions/{sessionId}` | 查询单个会话 | 患者仅可查本人 |
 | `POST` | `/api/sessions/{sessionId}/close` | 关闭会话（幂等） | |
@@ -225,6 +225,44 @@ RediSearch 的 `TAG` 查询语法保留了一批字符（`-`、`.`、`:` 等）�
 的兜底校验也仍按原始值比对——`escapeTagValue` 的职责边界就在查询语法这一层。
 只由字母、数字、`_` 组成的标识符转义后与原值完全一致，常见场景的查询串没有任何变化。
 
+#### 流式问诊的身份来源（D41）
+
+`POST /api/chat/stream` 的 tenant / dept / patient **取自认证身份，不取自请求体**。API Key 由
+`ApiKeyAuthFilter` 解析成 `MedPrincipal`，`ChatStreamService` 用它构造会话坐标
+（`med:chat:{tenant}:{dept}:{session}`）与 RAG 隔离 scope，请求体里的 `tenant` / `dept` / `patientId`
+降级为**一致性声明**，由 `RequestIdentityGuard` 校验：
+
+| 请求体声明 | 结果 |
+|---|---|
+| 缺省或空白 | 合法。身份完全来自 principal，客户端不必重复自己是谁 |
+| 与 principal 一致（允许首尾空白） | 合法，按 principal 的身份执行 |
+| 与 principal 不一致 | **403**（`tenant mismatch` / `department mismatch` / `patient mismatch`） |
+
+规则细节：STAFF 是科室级的，可以点名本科室的任意患者（医生打开患者问诊就是这条）；PATIENT
+只能指向自己，且**没有 patientId 的 patient principal 直接 403**，不会被放宽成科室级 scope。
+解析结果收敛成一个值对象 `MedCallerScope`（tenant/dept/patient 三元组），会话坐标与 RAG 隔离 scope
+都从它构造，因此不可能出现「坐标用一个来源、过滤用另一个来源」的错配。
+
+在触达模型之前，这个端点还会依次执行 `PatientAccessGuard.assertScope`（作用域级授权）与
+`MedChatSessionService.requireWritableSession`（会话存在、属于调用者、且仍可写入——已关闭/已归档的
+会话绝不增长）。**授权先于能力**，任何一步失败都不会产生 LLM 调用。
+
+同步失败一律在 SSE 打开之前以对应状态码 + 单个 `error` 事件返回，不落到全局异常处理器：
+`403`（身份/归属越权）、`404`（会话不存在）、`400`（`session`/`message` 缺失、scope 组合非法）、
+`503`（模型未配置）。原因很实际——`text/event-stream` 的响应协商渲染不了全局处理器的 JSON 信封，
+放过去只会变成一个语义不明的协商错误。跨组件契约由 `StreamingIdentityContractTest` 守住：
+它让真实的 API Key → principal → 控制器 → 服务 → 守卫整条链跑起来，断言请求体声明的他人身份会被拒绝、
+且身份缺省时到达会话层的是 **principal 的坐标**。审查报告里「1389 个测试全是单组件测试、抓不到
+『守卫没被调用』」正是这类缺陷的成因。
+
+**这个契约测试当场查出了一个缺陷**（D41）：`ChatStreamService` 的注释承诺「没有 `ChatClient.Builder`
+时抛 `LLM_SERVICE_ERROR`」，但 Spring AI 的 builder bean 带一个**必需**的 `ChatModel` 参数，而
+`ObjectProvider.getIfAvailable()` **不会吞掉实例化失败**——于是「模型未配置」的部署拿到的是
+bean 创建栈 + `500`，而不是文档承诺的 503。修法是把 `BeansException` 与「返回 null」折叠成同一个
+业务错误（`resolveChatClientBuilder`）。这正是审查归纳的「注释承诺与代码实际行为相反」那一类缺陷，
+而它只有在测试真的驱动**真实** `ObjectProvider`（而不是 mock）时才暴露——mock 永远返回 null，
+所以 1389 个测试都没看到它。
+
 ---
 
 ## 错误码
@@ -232,9 +270,9 @@ RediSearch 的 `TAG` 查询语法保留了一批字符（`-`、`.`、`:` 等）�
 | Code | 含义 | 典型场景 |
 |---|---|---|
 | `0` | 成功 | |
-| `40000` | 参数校验失败 | 身份三元组缺失、topK 越界 |
+| `40000` | 参数校验失败 | `session` / `message` 缺失、topK 越界（身份字段是可选的一致性声明，见 D41） |
 | `40100` | 未认证 | 缺少或无效的 `X-API-Key` |
-| `40300` | 无权限 | 患者跨会话访问、跨科室访问 |
+| `40300` | 无权限 | 患者跨会话访问、跨科室访问、请求体声明的身份与 API Key 不一致（D41） |
 | `40400` | 资源不存在 | 会话不存在 |
 | `40500` | 方法不允许 | |
 | `40900` | 会话锁占用 | 并发写入同一会话，稍后重试 |
@@ -341,6 +379,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -518,7 +557,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
-| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 流式问诊身份收敛、D42 RAG 管理端授权、D43 告警投递顺序） |
+| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 已完成：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest` 跨组件契约测试；D42 RAG 管理端授权、D43 告警投递顺序） |
 
 ---
 

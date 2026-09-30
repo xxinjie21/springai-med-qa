@@ -294,6 +294,28 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D41 streaming identity contract and its cross-component guard")
+    void apiChapterDocumentsTheStreamingIdentityContract() {
+        assertThat(english).contains("RequestIdentityGuard");
+        assertThat(english).contains("MedCallerScope");
+        assertThat(english).contains("StreamingIdentityContractTest");
+        assertThat(english).contains("MedChatSessionService.requireWritableSession");
+        assertThat(english).contains("PatientAccessGuard.assertScope");
+        assertThat(english).contains("consistency");
+        assertThat(english).contains("tenant mismatch");
+        assertThat(english).contains("department mismatch");
+        assertThat(english).contains("patient mismatch");
+        // The three refusals a caller can meet before the stream opens must all be named, and so must
+        // the reason they bypass the global advice.
+        assertThat(english).contains("503");
+        assertThat(english).contains("text/event-stream");
+        assertThat(english).contains("content-negotiation");
+        // What the D41 cross-component test caught on its first run.
+        assertThat(english).contains("BeansException");
+        assertThat(english).contains("ObjectProvider");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

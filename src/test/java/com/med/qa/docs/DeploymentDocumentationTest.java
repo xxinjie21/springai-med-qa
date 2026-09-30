@@ -127,6 +127,28 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D41 streaming identity contract and how to triage each refusal")
+    void streamingIdentityContractIsDocumented() {
+        // An operator seeing a 403 on /api/chat/stream must be able to tell an expired API key from a
+        // client that hard-codes another tenant's identifiers. The triage table is the operator-facing
+        // half of the contract, so it has to name the rule, every status and the guard order.
+        assertThat(handbook).contains("RequestIdentityGuard");
+        assertThat(handbook).contains("一致性声明");
+        assertThat(handbook).contains("tenant mismatch");
+        assertThat(handbook).contains("department mismatch");
+        assertThat(handbook).contains("patient mismatch");
+        assertThat(handbook).contains("PatientAccessGuard.assertScope");
+        assertThat(handbook).contains("requireWritableSession");
+        assertThat(handbook).contains("StreamingIdentityContractTest");
+        // The trap worth writing down: disabling authentication removes the principal, and the
+        // streaming endpoint then refuses every request rather than silently running unscoped.
+        assertThat(handbook).contains("MED_SECURITY_ENABLED=false");
+        // And what the D41 contract test caught: "no model configured" used to answer 500, not 503.
+        assertThat(handbook).contains("BeansException");
+        assertThat(handbook).contains("prototype bean");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

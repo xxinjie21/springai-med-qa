@@ -654,6 +654,39 @@ docker compose exec -T mysql mysql -uroot -p"$MED_MYSQL_ROOT_PASSWORD" med_qa < 
 - [ ] 镜像以非 root `medqa` 用户运行（Dockerfile 已固定）
 - [ ] 敏感字段经 `@Desensitize` 输出；审计与日志只记录标识符，不记录问诊文本
 - [ ] LLM / Embedding 出网走院内网关，密钥由密钥管理系统注入
+- [ ] 客户端不要依赖请求体里的身份字段：`/api/chat/stream` 的 tenant/dept/patientId 只是**一致性声明**，与 API Key 不一致即 403（D41，见 10.1）
+
+### 10.1 流式问诊的身份来源与拒绝语义（D41）
+
+**排障第一原则：`/api/chat/stream` 的身份只来自 API Key。** 请求体里的 `tenant` / `dept` /
+`patientId` 是可选的**一致性声明**，`RequestIdentityGuard` 只做校验、不提供授权。因此：
+
+| 现场现象 | 真实原因 | 处置 |
+|---|---|---|
+| 同一份 JSON 昨天能用、今天 403 `tenant mismatch` | 客户端换过 Key，或 Key 的 tenant 与请求体写的不一致 | 对比 `MedPrincipal`（Key 映射）与请求体；让客户端**删掉**请求体身份字段即可彻底避免 |
+| 403 `department mismatch` | 请求体的 dept 不是该 Key 所属科室（跨科室） | 同上；注意患者与医生 Key 都绑定单一科室 |
+| 403 `patient mismatch` | 请求体 patientId 不是该患者自己的 | 患者端不要传 patientId，身份由 Key 决定 |
+| 403 `authentication required` | 没带 `X-API-Key`，或 `MED_SECURITY_REQUIRE_AUTH` 下缺失 | 见 5.3；注意 `MED_SECURITY_ENABLED=false` 会让 principal 为空，**此时流式端点会一律 403**，只适用于本地开发 |
+| 404 | 会话在该 tenant/dept 下不存在（跨科室的会话一律按「不存在」回答，不确认它存在别处） | 核对 `med_session` 与 sessionId |
+| 400 | `session` / `message` 缺失；或会话已 CLOSED / ARCHIVED（`requireWritableSession`） | 归档会话需要新开一个 session |
+| 503 + `50201` | 没有可用模型（`spring.ai.model.chat` 未启用或没有 API Key） | 见 5.2 |
+| 请求体只带 session/message 也成功 | **这是设计**：身份完全来自 principal | 无需修改客户端 |
+
+> **D41 的真实收获**：写上面这张表时，跨组件契约测试当场查出「模型未配置」的现场表现与文档不符——
+> Spring AI 的 `ChatClient.Builder` bean 带一个**必需**的 `ChatModel` 参数，`ObjectProvider.getIfAvailable()`
+> **不会吞掉实例化失败**，于是未配模型的部署拿到的是 bean 创建栈 + `500`，而不是 `503 + 50201`。
+> 代码已修（把 `BeansException` 与「返回 null」折叠成同一个 `LLM_SERVICE_ERROR`）。
+> 提示：本机没有模型时的启动/探活**不会**报错——builder 是 prototype bean，只有第一个流式请求才触发，
+> 所以这类问题只会在上线后第一次问诊时暴露。
+
+拒绝一律发生在 SSE 打开之前，返回对应 HTTP 状态 + 单个 `error` 事件（`<code> <message>`），
+不会留下半开连接。这些错误**不经过全局异常处理器**——`text/event-stream` 渲染不了它的 JSON 信封，
+放过去只会变成语义不明的协商错误。
+
+排查顺序（与代码一致）：身份解析 → `PatientAccessGuard.assertScope` → `requireWritableSession` →
+模型可用性。**授权先于能力**，任何一步失败都不会产生 LLM 调用，所以日志里看不到模型侧痕迹时，
+问题一定在前面三步。跨组件契约由 `StreamingIdentityContractTest` 守住（真实 API Key 链路上验证
+「声明他人身份被拒」与「声明缺省时到达会话层的是 principal 的坐标」）。
 
 ---
 
