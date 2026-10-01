@@ -316,6 +316,20 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D42 RAG admin authorization contract")
+    void apiChapterDocumentsTheRagAdminAuthorization() {
+        assertThat(english).contains("RagAdminAuthorizationContractTest");
+        assertThat(english).contains("confirmDepartmentWide");
+        assertThat(english).contains("RequestIdentityGuard");
+        assertThat(english).contains("40300");
+        assertThat(english).contains("40000");
+        assertThat(english).contains("MED_SECURITY_DEPT_SCOPE_ENABLED");
+        // The reason an id-based delete was removed rather than guarded has to survive in the English
+        // text too, because that is the sentence an operator needs when a runbook breaks.
+        assertThat(english).contains("scope-less");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

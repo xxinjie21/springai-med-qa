@@ -201,8 +201,9 @@ Swagger UI: `http://localhost:8080/swagger-ui.html`. OpenAPI document: `/v3/api-
 | `POST` | `/api/sessions/{sessionId}/close` | Close a session (idempotent) | |
 | `POST` | `/api/sessions/{sessionId}/archive` | Archive a session (idempotent) | An archived session can no longer be closed |
 | `GET` | `/api/sessions` | Paged session listing | `tenantId`, `deptId`, `patientId`, `page`, `size` |
-| `POST` | `/api/rag/documents/ingest` | Batch ingestion of medical documents | `@RateLimit`, staff only |
-| `POST` | `/api/rag/documents/delete` | Delete by id list or by isolation scope | |
+| `POST` | `/api/rag/documents/ingest` | Batch ingestion of medical documents | `@RateLimit`, staff only, identity taken from the API key (D42) |
+| `POST` | `/api/rag/documents/delete` | Delete by isolation scope | Staff only; a department-wide delete needs `confirmDepartmentWide=true` (D42) |
+| `POST` | `/api/rag/documents/search` | Tag-scoped retrieval preview | Staff only; forwards `topK`, `threshold` and `includeShared` (D42) |
 | `POST` | `/api/rag/documents/search` | Tag-scoped retrieval preview | Passes through `topK`, `threshold`, `includeShared` |
 | `GET` | `/actuator/health` | Health check | Container and orchestrator probes |
 | `GET` | `/actuator/prometheus` | Prometheus metrics | Scrape endpoint of the monitoring stack |
@@ -282,6 +283,34 @@ same business error (`resolveChatClientBuilder`). This is precisely the "the com
 the code does another" category the review named, and it is only visible to a test that drives the
 **real** `ObjectProvider` — a mock always returns null, which is why 1389 tests never saw it.
 
+#### Where the RAG administration surface gets its scope (D42)
+
+The three `/api/rag/**` endpoints (ingest, delete, search) take their tenant / department / patient
+**from the API key as well**. The identity fields in the body are consistency claims checked by the same
+`RequestIdentityGuard`: absent means "use the principal's own value", and a contradiction is refused.
+Before D42 these endpoints treated the body's scope as authoritative, so any staff key could read, write
+and even physically delete another department's vectors just by putting that department's `deptId` in the
+JSON — P0-3 of the 2026-09-25 review.
+
+| Change | Why |
+|---|---|
+| The body's tenant/dept/patient are demoted from authority to claims | Letting the request body decide who sees what is what caused P0-3; the scope can now only come from the authenticated identity |
+| Deletion no longer accepts `ids` | The store keys documents by id, the isolation tags live inside the JSON value and RediSearch does not index the key, so "these ids **and** my scope" cannot be expressed as one filter — and a scope-less `VectorStore#delete(List)` can never be made safe. The primitive was removed rather than guarded |
+| A department-wide delete must set `confirmDepartmentWide=true` | A department scope takes the department's shared guidelines with it, after which every consultation there answers from a corpus without its protocols. A destructive action has to be confirmed (the same two-switch idea as D38) |
+| The controller re-checks the staff role itself | `MED_SECURITY_DEPT_SCOPE_ENABLED=false` removes the `@RequireDept` interceptor while leaving authentication intact; the extra check makes the surface fail closed on its own |
+
+A refusal shows up in two shapes, both deliberate and both pre-existing conventions: a refusal written by
+the **interceptor** is a real HTTP `403`, whereas a `BizException` raised **inside the handler** (a
+contradicting identity claim, an unconfirmed department-wide delete) follows the project-wide convention
+of HTTP `200` with the business code `40300` / `40000` in the `ApiResult` envelope — **the business code
+is the authoritative signal, not the status line**.
+
+The cross-component contract is guarded by `RagAdminAuthorizationContractTest`, which runs the real API
+key → interceptor → controller → guard → service chain and asserts both that a body claiming someone
+else's identity is refused with no service interaction at all, and that when the body claims nothing the
+coordinates reaching the services are the **principal's**. Following project convention the guard was
+**watched failing first**: restoring "body wins" broke 12 cases across the two test classes.
+
 ---
 
 ## Error codes
@@ -289,9 +318,9 @@ the code does another" category the review named, and it is only visible to a te
 | Code | Meaning | Typical situation |
 |---|---|---|
 | `0` | Success | |
-| `40000` | Validation failed | Missing `session` / `message`, `topK` out of range (the identity fields are optional claims, see D41) |
+| `40000` | Validation failed | Missing `session` / `message`, `topK` out of range (the identity fields are optional claims, see D41); an unconfirmed department-wide RAG delete (see D42) |
 | `40100` | Unauthenticated | Missing or invalid `X-API-Key` |
-| `40300` | Forbidden | Patient reading another patient's session, cross-department access, or a body identity that contradicts the API key (D41) |
+| `40300` | Forbidden | Patient reading another patient's session, cross-department access, a body identity that contradicts the API key (D41 and D42), or a non-staff call to `/api/rag/**` |
 | `40400` | Not found | Unknown session |
 | `40500` | Method not allowed | |
 | `40900` | Session lock held | Concurrent writes to one session, retry shortly |
@@ -401,7 +430,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40) and `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), and `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -735,7 +764,7 @@ the loop of code, unit tests, commit and push:
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
-| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 done: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest` cross-component contract test; D42 RAG admin authorization, D43 alert delivery ordering) |
+| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 done: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest` cross-component contract test; D42 done: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43 alert delivery ordering) |
 
 ---
 

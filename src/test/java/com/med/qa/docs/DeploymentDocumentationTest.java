@@ -149,6 +149,23 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D42 RAG admin authorization contract and its deletion semantics")
+    void ragAdminAuthorizationIsDocumented() {
+        // An operator hitting a refusal on /api/rag/** must be able to tell the two shapes apart: the
+        // interceptor writes a real 403, while a handler-raised refusal is HTTP 200 carrying business
+        // code 40300. And a runbook that still deletes by documentId has to be told, in the handbook,
+        // that the primitive is gone and why.
+        assertThat(handbook).contains("10.2");
+        assertThat(handbook).contains("RagAdminAuthorizationContractTest");
+        assertThat(handbook).contains("confirmDepartmentWide");
+        assertThat(handbook).contains("40300");
+        assertThat(handbook).contains("40000");
+        assertThat(handbook).contains("MedDocumentServiceDeleteTest");
+        assertThat(handbook).contains("NoIdBasedDeletion");
+        assertThat(handbook).contains("MED_SECURITY_DEPT_SCOPE_ENABLED");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

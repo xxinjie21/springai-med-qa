@@ -192,9 +192,9 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `POST` | `/api/sessions/{sessionId}/close` | 关闭会话（幂等） | |
 | `POST` | `/api/sessions/{sessionId}/archive` | 归档会话（幂等） | 归档后不可再关闭 |
 | `GET` | `/api/sessions` | 会话分页列表 | `tenantId` / `deptId` / `patientId` / `page` / `size` |
-| `POST` | `/api/rag/documents/ingest` | 医疗文档批量入库 | `@RateLimit`，仅 STAFF |
-| `POST` | `/api/rag/documents/delete` | 按 id 列表或隔离 scope 删除 | |
-| `POST` | `/api/rag/documents/search` | 标签隔离检索预览 | 透传 `topK` / `threshold` / `includeShared` |
+| `POST` | `/api/rag/documents/ingest` | 医疗文档批量入库 | `@RateLimit`，仅 STAFF；身份取自 API Key（D42） |
+| `POST` | `/api/rag/documents/delete` | 按隔离 scope 删除 | 仅 STAFF；部门级删除需 `confirmDepartmentWide=true`（D42） |
+| `POST` | `/api/rag/documents/search` | 标签隔离检索预览 | 仅 STAFF；透传 `topK` / `threshold` / `includeShared`（D42） |
 | `GET` | `/actuator/health` | 健康检查 | 容器 / 编排探针 |
 | `GET` | `/actuator/prometheus` | Prometheus 指标 | 监控栈抓取端点 |
 
@@ -263,6 +263,28 @@ bean 创建栈 + `500`，而不是文档承诺的 503。修法是把 `BeansExcep
 而它只有在测试真的驱动**真实** `ObjectProvider`（而不是 mock）时才暴露——mock 永远返回 null，
 所以 1389 个测试都没看到它。
 
+#### RAG 管理端的授权来源（D42）
+
+`/api/rag/**` 三个端点（ingest / delete / search）的 tenant / dept / patient **同样取自 API Key**，
+请求体里的身份字段只是一致性声明，由同一个 `RequestIdentityGuard` 校验：缺省即按 principal 取值，
+与 principal 不一致即拒绝。改动前这三个端点把 body 里的 scope 当作权威，于是任何 STAFF Key 只要在
+JSON 里写上别人的 `deptId`，就能**跨科室读、写、甚至物理删除**别人的向量（2026-09-25 审查 P0-3）。
+
+| 变更 | 原因 |
+|---|---|
+| 请求体的 tenant/dept/patient 由「权威」降级为「声明」 | 让请求体决定「谁能看到什么」是 P0-3 的成因；现在 scope 只能来自认证身份 |
+| 删除不再支持 `ids` | 向量库用 id 做 key、隔离标签在 JSON 值里、RediSearch 不索引 key，因此「这批 id **且** 属于我的 scope」无法表达成一个过滤表达式；而无 scope 谓词的 `VectorStore#delete(List)` 永远做不成 scope 安全。**删掉这个原语，而不是给它加守卫** |
+| 部门级删除必须 `confirmDepartmentWide=true` | 部门级 scope 会连该科室的共享指南一起删掉，之后该科室的每次问诊都在缺少诊疗规范的语料上作答。破坏性动作要显式确认（与 D38 的「两道开关」同源） |
+| 控制器自己再判一次 STAFF | `MED_SECURITY_DEPT_SCOPE_ENABLED=false` 会让 `@RequireDept` 拦截器整体跳过，而认证过滤器仍在工作；补一次角色判断让这个面自己 fail closed |
+
+拒绝的线上表现有两种，都是既有约定：**拦截器**写出的拒绝是真实 HTTP `403`；**处理器内部**抛出的
+`BizException`（身份声明不一致、未确认的部门级删除）按项目统一约定返回 HTTP `200` + `ApiResult`
+信封里的业务码 `40300` / `40000`——**判定以业务码为准，不要只看状态行**。
+
+跨组件契约由 `RagAdminAuthorizationContractTest` 守住：真实 API Key → 拦截器 → 控制器 → 守卫 → 服务
+整条链跑起来，断言「声明他人身份被拒且服务零交互」与「声明缺省时到达服务的是 principal 的坐标」。
+按项目惯例这条守卫**先被亲眼看过它变红**：把 scope 改回「body 优先」后，两个测试类共 12 个用例失败。
+
 ---
 
 ## 错误码
@@ -270,9 +292,9 @@ bean 创建栈 + `500`，而不是文档承诺的 503。修法是把 `BeansExcep
 | Code | 含义 | 典型场景 |
 |---|---|---|
 | `0` | 成功 | |
-| `40000` | 参数校验失败 | `session` / `message` 缺失、topK 越界（身份字段是可选的一致性声明，见 D41） |
+| `40000` | 参数校验失败 | `session` / `message` 缺失、topK 越界（身份字段是可选的一致性声明，见 D41）；未确认的部门级 RAG 删除（见 D42） |
 | `40100` | 未认证 | 缺少或无效的 `X-API-Key` |
-| `40300` | 无权限 | 患者跨会话访问、跨科室访问、请求体声明的身份与 API Key 不一致（D41） |
+| `40300` | 无权限 | 患者跨会话访问、跨科室访问、请求体声明的身份与 API Key 不一致（D41 / D42）、非 STAFF 调用 `/api/rag/**` |
 | `40400` | 资源不存在 | 会话不存在 |
 | `40500` | 方法不允许 | |
 | `40900` | 会话锁占用 | 并发写入同一会话，稍后重试 |
@@ -379,7 +401,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -557,7 +579,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
-| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 已完成：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest` 跨组件契约测试；D42 RAG 管理端授权、D43 告警投递顺序） |
+| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 已完成：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest` 跨组件契约测试；D42 已完成：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43 告警投递顺序） |
 
 ---
 

@@ -11,10 +11,16 @@ import com.med.qa.controller.dto.RagIngestResponse;
 import com.med.qa.controller.dto.RagSearchPreviewItem;
 import com.med.qa.controller.dto.RagSearchPreviewRequest;
 import com.med.qa.controller.dto.RagSearchPreviewResponse;
-import com.med.qa.rag.MedDocumentService;
+import com.med.qa.rag.MedDocumentRequest;
 import com.med.qa.rag.MedDocumentScope;
+import com.med.qa.rag.MedDocumentService;
 import com.med.qa.rag.MedRetrievalQuery;
 import com.med.qa.rag.MedRetrievalService;
+import com.med.qa.security.MedPrincipal;
+import com.med.qa.security.MedRole;
+import com.med.qa.security.MedSecurityContext;
+import com.med.qa.security.RequestIdentityGuard;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -31,16 +37,33 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
- * Unit tests of the RAG admin controller.
+ * Unit tests of the RAG admin controller (D42).
  *
  * <p>The two underlying services are mocked, so the controller is exercised in isolation: parsing,
- * boundary validation, scope assembly and response shaping. No Redis, embedding endpoint or vector
- * store is contacted.</p>
+ * boundary validation, scope resolution against the authenticated principal, and response shaping. No
+ * Redis, embedding endpoint or vector store is contacted.</p>
+ *
+ * <p>The <strong>real</strong> {@link RequestIdentityGuard} is used rather than a mock. It is a pure
+ * function of (principal, claims) with no IO, and mocking it would hide the one thing these tests exist
+ * to pin: that the scope which reaches the services is the principal's. The principal itself is placed
+ * in {@link MedSecurityContext} exactly as {@code ApiKeyAuthFilter} would.</p>
  */
 class RagAdminControllerTest {
+
+    private static final String TENANT = "hosp-1";
+
+    private static final String DEPT = "dept-cardio";
+
+    private static final String PATIENT = "pat-2048";
+
+    private static final MedPrincipal STAFF = new MedPrincipal(TENANT, DEPT, MedRole.STAFF, null);
+
+    private static final MedPrincipal PATIENT_PRINCIPAL =
+            new MedPrincipal(TENANT, DEPT, MedRole.PATIENT, PATIENT);
 
     private MedDocumentService documentService;
 
@@ -52,7 +75,17 @@ class RagAdminControllerTest {
     void setUp() {
         documentService = mock(MedDocumentService.class);
         retrievalService = mock(MedRetrievalService.class);
-        controller = new RagAdminController(documentService, retrievalService);
+        controller = new RagAdminController(documentService, retrievalService, new RequestIdentityGuard());
+        MedSecurityContext.setPrincipal(STAFF);
+    }
+
+    @AfterEach
+    void tearDown() {
+        MedSecurityContext.clear();
+    }
+
+    private static MedDocumentScope patientScope() {
+        return MedDocumentScope.ofPatient(TENANT, DEPT, PATIENT);
     }
 
     @Nested
@@ -60,18 +93,95 @@ class RagAdminControllerTest {
     class Ingestion {
 
         @Test
-        @DisplayName("indexes a batch and echoes the assigned identifiers")
-        void ingestsBatch() {
+        @DisplayName("indexes a batch in the principal's scope when the body claims nothing")
+        void ingestsInThePrincipalsScope() {
             when(documentService.ingestAll(anyList())).thenReturn(List.of("doc-1", "doc-2"));
 
             ApiResult<RagIngestResponse> result = controller.ingest(new RagIngestRequest(List.of(
-                    new RagIngestItem(null, "triage protocol", "hosp-1", "cardiology", null, null),
-                    new RagIngestItem(null, "discharge summary", "hosp-1", "cardiology", "P-2048", null))));
+                    new RagIngestItem(null, "triage protocol", null, null, null, null),
+                    new RagIngestItem(null, "discharge summary", null, null, PATIENT, null))));
 
             assertThat(result.isSuccess()).isTrue();
             assertThat(result.getData().ingested()).isEqualTo(2);
             assertThat(result.getData().ids()).containsExactly("doc-1", "doc-2");
-            verify(documentService).ingestAll(anyList());
+
+            ArgumentCaptor<List<MedDocumentRequest>> captor = ArgumentCaptor.forClass(List.class);
+            verify(documentService).ingestAll(captor.capture());
+            assertThat(captor.getValue()).extracting(MedDocumentRequest::getScope)
+                    .containsExactly(MedDocumentScope.ofDepartment(TENANT, DEPT), patientScope());
+        }
+
+        @Test
+        @DisplayName("accepts claims that match the principal")
+        void acceptsMatchingClaims() {
+            when(documentService.ingestAll(anyList())).thenReturn(List.of("doc-1"));
+
+            controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "text", TENANT, DEPT, PATIENT, null))));
+
+            ArgumentCaptor<List<MedDocumentRequest>> captor = ArgumentCaptor.forClass(List.class);
+            verify(documentService).ingestAll(captor.capture());
+            assertThat(captor.getValue().get(0).getScope()).isEqualTo(patientScope());
+        }
+
+        @Test
+        @DisplayName("refuses an item claiming another tenant before anything is written")
+        void refusesForeignTenantClaim() {
+            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "text", "hosp-2", DEPT, null, null)))))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses an item claiming another department before anything is written")
+        void refusesForeignDepartmentClaim() {
+            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "text", TENANT, "dept-onco", null, null)))))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("a foreign claim on the second item stops the whole batch")
+        void refusesForeignClaimOnALaterItem() {
+            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "fine", null, null, null, null),
+                    new RagIngestItem(null, "not fine", TENANT, "dept-onco", null, null)))))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses a patient principal even though the interceptor is configurable")
+        void refusesPatientPrincipal() {
+            MedSecurityContext.setPrincipal(PATIENT_PRINCIPAL);
+
+            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "text", null, null, null, null)))))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses an anonymous caller")
+        void refusesAnonymousCaller() {
+            MedSecurityContext.clear();
+
+            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
+                    new RagIngestItem(null, "text", null, null, null, null)))))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
         }
 
         @Test
@@ -96,17 +206,7 @@ class RagAdminControllerTest {
         @DisplayName("rejects an item with blank text")
         void rejectsBlankText() {
             assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
-                    new RagIngestItem(null, "   ", "hosp-1", "cardiology", null, null)))))
-                    .isInstanceOf(BizException.class)
-                    .extracting(ex -> ((BizException) ex).getErrorCode())
-                    .isEqualTo(ErrorCode.BAD_REQUEST);
-        }
-
-        @Test
-        @DisplayName("rejects an item missing tenant or department")
-        void rejectsMissingScope() {
-            assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
-                    new RagIngestItem(null, "text", "", "cardiology", null, null)))))
+                    new RagIngestItem(null, "   ", null, null, null, null)))))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
                     .isEqualTo(ErrorCode.BAD_REQUEST);
@@ -116,7 +216,7 @@ class RagAdminControllerTest {
         @DisplayName("rejects metadata that collides with an isolation tag")
         void rejectsReservedMetadata() {
             assertThatThrownBy(() -> controller.ingest(new RagIngestRequest(List.of(
-                    new RagIngestItem(null, "text", "hosp-1", "cardiology", null,
+                    new RagIngestItem(null, "text", null, null, null,
                             Map.of(MedDocumentScope.METADATA_TENANT_ID, "evil"))))))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
@@ -129,35 +229,69 @@ class RagAdminControllerTest {
     class Deletion {
 
         @Test
-        @DisplayName("deletes by identifier and reports the ids")
-        void deletesByIds() {
+        @DisplayName("deletes the patient scope named by the body without any confirmation")
+        void deletesPatientScope() {
             ApiResult<RagDeleteResponse> result = controller.delete(
-                    new RagDeleteRequest(List.of("a", "b"), null, null, null));
+                    new RagDeleteRequest(null, null, PATIENT, false));
 
             assertThat(result.isSuccess()).isTrue();
-            assertThat(result.getData().byId()).isTrue();
-            assertThat(result.getData().ids()).containsExactly("a", "b");
-            verify(documentService).deleteByIds(List.of("a", "b"));
+            assertThat(result.getData().patientScoped()).isTrue();
+            assertThat(result.getData().scope()).contains(TENANT).contains(DEPT).contains(PATIENT);
+            verify(documentService).deleteByScope(patientScope());
         }
 
         @Test
-        @DisplayName("deletes by isolation scope when no ids are given")
-        void deletesByScope() {
+        @DisplayName("deletes the department scope only when it has been confirmed")
+        void deletesDepartmentScopeWhenConfirmed() {
             ApiResult<RagDeleteResponse> result = controller.delete(
-                    new RagDeleteRequest(null, "hosp-1", "cardiology", "P-2048"));
+                    new RagDeleteRequest(null, null, null, true));
 
-            assertThat(result.isSuccess()).isTrue();
-            assertThat(result.getData().scope()).contains("hosp-1").contains("P-2048");
-            verify(documentService).deleteByScope(any(MedDocumentScope.class));
+            assertThat(result.getData().patientScoped()).isFalse();
+            verify(documentService).deleteByScope(MedDocumentScope.ofDepartment(TENANT, DEPT));
         }
 
         @Test
-        @DisplayName("rejects a request that names neither ids nor a scope")
-        void rejectsEmptyDelete() {
-            assertThatThrownBy(() -> controller.delete(new RagDeleteRequest(null, null, null, null)))
+        @DisplayName("refuses an unconfirmed department-wide delete and touches nothing")
+        void refusesUnconfirmedDepartmentWideDelete() {
+            assertThatThrownBy(() -> controller.delete(new RagDeleteRequest(null, null, null, false)))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
                     .isEqualTo(ErrorCode.BAD_REQUEST);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses a delete that claims another department, even with confirmation")
+        void refusesForeignDepartmentClaim() {
+            assertThatThrownBy(() -> controller.delete(
+                    new RagDeleteRequest(TENANT, "dept-onco", null, true)))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses a delete that claims another tenant")
+        void refusesForeignTenantClaim() {
+            assertThatThrownBy(() -> controller.delete(
+                    new RagDeleteRequest("hosp-2", DEPT, null, true)))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
+        }
+
+        @Test
+        @DisplayName("refuses a patient principal")
+        void refusesPatientPrincipal() {
+            MedSecurityContext.setPrincipal(PATIENT_PRINCIPAL);
+
+            assertThatThrownBy(() -> controller.delete(new RagDeleteRequest(null, null, null, true)))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(documentService);
         }
 
         @Test
@@ -183,7 +317,7 @@ class RagAdminControllerTest {
             when(retrievalService.search(any(MedRetrievalQuery.class))).thenReturn(List.of(document));
 
             ApiResult<RagSearchPreviewResponse> result = controller.searchPreview(
-                    new RagSearchPreviewRequest("what aspirin dose", "hosp-1", "cardiology", "P-2048",
+                    new RagSearchPreviewRequest("what aspirin dose", null, null, PATIENT,
                             null, null, null));
 
             assertThat(result.isSuccess()).isTrue();
@@ -196,12 +330,26 @@ class RagAdminControllerTest {
         }
 
         @Test
+        @DisplayName("the search scope is the principal's, not the body's")
+        void scopeComesFromThePrincipal() {
+            when(retrievalService.search(any(MedRetrievalQuery.class))).thenReturn(List.of());
+            ArgumentCaptor<MedRetrievalQuery> captor = ArgumentCaptor.forClass(MedRetrievalQuery.class);
+
+            // No tenant, no dept: only the authenticated principal can have supplied them.
+            controller.searchPreview(new RagSearchPreviewRequest("q", null, null, PATIENT,
+                    null, null, null));
+
+            verify(retrievalService).search(captor.capture());
+            assertThat(captor.getValue().getScope()).isEqualTo(patientScope());
+        }
+
+        @Test
         @DisplayName("forwards explicit topK, threshold and shared-toggle to the search service")
         void forwardsSearchParameters() {
             when(retrievalService.search(any(MedRetrievalQuery.class))).thenReturn(List.of());
             ArgumentCaptor<MedRetrievalQuery> captor = ArgumentCaptor.forClass(MedRetrievalQuery.class);
 
-            controller.searchPreview(new RagSearchPreviewRequest("q", "hosp-1", "cardiology", "P-2048",
+            controller.searchPreview(new RagSearchPreviewRequest("q", TENANT, DEPT, PATIENT,
                     3, 0.5, false));
 
             verify(retrievalService).search(captor.capture());
@@ -217,7 +365,7 @@ class RagAdminControllerTest {
             when(retrievalService.search(any(MedRetrievalQuery.class))).thenReturn(List.of());
             ArgumentCaptor<MedRetrievalQuery> captor = ArgumentCaptor.forClass(MedRetrievalQuery.class);
 
-            controller.searchPreview(new RagSearchPreviewRequest("q", "hosp-1", "cardiology", "P-2048",
+            controller.searchPreview(new RagSearchPreviewRequest("q", null, null, PATIENT,
                     null, null, null));
 
             verify(retrievalService).search(captor.capture());
@@ -225,20 +373,21 @@ class RagAdminControllerTest {
         }
 
         @Test
-        @DisplayName("rejects a null or blank query")
-        void rejectsBlankQuery() {
+        @DisplayName("refuses a query that claims another department and never searches")
+        void refusesForeignDepartmentClaim() {
             assertThatThrownBy(() -> controller.searchPreview(
-                    new RagSearchPreviewRequest("  ", "hosp-1", "cardiology", null, null, null, null)))
+                    new RagSearchPreviewRequest("q", TENANT, "dept-onco", null, null, null, null)))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
-                    .isEqualTo(ErrorCode.BAD_REQUEST);
+                    .isEqualTo(ErrorCode.FORBIDDEN);
+            verifyNoInteractions(retrievalService);
         }
 
         @Test
-        @DisplayName("rejects a query without tenant and department")
-        void rejectsMissingScope() {
+        @DisplayName("rejects a null or blank query")
+        void rejectsBlankQuery() {
             assertThatThrownBy(() -> controller.searchPreview(
-                    new RagSearchPreviewRequest("q", "hosp-1", "", null, null, null, null)))
+                    new RagSearchPreviewRequest("  ", null, null, null, null, null, null)))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
                     .isEqualTo(ErrorCode.BAD_REQUEST);
@@ -248,7 +397,7 @@ class RagAdminControllerTest {
         @DisplayName("rejects an out-of-range topK as a bad request, not a server error")
         void rejectsInvalidTopK() {
             assertThatThrownBy(() -> controller.searchPreview(
-                    new RagSearchPreviewRequest("q", "hosp-1", "cardiology", "P-2048", 0, null, null)))
+                    new RagSearchPreviewRequest("q", null, null, PATIENT, 0, null, null)))
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
                     .isEqualTo(ErrorCode.BAD_REQUEST);

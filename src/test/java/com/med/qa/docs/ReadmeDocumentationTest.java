@@ -337,6 +337,24 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D42 RAG admin authorization contract and scope-only deletion")
+    void apiChapterDocumentsTheRagAdminAuthorization() {
+        // The defect this guards: the RAG admin handlers built their scope from the request body, so any
+        // staff key could read, write and physically delete another department's vectors by naming it.
+        // The README has to state where the authority now lives, why an id-based delete is gone rather
+        // than guarded, and that a department-wide delete needs an explicit confirmation.
+        assertThat(readme).contains("RagAdminAuthorizationContractTest");
+        assertThat(readme).contains("confirmDepartmentWide");
+        assertThat(readme).contains("RequestIdentityGuard");
+        // The two refusal shapes and the authoritative signal (the business code, not the status line).
+        assertThat(readme).contains("40300");
+        assertThat(readme).contains("40000");
+        // The configuration under which the interceptor disappears and the controller has to defend
+        // itself: naming it is what turns the extra role check from redundant into justified.
+        assertThat(readme).contains("MED_SECURITY_DEPT_SCOPE_ENABLED");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

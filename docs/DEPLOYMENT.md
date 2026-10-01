@@ -655,6 +655,7 @@ docker compose exec -T mysql mysql -uroot -p"$MED_MYSQL_ROOT_PASSWORD" med_qa < 
 - [ ] 敏感字段经 `@Desensitize` 输出；审计与日志只记录标识符，不记录问诊文本
 - [ ] LLM / Embedding 出网走院内网关，密钥由密钥管理系统注入
 - [ ] 客户端不要依赖请求体里的身份字段：`/api/chat/stream` 的 tenant/dept/patientId 只是**一致性声明**，与 API Key 不一致即 403（D41，见 10.1）
+- [ ] 运维脚本不要用「按 documentId 删除」的旧姿势：`/api/rag/documents/delete` 已**只支持按隔离 scope 删除**，且部门级删除必须显式带 `confirmDepartmentWide=true`（D42，见 10.2）
 
 ### 10.1 流式问诊的身份来源与拒绝语义（D41）
 
@@ -687,6 +688,36 @@ docker compose exec -T mysql mysql -uroot -p"$MED_MYSQL_ROOT_PASSWORD" med_qa < 
 模型可用性。**授权先于能力**，任何一步失败都不会产生 LLM 调用，所以日志里看不到模型侧痕迹时，
 问题一定在前面三步。跨组件契约由 `StreamingIdentityContractTest` 守住（真实 API Key 链路上验证
 「声明他人身份被拒」与「声明缺省时到达会话层的是 principal 的坐标」）。
+
+---
+
+### 10.2 RAG 管理端的授权与删除语义（D42）
+
+**排障第一原则：`/api/rag/**` 的 tenant / dept / patient 也只来自 API Key。** 请求体里的
+`tenantId` / `deptId` / `patientId` 是可选的**一致性声明**，由同一个 `RequestIdentityGuard` 校验；
+**判定以业务码为准**——拦截器写出的拒绝是真实 HTTP `403`，处理器内部抛出的 `BizException` 按项目
+统一约定返回 HTTP `200` + 业务码 `40300` / `40000`。
+
+| 现场现象 | 真实原因 | 处置 |
+|---|---|---|
+| HTTP 200 但 `code=40300`、`message=department mismatch` | 请求体写的 `deptId` 不是该 Key 所属科室 | 对比 Key 映射与请求体；让调用方**删掉**请求体里的身份字段即可彻底避免 |
+| HTTP 200 但 `code=40300`、`message=tenant mismatch` | 请求体写的 `tenantId` 不是该 Key 的租户 | 同上 |
+| HTTP 403（拦截器直接写出，非 `ApiResult` 信封） | 用的是 PATIENT Key，或请求**信封**里带了 `deptId` 参数/头 | `/api/rag/**` 仅 STAFF；身份字段请放 body，别放 query/header |
+| HTTP 200 但 `code=40000`、`message=deleting the whole department scope ...` | 删除请求没写 `patientId` 又没确认 | 补 `"confirmDepartmentWide": true`，或改成按患者删除 |
+| 传了 `ids` 却什么都没删 | **按 id 删除已下线**（D42）：`ids` 不再是已知字段，Jackson 忽略它，请求退化成「未确认的部门级删除」而被拒 | 改用 scope 删除；需要精确删除单个文档时，先删该患者/科室 scope 再重新入库 |
+| 删除后该科室问诊「指南不见了」 | 部门级删除会连**共享指南**一起删掉（这是设计） | 重新入库共享指南，或改用按患者删除 |
+| `MED_SECURITY_ENABLED=false` 下所有 `/api/rag/**` 都拒绝 | principal 为空，守卫 fail closed | 本地开发才可关闭安全；见 5.3 |
+
+**为什么按 id 删除被移除**（这是 D42 的核心）：向量库用文档 id 作 Redis key、隔离标签存在 JSON
+值里、RediSearch **不索引 key**，因此「这批 id **且** 属于我的 scope」无法表达成一个过滤表达式；
+而无 scope 谓词的 `VectorStore#delete(List<String>)` 永远做不成 scope 安全——改动前任何 STAFF Key
+只要猜到一个 documentId，就能物理删除别的科室的向量。所以 `MedDocumentService` 里这个原语被**删除**
+而不是加守卫，并有反射守护测试（`MedDocumentServiceDeleteTest$NoIdBasedDeletion`）钉住「它不存在」。
+将来若真需要精确删除，正确做法是把文档 id 作为一个 TAG 元数据字段**显式纳入索引 schema**，
+而不是绕过隔离模型。
+
+跨组件契约由 `RagAdminAuthorizationContractTest` 守住（真实 API Key → 拦截器 → 控制器 → 守卫 → 服务）。
+按项目惯例，这条守卫先被亲眼看过变红：把 scope 改回「body 优先」后，两个测试类共 12 个用例失败。
 
 ---
 

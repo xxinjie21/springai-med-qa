@@ -13,7 +13,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -30,6 +29,11 @@ import java.util.Map;
  * the official {@link VectorStore} in bounded batches. Embedding, vector encoding, index writes and
  * Top-K search are entirely the store's business; this class contains no vector math, no chunking
  * and no retrieval logic.</p>
+ *
+ * <p>The same class owns the removal half: {@link #deleteByScope(MedDocumentScope)} deletes an entire
+ * isolation scope through the same metadata predicate retrieval uses. It is deliberately the only
+ * deletion primitive — the method's javadoc explains why an id-based delete cannot be made
+ * scope-safe (D42).</p>
  *
  * <h2>Hard constraint: no content analysis</h2>
  * <p>The document text is passed through verbatim. It is never split, normalized, tokenized or
@@ -247,55 +251,18 @@ public class MedDocumentService {
     }
 
     /**
-     * Removes one previously indexed document by its store identifier.
-     *
-     * @param documentId identifier assigned at ingestion, must not be blank
-     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the identifier is blank,
-     *                      {@link ErrorCode#STORAGE_ERROR} when the index delete fails
-     */
-    public void deleteById(String documentId) {
-        if (!StringUtils.hasText(documentId)) {
-            throw new BizException(ErrorCode.BAD_REQUEST, "document id must not be blank");
-        }
-        deleteByIds(List.of(documentId));
-    }
-
-    /**
-     * Removes several previously indexed documents by their store identifiers.
-     *
-     * <p>An empty list is a no-op: the vector store is never contacted, so a careless caller cannot
-     * wipe the whole index by submitting nothing.</p>
-     *
-     * @param documentIds identifiers to remove, must not be {@code null}, non-empty and hold no blank
-     *                   entry
-     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the list is null/empty or carries a
-     *                      blank id, {@link ErrorCode#STORAGE_ERROR} when the index delete fails
-     */
-    public void deleteByIds(List<String> documentIds) {
-        if (documentIds == null || documentIds.isEmpty()) {
-            throw new BizException(ErrorCode.BAD_REQUEST, "document ids must not be empty");
-        }
-        for (String id : documentIds) {
-            if (!StringUtils.hasText(id)) {
-                throw new BizException(ErrorCode.BAD_REQUEST, "document id must not be blank");
-            }
-        }
-        try {
-            vectorStore.delete(documentIds);
-        } catch (BizException ex) {
-            throw ex;
-        } catch (RuntimeException ex) {
-            ErrorCode errorCode = classifyFailure(ex);
-            log.error("failed to delete {} document(s) from index '{}'",
-                    documentIds.size(), storeProperties.getIndexName(), ex);
-            throw new BizException(errorCode,
-                    "failed to delete " + documentIds.size() + " document(s) from vector index '"
-                            + storeProperties.getIndexName() + "'", ex);
-        }
-    }
-
-    /**
      * Removes every document of an isolation scope.
+     *
+     * <h2>The only deletion primitive, and why (D42)</h2>
+     * <p>Deletion is expressed exclusively in terms of the isolation triple. An earlier revision also
+     * offered a delete-by-identifier, and that primitive is what let any staff key remove another
+     * department's vectors by guessing a document id: the store keys documents by id, the isolation
+     * tags live inside the JSON value, and RediSearch does not index the key — so "these ids
+     * <em>and</em> this scope" cannot be expressed as one filter, and an unbounded
+     * {@code VectorStore#delete(List)} can never be made scope-safe. The id-based methods were
+     * therefore removed rather than guarded; a future need for single-document deletion has to be
+     * answered by putting the document id into the indexed metadata deliberately, not by reaching
+     * around the isolation model.</p>
      *
      * <p>A patient-scoped delete removes only that patient's own documents (the department-wide
      * shared documents are deliberately left untouched); a department-wide delete removes every
