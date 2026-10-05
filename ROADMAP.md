@@ -220,11 +220,18 @@ springai-med-qa/
 | D40 | 生产配置契约与守护断言校正 | `application-prod.yml` 的暴露列表修正为 `health,info,prometheus`（Spring Boot 的 list 属性在 profile 里是**覆盖**而非合并，收窄即等于生产环境 404 掉 `/actuator/prometheus`，Prometheus 抓不到 `med_qa_alert_total`、`deploy/prometheus/med-qa-alerts.yml` 里全部规则永不触发）；新增跨文件契约测试 `ApplicationProfileContractTest`——用 Spring Boot 自己的 `YamlPropertySourceLoader` 按 profile 优先级合并 base 与 `application-<profile>.yml`，再用 `Binder` 绑定**实际生效值**，断言「任何 profile 都不得移除 base 已暴露的端点」，并锁定 profile 集合与 Dockerfile/compose 实际激活的 profile，使断言不会因 profile 改名而空转；`DeploymentDocumentationTest` 的前缀断言 `include: health,info` 改为完整串（前缀断言正是 P0-1 的漏网原因）并补 `application-prod.yml` 断言；`CoverageGateConfigTest` 的 `isBetween(0.0, 1.0)` 改为显式下限（把门禁调到 0.01 也能通过的守卫等于不守） | `fix(config): keep prometheus exposed in the prod profile` |
 | D41 | 流式问诊身份来源收敛 | `/api/chat/stream` 的 tenant/dept/patient 一律取自已认证的 `MedPrincipal`，请求体中的身份字段降级为**一致性校验**（不匹配即 403），`ChatStreamService` 在追加轮次前先过 `PatientAccessGuard` 与 `MedChatSessionService.requireWritableSession`（该方法此前零生产调用点，注释却声称流式路径会调它，已关闭/归档的会话因此仍可增长） | `fix(security): derive streaming consultation identity from the principal` |
 | D42 | RAG 管理端授权与按 scope 删除 | `RagAdminController` 的 ingest / delete / search 三处 scope 全部由 principal 推导（复用 D41 的 `RequestIdentityGuard`，请求体只作一致性校验：缺省按 principal 取值、不一致即拒绝），消除「猜到 documentId 即可跨科室物理删除向量」。**删除只保留 scope 一种模式**：`MedDocumentService` 的 `deleteById` / `deleteByIds` 被**删除**而不是加守卫——向量库用 id 作 key、隔离标签在 JSON 值里、RediSearch 不索引 key，所以「这批 id 且属于我的 scope」无法表达成单个过滤表达式，无 scope 谓词的 `VectorStore#delete(List)` 永远做不成 scope 安全；为此加反射守护测试钉住「该原语不存在」。部门级删除（会连共享指南一起删）必须显式 `confirmDepartmentWide=true`，与 D38 的「两道开关」同源；控制器自己再判一次 STAFF，因为 `MED_SECURITY_DEPT_SCOPE_ENABLED=false` 会让 `@RequireDept` 拦截器整体跳过而认证仍在；新增跨组件契约测试 `RagAdminAuthorizationContractTest`（真实 API Key → 拦截器 → 控制器 → 守卫 → 服务，断言到达服务的是 principal 的坐标），并亲眼看过它变红（还原「body 优先」后 12 个用例失败） | `fix(rag): scope rag admin operations to the caller` |
-| D43 | 告警投递顺序与探测失败信号 | `MedAlertNotifier` 改为**投递成功后才写冷却指纹**（现实现先 `putIfAbsent` 再 `dispatch`，所有 sink 同时失败时该告警在冷却窗口内被静默丢弃）；`MedVectorIndexAlertMonitor` 的 `INDEX_PROBE_FAILED`（CRITICAL）分支当前不可达——`AbstractHealthIndicator#health()` 是 final 且把异常吞成 `DOWN`，需把「探测本身失败」做成显式信号，否则 Redis 全挂只报 WARNING | `fix(alert): stop marking an alert as delivered before it is` |
+| D43 | 告警投递顺序与探测失败信号 | `MedAlertNotifier` 改为**投递成功后才写冷却指纹**（原实现先 `putIfAbsent` 再 `dispatch`，所有 sink 同时失败时该告警在整个冷却窗口内被静默丢弃）；`MedVectorIndexAlertMonitor` 的 `INDEX_PROBE_FAILED`（CRITICAL）分支原为不可达——`AbstractHealthIndicator#health()` 是 final 且把异常吞成 `DOWN`，故把「探测本身失败」做成**显式信号**：`reason=unreachable` 由 `MedVectorIndexHealthIndicator` 自己写入，监控读该 reason 分流（`unreachable` → CRITICAL，`index-missing`/`schema-drift` → WARNING），并新增 Prometheus 规则 `MedQaRagIndexProbeFailed`；新增跨组件契约测试 `AlertDeliveryContractTest`（真实探针 → 健康组件 → 监控 → 通知器 → sink） | `fix(alert): stop marking an alert as delivered before it is` |
 
-> 阶段 8 之后仍待处理（留给后续阶段）：P1-1 `metadata-mode: EMBED` 实际**包含**元数据（与上方注释相反，
-> 隔离标签会被写进向量）、P1-2 MySQL 只保存 `MessageWindowChatMemory` 的 20 条滚动窗口（javadoc 却称其为
-> "authoritative copy"）、P1-3 记忆写路径无锁且非事务、以及 P2-1/P2-3/P2-4 的注释与部署前置条件校正。
+> 阶段 8（D40–D43）**已完成**：三处 P0（prod profile 暴露契约、流式身份来源、RAG 管理端授权）与
+> P1-4 / P1-5 / P1-6 均已收敛，并各自配套跨组件契约测试（`ApplicationProfileContractTest` /
+> `StreamingIdentityContractTest` / `RagAdminAuthorizationContractTest` / `AlertDeliveryContractTest`），
+> 每一条都按项目惯例**先被亲眼看过它变红**。
+>
+> **阶段 8 之后仍待处理（留给后续阶段，当前 ROADMAP 尚无 D44 及以后）**：P1-1 `metadata-mode: EMBED`
+> 实际**包含**元数据（与上方注释相反，隔离标签会被写进向量）、P1-2 MySQL 只保存
+> `MessageWindowChatMemory` 的 20 条滚动窗口（javadoc 却称其为 "authoritative copy"）、P1-3 记忆写路径
+> 无锁且非事务，以及 P2-1/P2-3/P2-4 的注释与部署前置条件校正。**下一次运行必须先扩写本节新增阶段，
+> 不得自造迭代编号。**
 
 ---
 

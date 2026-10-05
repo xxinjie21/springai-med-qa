@@ -355,6 +355,23 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D43 alert delivery order and the probe-failure signal")
+    void apiChapterDocumentsTheAlertDeliveryContract() {
+        // The two defects this guards: an alert was marked delivered before the delivery happened, and
+        // a probe failure was indistinguishable from a repairable index because Actuator swallows the
+        // exception. The README must name the contract and the test that crosses the boundary.
+        assertThat(readme).contains("AlertDeliveryContractTest");
+        assertThat(readme).contains("putIfAbsent");
+        assertThat(readme).contains("containsKey");
+        assertThat(readme).contains("isProbeFailure");
+        assertThat(readme).contains("rag-index-probe-failed");
+        assertThat(readme).contains("MedQaRagIndexProbeFailed");
+        // The reason the severity split cannot be simplified back into a try/catch around health().
+        assertThat(readme).contains("AbstractHealthIndicator#health()");
+        assertThat(readme).contains("final");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

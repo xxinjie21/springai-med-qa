@@ -78,6 +78,26 @@ groups:
             /actuator/health reports the med-vector-index component as UP again.
           runbook: "docs/DEPLOYMENT.md#7-健康检查与探针"
 
+      - alert: MedQaRagIndexProbeFailed
+        # D43. The index probe itself could not reach Redis, so there is no index verdict at all -
+        # distinct from MedQaRagIndexDegraded, where the probe answered and found a repairable index.
+        # This one pages: it is the signature of a total outage of the retrieval layer, and before
+        # D43 the monitor could not tell it apart from a mere schema drift because
+        # AbstractHealthIndicator#health() swallows the exception into a plain DOWN.
+        expr: increase(med_qa_alert_total{code="rag-index-probe-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: vector-index
+        annotations:
+          summary: "The medical RAG vector index probe is failing"
+          description: >-
+            MedVectorIndexHealthIndicator could not reach the vector store, so the index verdict is
+            unknown and /actuator/health reports reason=unreachable. Treat this as a Redis outage
+            first: every scoped retrieval is failing while the consultation endpoint keeps returning
+            200. Once Redis is reachable again the monitor emits rag-index-recovered.
+          runbook: "docs/DEPLOYMENT.md#71-向量索引健康与-schema-漂移d37"
+
       - alert: MedQaRagIndexRebuildFailed
         # D38. A rebuild is an operator-triggered repair of the index D37 watches. When it fails, the
         # index may be gone, empty or half built - which is strictly worse than the drift it was

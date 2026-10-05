@@ -166,6 +166,27 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D43 alert delivery order and the probe-failure signal")
+    void alertDeliveryOrderIsDocumented() {
+        // Two behaviours an operator must be able to reason about from the handbook alone: an alert is
+        // recorded only after it was delivered (so a totally failed delivery is retried, not swallowed
+        // for the cooldown), and reason=unreachable is a different incident from index-missing.
+        assertThat(handbook).contains("7.5");
+        assertThat(handbook).contains("AlertDeliveryContractTest");
+        assertThat(handbook).contains("reason=unreachable");
+        assertThat(handbook).contains("MedQaRagIndexProbeFailed");
+        assertThat(handbook).contains("MedQaRagIndexDegraded");
+        // The triage commands have to be in the handbook: an on-call engineer needs the read, not a
+        // description of the read.
+        assertThat(handbook).contains("med:alert:dedupe");
+        assertThat(handbook).contains("med-vector-index");
+        // And the reason the severity split cannot live in the monitor must be stated, otherwise the
+        // next reader will "simplify" it back into the unreachable form.
+        assertThat(handbook).contains("AbstractHealthIndicator#health()");
+        assertThat(handbook).contains("final");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

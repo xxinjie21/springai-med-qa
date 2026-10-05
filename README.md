@@ -285,6 +285,32 @@ JSON 里写上别人的 `deptId`，就能**跨科室读、写、甚至物理删�
 整条链跑起来，断言「声明他人身份被拒且服务零交互」与「声明缺省时到达服务的是 principal 的坐标」。
 按项目惯例这条守卫**先被亲眼看过它变红**：把 scope 改回「body 优先」后，两个测试类共 12 个用例失败。
 
+#### 告警投递顺序与探测失败信号（D43）
+
+`com.med.qa.alert` 链路上有两处「注释/文档承诺的行为与代码实际行为相反」，都**不会让任何测试变红**，
+只会让告警在最需要它的时刻消失。D43 逐条收敛：
+
+| 缺陷 | 现场表现 | 修法 |
+|---|---|---|
+| 先写冷却指纹、再投递（P1-5） | `MedAlertNotifier` 用 `putIfAbsent` 的返回值同时回答「之前投过吗」与「现在就占位」。所有 sink 同时失败时（日志卷满、指标采集器不可达），指纹已经写进 `med:alert:dedupe`，该告警在**整个冷却窗口内被静默丢弃**——正是告警最该出现的场景 | 判定改为**只读**（`RMapCache#containsKey`，Redisson 在 Lua 里一并判断条目 TTL），指纹只在 `dispatch` 返回「至少一个 sink 接受」**之后**才写；投递失败则什么都不留，下一次轮询会重新告警 |
+| `INDEX_PROBE_FAILED` 分支不可达（P1-6） | `AbstractHealthIndicator#health()` 是 `final` 且把异常吞成 `DOWN`，所以「用 `try/catch` 包住 `health()`」在生产路径上永不触发；Redis 全挂时 `MedVectorIndexAlertMonitor` 只报 `WARNING` 的 `rag-index-degraded`，与「索引可修复」共用同一级别 | 把「探测本身失败」做成**显式信号**：健康详情里的 `reason=unreachable` 由 `MedVectorIndexHealthIndicator` 自己写入（它包住了 `probe()` 调用），`MedVectorIndexAlertMonitor.isProbeFailure` 读这个 `reason` 分流——`unreachable` → `CRITICAL`，`index-missing` / `schema-drift` → `WARNING` |
+
+分流之后，`rag-index-probe-failed` 新增配套的 Prometheus 规则 `MedQaRagIndexProbeFailed`（`critical`）：
+一个可达的 `CRITICAL` 告警若没有规则消费，只会落进日志与指标——那只是修了一半，`CRITICAL` 的意义就在于会响铃。
+它与 `MedQaRagIndexDegraded`（`warning`）必须是两条规则，否则「Redis 全挂」会被合并进「索引漂移」里。
+
+两处顺序/分流语义都不是「改个常量」：**先记录后投递**会把「可能失败的投递」标成已送达，
+**用异常判断探测失败**在 Actuator 的 `final` 方法面前根本不可达——两者都属于审查归纳的
+「组件写好了但没接进调用链 / 注释与行为相反」那一类。
+
+跨组件契约由 `AlertDeliveryContractTest` 守住：真实的 `MedVectorIndexProbe`（Jedis 客户端被注入故障）
+→ 真实 `MedVectorIndexHealthIndicator` → 真实 `MedVectorIndexAlertMonitor` → 真实 `MedAlertNotifier`
+→ 真实 sink 整条链跑起来，断言 Redis 不可达时出来的是 `CRITICAL` 的 `rag-index-probe-failed`、
+索引只是缺失时仍是 `WARNING`、以及「全部 sink 失败 → 指纹未写 → 下一次轮询重新告警」。
+单组件测试抓不到这两处——`MedVectorIndexAlertMonitorTest` 交给监控的是一个**手写的** `Health`，
+它只断言分类器，无法证明真实 indicator **会产出**被分类的那个形状。
+按项目惯例这条守卫**先被亲眼看过它变红**：还原两处缺陷后共 6 个用例失败（3 个测试类）。
+
 ---
 
 ## 错误码
@@ -401,7 +427,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -579,7 +605,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 5 运维加固 | D32–D33 | 已完成 |
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
-| 阶段 8 安全边界与生产配置契约 | D40–D43 | 进行中（D40 已完成：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41 已完成：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest` 跨组件契约测试；D42 已完成：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43 告警投递顺序） |
+| 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
 
 ---
 

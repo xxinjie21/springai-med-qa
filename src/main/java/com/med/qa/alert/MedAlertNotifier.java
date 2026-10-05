@@ -24,6 +24,17 @@ import java.util.concurrent.TimeUnit;
  * lose the window. The key is {@link MedAlert#fingerprint()}, so a new component failing is a new
  * alert even while the first one is still suppressed.</p>
  *
+ * <p>The fingerprint is written <strong>after</strong> the alert has been accepted by at least one
+ * sink, never before. The order is the whole point: {@code putIfAbsent}-first marks the alert as
+ * delivered while the delivery may still fail, so an outage of every sink (a full log volume, an
+ * unreachable metrics collector) would silently discard that alert for the entire cooldown window --
+ * exactly the situation in which the alert matters most. With the write moved after the dispatch, a
+ * failed delivery leaves no fingerprint behind and the next scheduled pass raises the alert again.</p>
+ *
+ * <p>The check-then-write pair is not atomic, so two replicas can both dispatch the same alert. That
+ * is the intended trade: a duplicate page is strictly better than a lost one, and the write still
+ * uses {@code putIfAbsent} so the cooldown window itself is never shortened by a later replica.</p>
+ *
  * <h2>Fail-open</h2>
  * <p>If the deduplication store is unreachable the alert is dispatched anyway. Losing an alert
  * because the suppression bookkeeping is down would be strictly worse than sending a duplicate --
@@ -75,10 +86,12 @@ public class MedAlertNotifier {
     }
 
     /**
-     * Applies the policy and dispatches the alert to every sink.
+     * Applies the policy, dispatches the alert to every sink and only then records the delivery.
      *
      * <p>Sink failures are isolated: one broken sink is logged and the remaining sinks still receive
-     * the alert. The return value therefore means "delivered somewhere", not "delivered everywhere".</p>
+     * the alert. The return value therefore means "delivered somewhere", not "delivered everywhere".
+     * The cooldown fingerprint is written only when this returns {@code true}, so a pass in which
+     * every sink failed stays re-raisable instead of being suppressed for the whole window.</p>
      *
      * @param alert the alert to dispatch, must not be {@code null}
      * @return {@code true} when the alert reached at least one sink
@@ -105,11 +118,21 @@ public class MedAlertNotifier {
             log.debug("alert {} is inside its cooldown window, suppressing", alert.fingerprint());
             return false;
         }
-        return dispatch(alert);
+        boolean delivered = dispatch(alert);
+        if (delivered) {
+            rememberDelivered(alert);
+        }
+        return delivered;
     }
 
     /**
      * Tells whether the alert fingerprint was already dispatched inside the cooldown window.
+     *
+     * <p>Read-only on purpose. The previous implementation used the return value of
+     * {@code putIfAbsent} to answer the same question, which conflated "was it delivered before"
+     * with "claim it now" and made a failed delivery indistinguishable from a delivered one. Redisson
+     * evaluates the entry TTL inside {@code containsKey}, so an expired fingerprint correctly reports
+     * as absent.</p>
      *
      * @param alert the alert to test
      * @return {@code true} when the alert must be suppressed
@@ -121,14 +144,40 @@ public class MedAlertNotifier {
         try {
             RMapCache<String, Long> dedupeMap =
                     redissonClient.getMapCache(properties.getKeyPrefix() + DEDUPLICATION_SUFFIX);
-            Long previous = dedupeMap.putIfAbsent(alert.fingerprint(), alert.occurredAt().toEpochMilli(),
-                    properties.getCooldown().toMillis(), TimeUnit.MILLISECONDS);
-            return previous != null;
+            return dedupeMap != null && dedupeMap.containsKey(alert.fingerprint());
         } catch (RuntimeException ex) {
             // Fail open: a duplicate page is strictly better than a lost one.
             log.warn("alert deduplication store unavailable, dispatching without suppression: {}",
                     ex.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Records that the alert was delivered, so the next identical alert is suppressed.
+     *
+     * <p>Called only after {@link #dispatch(MedAlert)} accepted the alert somewhere. The write uses
+     * {@code putIfAbsent} so that a replica which lost the race does not extend or shorten the window
+     * the winner established. A store failure here is logged and swallowed: the alert has already
+     * reached a sink, so the only consequence is a possible repeat, which is the safe direction.</p>
+     *
+     * @param alert the alert that reached at least one sink
+     */
+    private void rememberDelivered(MedAlert alert) {
+        if (!properties.isDeduplicationEnabled() || redissonClient == null) {
+            return;
+        }
+        try {
+            RMapCache<String, Long> dedupeMap =
+                    redissonClient.getMapCache(properties.getKeyPrefix() + DEDUPLICATION_SUFFIX);
+            if (dedupeMap == null) {
+                return;
+            }
+            dedupeMap.putIfAbsent(alert.fingerprint(), alert.occurredAt().toEpochMilli(),
+                    properties.getCooldown().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (RuntimeException ex) {
+            log.warn("could not record the delivered alert {}, a repeat is possible: {}",
+                    alert.fingerprint(), ex.getMessage());
         }
     }
 

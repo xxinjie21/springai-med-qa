@@ -488,8 +488,14 @@ Redis Stack 版而从未建成功；也可以存在、但 TAG 字段与配置漂
 > 只监控、不重建：重建属 D38，探针永远不会写 Redis。
 
 `MedVectorIndexAlertMonitor` 复用 `med.alert.*` 链路推送：降级 `WARNING`（`rag-index-degraded`）、
-恢复 `INFO`（`rag-index-recovered`）、探针异常 `CRITICAL`（`rag-index-probe-failed`）。
+恢复 `INFO`（`rag-index-recovered`）、探测失败 `CRITICAL`（`rag-index-probe-failed`）。
 Prometheus 规则 `MedQaRagIndexDegraded` 消费 `med_qa_alert_total{code="rag-index-degraded"}`。
+
+> **`unreachable` 与另外两种 `reason` 不是同一件事（D43）**：`index-missing` / `schema-drift` 是
+> 「探针跑完了，结论是索引需要修」，所以只报 `WARNING`；`unreachable` 是「探针根本没拿到结论」，
+> 按 `CRITICAL` 处理并触发 `MedQaRagIndexProbeFailed` 规则。这个分流必须做在
+> `MedVectorIndexHealthIndicator` 里——`AbstractHealthIndicator#health()` 是 `final` 且把异常吞成
+> 普通 `DOWN`，调用方无法用 `try/catch` 区分「探针挂了」与「索引坏了」。详见 §7.5。
 
 ### 7.2 索引重建（D38）
 
@@ -562,7 +568,8 @@ MedVectorIndexAlertMonitor（@Scheduled 轮询 MedVectorIndexHealthIndicator，D
 
 - **策略**：`med.alert.*`（开关、轮询间隔、冷却窗口、最低级别、静音码），全部可在 `.env` 覆盖；
 - **去重**：以 `code:component` 为指纹写入 `med:alert:dedupe`（Redisson `RMapCache`，TTL = cooldown），
-  多副本共享同一个抑制窗口，一次故障只响一次；
+  多副本共享同一个抑制窗口，一次故障只响一次。**指纹在「至少一个 sink 接收成功」之后才写**（D43，
+  见 §7.5）——先写再投会把「可能失败的投递」标成已送达；
 - **失败开放**：去重存储不可达时**照常派发**——因为 Redis 挂掉本身就是需要告警的场景；
 - **恢复通知**：组件恢复会补一条 `INFO`（`storage-recovered` / `rag-index-recovered`），
   避免「还在坏」与「早已恢复」无法区分。
@@ -580,7 +587,7 @@ docker compose --profile observability up -d
 | 文件 | 作用 |
 |---|---|
 | `deploy/prometheus/prometheus.yml` | 抓取 `app:8080/actuator/prometheus`，15s 间隔，加载规则并指向 Alertmanager |
-| `deploy/prometheus/med-qa-alerts.yml` | 规则：`MedQaTargetDown` / `MedQaStorageUnavailable` / `MedQaStorageProbeFailed` / `MedQaRagIndexDegraded` / `MedQaAlertStorm` / `MedQaHighServerErrorRate` / `MedQaConsultationLatencyHigh` / `MedQaRateLimitStorm` |
+| `deploy/prometheus/med-qa-alerts.yml` | 规则：`MedQaTargetDown` / `MedQaStorageUnavailable` / `MedQaStorageProbeFailed` / `MedQaRagIndexDegraded` / `MedQaRagIndexProbeFailed` / `MedQaRagIndexRebuildFailed` / `MedQaAlertStorm` / `MedQaHighServerErrorRate` / `MedQaConsultationLatencyHigh` / `MedQaRateLimitStorm` |
 | `deploy/alertmanager/alertmanager.yml` | 按 `alertname` + `component` 分组；`critical` 走独立接收器与更短的重复间隔；抑制规则避免「整体不可达」时重复刷屏 |
 
 > **必须替换**：`alertmanager.yml` 中的 `webhook_configs.url` 是占位地址（Alertmanager 不支持在配置里
@@ -589,6 +596,25 @@ docker compose --profile observability up -d
 
 自定义应用指标：`med_qa_alert_total{severity,code,component}`（计数器）与
 `med_qa_alert_last_epoch_seconds`（最近一次告警时间戳，可用于 dead-man's-switch 规则）。
+
+### 7.5 告警投递顺序与探测失败信号（D43）
+
+告警链路有两处「注释承诺的行为与代码实际行为相反」的缺陷，共同点是**不会让任何测试变红**，
+只会让告警在最需要它的时刻消失。两处都在 D43 收敛：
+
+| 缺陷 | 现场表现 | 修法与排查方式 |
+|---|---|---|
+| 先写冷却指纹、再投递（P1-5） | `MedAlertNotifier` 原先用 `putIfAbsent` 的返回值同时回答「之前投过吗」与「现在就占位」。所有 sink 同时失败时（日志卷满、指标采集器不可达），指纹已经落进 `med:alert:dedupe`，该告警在**整个冷却窗口内被静默丢弃**——恰恰是告警最该出现的场景 | 判定改为**只读**（`RMapCache#containsKey`，Redisson 在 Lua 里一并判断条目 TTL），指纹只在 `dispatch` 返回「至少一个 sink 接受」**之后**才写。现场排查：如果某个故障持续存在却只在日志里出现过一次，先用 `redis-cli --scan --pattern 'med:alert:dedupe*'` 看指纹是否被提前写入 |
+| `INDEX_PROBE_FAILED` 分支不可达（P1-6） | `AbstractHealthIndicator#health()` 是 `final` 且把异常吞成 `DOWN`，所以「用 `try/catch` 包住 `health()`」在生产路径上永不触发。Redis 全挂时监控只报 `WARNING` 的 `rag-index-degraded`，与「索引可修复」共用同一级别，**关键故障被降级成普通告警** | 把「探测本身失败」做成**显式信号**：`reason=unreachable` 由 `MedVectorIndexHealthIndicator` 自己写入（它包住了 `probe()` 调用），`MedVectorIndexAlertMonitor.isProbeFailure` 读该 `reason` 分流。现场排查：`curl -s localhost:8080/actuator/health \| jq '.components."med-vector-index".details.reason'` —— `unreachable` 按 Redis 故障处理，`index-missing` / `schema-drift` 按索引修复处理 |
+
+对应的 Prometheus 规则：`rag-index-degraded` → `MedQaRagIndexDegraded`（warning），
+`rag-index-probe-failed` → `MedQaRagIndexProbeFailed`（critical）。两者必须是两条规则，
+否则「Redis 全挂」会被合并进「索引漂移」的告警里。
+
+跨组件契约由 `AlertDeliveryContractTest` 守住（真实探针 → 健康组件 → 监控 → 通知器 → sink 整条链），
+断言 Redis 不可达时出来的是 `CRITICAL` 的 `rag-index-probe-failed`、索引只是缺失时仍是 `WARNING`、
+以及「全部 sink 失败 → 指纹未写 → 下一次轮询重新告警」。按项目惯例这条守卫**先被亲眼看过它变红**：
+还原两处缺陷后共 6 个用例失败（3 个测试类）。
 
 ---
 

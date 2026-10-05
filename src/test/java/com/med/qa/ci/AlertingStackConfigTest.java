@@ -219,6 +219,7 @@ class AlertingStackConfigTest {
                 "MedQaStorageUnavailable",
                 "MedQaStorageProbeFailed",
                 "MedQaRagIndexDegraded",
+                "MedQaRagIndexProbeFailed",
                 "MedQaRagIndexRebuildFailed",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
@@ -276,6 +277,19 @@ class AlertingStackConfigTest {
         assertThat(read(ALERT_RULES)).contains("component: vector-index");
         // A degraded index degrades answers but does not stop consultations, so it must not page.
         assertThat(read(ALERT_RULES)).contains("MedQaRagIndexDegraded");
+    }
+
+    @Test
+    @DisplayName("the D43 probe-failure rule selects the code the monitor exports and pages for it")
+    void ragIndexProbeFailureRuleMatchesTheExportedCode() throws IOException {
+        // D43 made the CRITICAL branch reachable. A reachable alert with no rule on it would only land
+        // in the log and the metric, which is half a fix: the point of CRITICAL is that it pages.
+        assertThat(read("src/main/java/com/med/qa/alert/MedVectorIndexAlertMonitor.java"))
+                .contains("rag-index-probe-failed");
+        assertThat(read(ALERT_RULES)).contains("code=\"rag-index-probe-failed\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaRagIndexProbeFailed");
+        // And it must stay distinguishable from the degradation notice it used to be collapsed into.
+        assertThat(read(ALERT_RULES)).contains("reason=unreachable");
     }
 
     @Test

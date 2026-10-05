@@ -15,8 +15,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -24,10 +26,12 @@ import static org.mockito.Mockito.when;
 /**
  * Unit tests for {@link MedAlertNotifier}.
  *
- * <p>These pin the two behaviours that decide whether an incident is noticed: the policy filters
- * (disabled / muted / below the severity floor) and the fail-open rule. A suppression store that is
- * down must never swallow an alert -- an unreachable Redis is itself one of the conditions this
- * chain reports.</p>
+ * <p>These pin the three behaviours that decide whether an incident is noticed: the policy filters
+ * (disabled / muted / below the severity floor), the fail-open rule, and the delivery-before-
+ * suppression order. A suppression store that is down must never swallow an alert -- an unreachable
+ * Redis is itself one of the conditions this chain reports -- and neither may a suppression entry
+ * written before the delivery succeeded, which would discard the alert for the whole cooldown window
+ * precisely when every sink is failing.</p>
  */
 class MedAlertNotifierTest {
 
@@ -57,7 +61,7 @@ class MedAlertNotifierTest {
     void dispatchesToEverySink() {
         MedAlertProperties properties = new MedAlertProperties();
         when(redissonClient.<String, Long>getMapCache(anyString())).thenReturn(dedupeMap);
-        when(dedupeMap.putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class))).thenReturn(null);
+        when(dedupeMap.containsKey(anyString())).thenReturn(false);
 
         assertThat(notifier(properties).raise(ALERT)).isTrue();
 
@@ -126,28 +130,101 @@ class MedAlertNotifierTest {
     void suppressesDuplicateInsideCooldown() {
         MedAlertProperties properties = new MedAlertProperties();
         when(redissonClient.<String, Long>getMapCache(anyString())).thenReturn(dedupeMap);
-        when(dedupeMap.putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class)))
-                .thenReturn(1_700_000_000_000L);
+        when(dedupeMap.containsKey(anyString())).thenReturn(true);
 
         assertThat(notifier(properties).raise(ALERT)).isFalse();
 
         verify(firstSink, never()).publish(any(MedAlert.class));
         verify(secondSink, never()).publish(any(MedAlert.class));
+        // A suppressed alert is not re-recorded either: the existing window stays untouched.
+        verify(dedupeMap, never()).putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class));
     }
 
     @Test
-    @DisplayName("the suppression entry is written with the fingerprint and the configured TTL")
-    void suppressionUsesFingerprintAndTtl() {
+    @DisplayName("a write that loses the race does not turn a delivered alert into a dropped one")
+    void losingTheWriteRaceDoesNotUndoTheDelivery() {
+        // Under the old putIfAbsent-first code a non-null return value *was* the suppression signal, so
+        // a concurrent writer could make an already-delivered alert report as not delivered. The
+        // decision is now made by the read, and the write's result is deliberately ignored.
+        MedAlertProperties properties = new MedAlertProperties();
+        when(redissonClient.<String, Long>getMapCache(anyString())).thenReturn(dedupeMap);
+        when(dedupeMap.containsKey(anyString())).thenReturn(false);
+        when(dedupeMap.putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class)))
+                .thenReturn(1_700_000_000_000L);
+
+        assertThat(notifier(properties).raise(ALERT)).isTrue();
+
+        verify(firstSink).publish(ALERT);
+        verify(secondSink).publish(ALERT);
+    }
+
+    @Test
+    @DisplayName("the fingerprint is written with the configured TTL and only after a sink accepted it")
+    void suppressionIsWrittenAfterDelivery() {
         MedAlertProperties properties = new MedAlertProperties();
         properties.setCooldown(Duration.ofMinutes(7));
         properties.setKeyPrefix("med:alert:");
         when(redissonClient.<String, Long>getMapCache("med:alert:dedupe")).thenReturn(dedupeMap);
-        when(dedupeMap.putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class))).thenReturn(null);
+        when(dedupeMap.containsKey(anyString())).thenReturn(false);
 
-        notifier(properties).raise(ALERT);
+        assertThat(notifier(properties).raise(ALERT)).isTrue();
 
         verify(dedupeMap).putIfAbsent(eq("storage-down:mysql"), anyLong(),
                 eq(Duration.ofMinutes(7).toMillis()), eq(TimeUnit.MILLISECONDS));
+        // The order is the contract: recording first would mark a delivery that may still fail.
+        org.mockito.InOrder order = inOrder(firstSink, dedupeMap);
+        order.verify(firstSink).publish(ALERT);
+        order.verify(dedupeMap).putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class));
+    }
+
+    @Test
+    @DisplayName("regression: a delivery that reached no sink leaves no fingerprint behind")
+    void failedDeliveryLeavesNoFingerprint() {
+        MedAlertProperties properties = new MedAlertProperties();
+        when(redissonClient.<String, Long>getMapCache(anyString())).thenReturn(dedupeMap);
+        when(dedupeMap.containsKey(anyString())).thenReturn(false);
+        org.mockito.Mockito.doThrow(new IllegalStateException("boom"))
+                .when(firstSink).publish(any(MedAlert.class));
+        org.mockito.Mockito.doThrow(new IllegalStateException("boom"))
+                .when(secondSink).publish(any(MedAlert.class));
+
+        MedAlertNotifier notifier = notifier(properties);
+
+        assertThat(notifier.raise(ALERT)).isFalse();
+        // The whole point of P1-5: with putIfAbsent-first the alert was silently dropped for the
+        // entire cooldown window. Now nothing is recorded, so the next pass tries again.
+        verify(dedupeMap, never()).putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class));
+
+        assertThat(notifier.raise(ALERT)).isFalse();
+        verify(firstSink, times(2)).publish(ALERT);
+        verify(secondSink, times(2)).publish(ALERT);
+    }
+
+    @Test
+    @DisplayName("boundary: a store that rejects the write still reports the alert as delivered")
+    void storeWriteFailureDoesNotUndoTheDelivery() {
+        MedAlertProperties properties = new MedAlertProperties();
+        when(redissonClient.<String, Long>getMapCache(anyString())).thenReturn(dedupeMap);
+        when(dedupeMap.containsKey(anyString())).thenReturn(false);
+        when(dedupeMap.putIfAbsent(anyString(), anyLong(), anyLong(), any(TimeUnit.class)))
+                .thenThrow(new IllegalStateException("write rejected"));
+
+        assertThat(notifier(properties).raise(ALERT)).isTrue();
+
+        verify(firstSink).publish(ALERT);
+    }
+
+    @Test
+    @DisplayName("boundary: a store that hands back no map neither suppresses nor records")
+    void nullDedupeMapIsTolerated() {
+        MedAlertProperties properties = new MedAlertProperties();
+        RedissonClient client = mock(RedissonClient.class);
+        when(client.<String, Long>getMapCache(anyString())).thenReturn(null);
+
+        assertThat(notifier(properties, client).raise(ALERT)).isTrue();
+
+        verify(firstSink).publish(ALERT);
+        verify(secondSink).publish(ALERT);
     }
 
     @Test

@@ -34,6 +34,14 @@ import java.util.Set;
  * scanned key prefixes. No document text, embedding or query result ever reaches
  * {@code /actuator/health}.</p>
  *
+ * <h2>Contract with the alert chain</h2>
+ * <p>{@code reason} is not decoration: {@code MedVectorIndexAlertMonitor} reads it to choose the
+ * severity. {@code unreachable} means no verdict could be reached and is escalated as {@code CRITICAL};
+ * {@code index-missing} and {@code schema-drift} mean the probe answered and the index needs repair,
+ * so they stay a {@code WARNING}. That split has to live here because
+ * {@code AbstractHealthIndicator#health()} is {@code final} and converts every exception into a plain
+ * {@code DOWN}, leaving a caller no way to tell "the probe failed" from "the index is broken".</p>
+ *
  * <h2>Deployment note</h2>
  * <p>The probe needs Redis Stack (RediSearch). A deployment running the conversation cache on a plain
  * Redis build must set {@code med.rag.index.enabled=false}; the bean is then not created and the

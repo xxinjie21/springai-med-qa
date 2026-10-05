@@ -430,7 +430,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), and `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), and `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -668,11 +668,42 @@ MedStorageAlertMonitor  (scheduled poll of the existing MedStorageHealthIndicato
   floor and muted codes, all overridable through the environment.
 - **Deduplication** keys on the `code:component` fingerprint in `med:alert:dedupe`, a Redisson
   `RMapCache` whose TTL equals the cooldown, so every replica shares one suppression window and a
-  single outage pages once instead of once per pod.
+  single outage pages once instead of once per pod. The fingerprint is written **after** a sink
+  accepted the alert, never before (see D43 below).
 - **Fail-open**: if the deduplication store is unreachable the alert is dispatched anyway, because an
   unreachable Redis is itself one of the conditions this chain reports.
 - **Recovery notices**: a component that answers again raises an `INFO` alert, so an engineer joining
   mid-incident can tell "still broken" from "fixed twenty minutes ago".
+
+#### Delivery order and the probe-failure signal (D43)
+
+Two spots on this chain had a comment promising one behaviour while the code did the opposite. Neither
+made a test fail; both made an alert disappear at the moment it mattered most.
+
+| Defect | What an operator saw | Fix |
+|---|---|---|
+| The cooldown fingerprint was written before the delivery (P1-5) | `MedAlertNotifier` used the return value of `putIfAbsent` to answer both "was it delivered before?" and "claim it now". When every sink failed at once (a full log volume, an unreachable metrics collector) the fingerprint was already in `med:alert:dedupe`, so the alert was **silently discarded for the whole cooldown window** — exactly the situation in which it matters most | The check is now a **read** (`RMapCache#containsKey`; Redisson evaluates the entry TTL inside its Lua script), and the fingerprint is written only **after** `dispatch` reports that at least one sink accepted the alert. A failed delivery leaves nothing behind, so the next poll raises the alert again |
+| The `INDEX_PROBE_FAILED` branch was unreachable (P1-6) | `AbstractHealthIndicator#health()` is `final` and swallows the exception into a plain `DOWN`, so wrapping `health()` in a `try`/`catch` never fires on the production path. With Redis completely down the monitor only raised the `WARNING` `rag-index-degraded`, the same severity as a repairable index | "The probe itself failed" is now an **explicit signal**: the health detail `reason=unreachable` is written by `MedVectorIndexHealthIndicator` itself (it wraps its own `probe()` call), and `MedVectorIndexAlertMonitor.isProbeFailure` reads that reason to choose the severity — `unreachable` becomes `CRITICAL`, while `index-missing` and `schema-drift` stay `WARNING` |
+
+Both are the "component written but never wired into the call chain, or a comment contradicting the
+behaviour" class the review named, not a constant to flip: recording before delivering marks a delivery
+that may still fail, and detecting a probe failure by exception is simply unreachable behind Actuator's
+`final` method.
+
+The split also brings its own rule: `rag-index-probe-failed` is consumed by `MedQaRagIndexProbeFailed`
+(`critical`). A reachable `CRITICAL` alert with no rule on it would only land in the log and the metric,
+which is half a fix — the point of `CRITICAL` is that it pages. It has to stay a separate rule from
+`MedQaRagIndexDegraded` (`warning`), otherwise a total Redis outage gets merged into a schema drift.
+
+The cross-component contract is guarded by `AlertDeliveryContractTest`: a real `MedVectorIndexProbe`
+(with the Jedis client told to fail), a real `MedVectorIndexHealthIndicator`, a real
+`MedVectorIndexAlertMonitor`, a real `MedAlertNotifier` and a real sink, asserting that an unreachable
+Redis produces the `CRITICAL` `rag-index-probe-failed`, that a merely absent index stays a `WARNING`,
+and that "every sink failed" leaves no fingerprint so the next poll raises the alert again. A
+single-component test cannot see either defect — `MedVectorIndexAlertMonitorTest` hands the monitor a
+**hand-written** `Health`, so it asserts the classifier but never that the real indicator *produces*
+the classified shape. Following the project convention, the guards were **seen to fail**: restoring
+both defects turned 6 cases red across 3 test classes.
 
 An optional monitoring stack sits behind the `observability` Compose profile and is not started by a
 plain `docker compose up -d`:
@@ -764,7 +795,7 @@ the loop of code, unit tests, commit and push:
 | Phase 5, operations hardening | D32 to D33 | Done |
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
-| Phase 8, security boundaries and production configuration contracts | D40 to D43 | In progress (D40 done: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41 done: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest` cross-component contract test; D42 done: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43 alert delivery ordering) |
+| Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
 
 ---
 

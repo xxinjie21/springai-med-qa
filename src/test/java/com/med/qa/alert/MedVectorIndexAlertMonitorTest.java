@@ -24,9 +24,10 @@ import static org.mockito.Mockito.when;
  *
  * <p>The monitor is the bridge between the pull-only health endpoint and the push-based alert chain
  * for the retrieval layer. What is asserted is the transition logic and the severity choice: a
- * degraded index must raise a {@code WARNING} (consultations keep working, answers get worse) and a
+ * degraded index must raise a {@code WARNING} (consultations keep working, answers get worse), a
  * recovery must raise an {@code INFO} — without which an on-call engineer joining mid-incident cannot
- * tell "still broken" from "fixed twenty minutes ago".</p>
+ * tell "still broken" from "fixed twenty minutes ago" — and a probe that could not reach Redis at all
+ * must raise {@code CRITICAL}, not the same {@code WARNING} as a repairable index.</p>
  */
 class MedVectorIndexAlertMonitorTest {
 
@@ -69,6 +70,23 @@ class MedVectorIndexAlertMonitorTest {
                 .withDetail(MedVectorIndexHealthIndicator.EXISTS_DETAIL, false)
                 .withDetail(MedVectorIndexHealthIndicator.REASON_DETAIL,
                         MedVectorIndexHealthIndicator.REASON_INDEX_MISSING)
+                .build();
+    }
+
+    /**
+     * Exactly what {@link MedVectorIndexHealthIndicator} produces when Redis cannot be reached: a
+     * {@code DOWN} carrying {@code reason=unreachable}. Reproducing the shape here rather than
+     * throwing from the mock is the point — {@code AbstractHealthIndicator#health()} is final and
+     * swallows the exception, so this is the only form in which a probe failure ever reaches the
+     * monitor in production.
+     */
+    private static Health unreachable() {
+        return Health.down()
+                .withDetail(MedVectorIndexHealthIndicator.INDEX_DETAIL, "med-doc-index")
+                .withDetail(MedVectorIndexHealthIndicator.EXISTS_DETAIL, false)
+                .withDetail(MedVectorIndexHealthIndicator.DOCUMENTS_DETAIL, 0L)
+                .withDetail(MedVectorIndexHealthIndicator.REASON_DETAIL,
+                        MedVectorIndexHealthIndicator.REASON_UNREACHABLE)
                 .build();
     }
 
@@ -207,6 +225,76 @@ class MedVectorIndexAlertMonitorTest {
         assertThat(monitor.checkNow()).isTrue();
         assertThat(monitor.isDegraded()).isTrue();
         verify(notifier, never()).raise(eq(MedAlertSeverity.INFO), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("regression: an unreachable Redis is escalated as critical, not filed as a degradation")
+    void unreachableProbeRaisesCritical() {
+        // P1-6: because health() is final and swallows the exception, the CRITICAL branch used to be
+        // unreachable and a total Redis outage was reported as a WARNING "index degraded".
+        when(provider.getIfAvailable()).thenReturn(indicator);
+        when(indicator.health()).thenReturn(unreachable());
+
+        MedVectorIndexAlertMonitor monitor = monitor();
+
+        assertThat(monitor.checkNow()).isTrue();
+        assertThat(monitor.isDegraded()).isTrue();
+        verify(notifier).raise(eq(MedAlertSeverity.CRITICAL),
+                eq(MedVectorIndexAlertMonitor.INDEX_PROBE_FAILED),
+                eq(MedVectorIndexAlertMonitor.INDEX_COMPONENT),
+                contains("reason=unreachable"));
+        // The degradation code must not be used as well: two codes for one condition doubles the noise
+        // and mislabels the severity in the operator's triage table.
+        verify(notifier, never()).raise(eq(MedAlertSeverity.WARNING),
+                eq(MedVectorIndexAlertMonitor.INDEX_DEGRADED), any(), any());
+    }
+
+    @Test
+    @DisplayName("an index that becomes reachable again raises the informational recovery alert")
+    void recoveryAfterUnreachableRaisesInformational() {
+        when(provider.getIfAvailable()).thenReturn(indicator);
+        MedVectorIndexAlertMonitor monitor = monitor();
+
+        when(indicator.health()).thenReturn(unreachable());
+        assertThat(monitor.checkNow()).isTrue();
+
+        when(indicator.health()).thenReturn(healthy());
+        assertThat(monitor.checkNow()).isFalse();
+
+        verify(notifier).raise(eq(MedAlertSeverity.INFO),
+                eq(MedVectorIndexAlertMonitor.INDEX_RECOVERED),
+                eq(MedVectorIndexAlertMonitor.INDEX_COMPONENT),
+                contains("healthy again"));
+    }
+
+    @Test
+    @DisplayName("a thrown health check that Actuator converted into an error detail is also a probe failure")
+    void actuatorErrorDetailIsAProbeFailure() {
+        // doHealthCheck blowing up outside the indicator's own guard is the only path left where
+        // Actuator itself records the failure, under the "error" key.
+        Health exploded = Health.down()
+                .withDetail("error", "java.lang.IllegalStateException: exploded")
+                .build();
+        when(provider.getIfAvailable()).thenReturn(indicator);
+        when(indicator.health()).thenReturn(exploded);
+
+        monitor().checkNow();
+
+        verify(notifier).raise(eq(MedAlertSeverity.CRITICAL),
+                eq(MedVectorIndexAlertMonitor.INDEX_PROBE_FAILED), any(), any());
+    }
+
+    @Test
+    @DisplayName("boundary: the probe-failure classifier only fires on a non-up verdict")
+    void probeFailureClassifierBoundaries() {
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(null)).isFalse();
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(healthy())).isFalse();
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(missing())).isFalse();
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(drifted())).isFalse();
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(unreachable())).isTrue();
+        // An UP verdict carrying an error detail is contradictory but must not be escalated.
+        assertThat(MedVectorIndexAlertMonitor.isProbeFailure(
+                Health.up().withDetail("error", "leftover").build())).isFalse();
     }
 
     // ---------------------------------------------------------------- no probe in this context

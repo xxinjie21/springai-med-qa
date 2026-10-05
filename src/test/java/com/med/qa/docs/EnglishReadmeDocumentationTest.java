@@ -330,6 +330,21 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D43 alert delivery order and probe-failure signal")
+    void alertChapterDocumentsTheDeliveryContract() {
+        assertThat(english).contains("AlertDeliveryContractTest");
+        assertThat(english).contains("putIfAbsent");
+        assertThat(english).contains("containsKey");
+        assertThat(english).contains("isProbeFailure");
+        assertThat(english).contains("rag-index-probe-failed");
+        assertThat(english).contains("MedQaRagIndexProbeFailed");
+        // Why the split lives in the indicator and not in the monitor: without it a later reader will
+        // "simplify" the code back into the form where the branch is unreachable.
+        assertThat(english).contains("final");
+        assertThat(english).contains("AbstractHealthIndicator");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));
