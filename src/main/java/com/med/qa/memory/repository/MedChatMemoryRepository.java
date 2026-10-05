@@ -25,17 +25,36 @@ import java.util.Optional;
  *   <li>Read the {@code med:chat:{tenant_id}:{dept_id}:{session_id}} window from
  *       {@link RedisMessageCache}.</li>
  *   <li>On a hit, return it as-is: the cached payload is the very same Protobuf encoding stored in
- *       MySQL, so both tiers are byte-identical.</li>
+ *       MySQL, so both tiers are byte-identical. Note that a hit returns the <em>cached window</em>,
+ *       which is bounded by {@code med.cache.max-messages} and is therefore not necessarily the whole
+ *       transcript — MySQL holds every message ever written, the cache holds the recent tail.</li>
  *   <li>On a miss (cold key, expired TTL, Redis outage or a corrupt payload — the cache maps all of
  *       them to an empty result), replay the session from
- *       {@code med_message_{crc32(session_id) % 16}} through {@link ChatMessageMapper} and
- *       back-fill the cache before returning.</li>
+ *       {@code med_message_{crc32(session_id) % 16}} through {@link ChatMessageMapper}, truncate the
+ *       replay to the cache window and back-fill the cache before returning. The truncation matters
+ *       since D44: MySQL holds the whole transcript, so an unbounded replay would push a long
+ *       consultation's entire history into the memory window (and from there into the model prompt).</li>
  * </ol>
  *
  * <h2>Write path — dual write, MySQL first</h2>
  * <p>MySQL is the source of truth and is always written first; only then is the cache updated.
  * The inverse order would publish a message to the memory window that a failing insert never
  * persisted.</p>
+ *
+ * <p><b>The transcript is never trimmed (D44).</b> {@link #saveWindow} — the primitive the Spring AI
+ * memory window writes through — is an <em>additive, idempotent</em> append: a message that is
+ * already stored is skipped by primary key, and no code path here deletes a message to make room.
+ * Trimming belongs to {@code MessageWindowChatMemory}, which only decides what the model sees; the
+ * durable copy of a medical conversation keeps every turn. Before D44 this class was driven by a
+ * "delete the session, then re-insert the window" sequence, which physically destroyed every message
+ * that had scrolled past {@code med.chat.max-messages} — and, with two instances handling the same
+ * session, let two turns delete each other's messages.</p>
+ *
+ * <p><b>Why the batch is not transactional.</b> The write is idempotent and Spring AI re-sends the
+ * entire window on every turn, so a partially failed batch is healed by the next turn instead of
+ * needing a rollback; and the cache is published <em>after</em> the inserts, outside any transaction.
+ * Publishing Redis inside a transaction that later rolled back would leave a window holding messages
+ * the database never accepted, which is the one inconsistency this class refuses to create.</p>
  *
  * <h2>Failure semantics</h2>
  * <ul>
@@ -123,8 +142,63 @@ public class MedChatMemoryRepository {
     }
 
     /**
-     * Returns the whole conversation of a session in chronological order, serving it from the cache
-     * and falling back to MySQL with a back-fill.
+     * Persists a conversation window <em>additively</em>: every message that is not stored yet is
+     * inserted, every message that already exists is left untouched, and nothing is ever deleted.
+     *
+     * <p>This is the write primitive of the Spring AI memory window (D44). {@code saveAll} of
+     * {@code MessageWindowChatMemory} re-sends the whole rolling window after each turn, so the
+     * durable transcript must be built by union, not by replacement: replacing it would silently drop
+     * every turn that has scrolled past {@code med.chat.max-messages}, and the window is a view for
+     * the model, not the record of the consultation.</p>
+     *
+     * <p>After the inserts the cache window is replaced by the window that was just written, which is
+     * the newest state of the memory store. The cache is therefore never narrower than what the model
+     * is given, and a later cache miss is answered from the durable transcript.</p>
+     *
+     * @param tenantId  hospital/tenant id, must not be blank
+     * @param deptId    department id, must not be blank
+     * @param sessionId consultation session id, must not be blank
+     * @param window    the messages to persist, must not be {@code null} nor contain {@code null},
+     *                  and every element must belong to the given session; an empty list is a legal
+     *                  no-op that touches neither tier
+     * @return how many messages were newly inserted ({@code 0} when all of them were already stored)
+     * @throws IllegalArgumentException if an identity segment is blank, the window is {@code null},
+     *                                  holds a {@code null} element, misses a required field or
+     *                                  belongs to a different session
+     * @throws BizException             {@link ErrorCode#STORAGE_ERROR} on a MySQL failure, or when a
+     *                                  failed cache rebuild could not be compensated by an eviction
+     */
+    public int saveWindow(String tenantId, String deptId, String sessionId,
+                          List<ChatMessageDO> window) {
+        requireText(tenantId, "tenantId");
+        requireText(deptId, "deptId");
+        requireText(sessionId, "sessionId");
+        if (window == null) {
+            throw new IllegalArgumentException("window must not be null");
+        }
+        for (ChatMessageDO message : window) {
+            requireStorable(message);
+            requireBelongsTo(message, tenantId, deptId, sessionId);
+        }
+        if (window.isEmpty()) {
+            return 0;
+        }
+        int inserted = 0;
+        for (ChatMessageDO message : window) {
+            inserted += insertIfAbsent(message);
+        }
+        publishWindowToCache(tenantId, deptId, sessionId, window);
+        return inserted;
+    }
+
+    /**
+     * Returns the conversation of a session in chronological order: the cached window when it is
+     * warm, otherwise the whole transcript replayed from MySQL and back-filled into the cache.
+     *
+     * <p>Either way the answer is bounded by {@code med.cache.max-messages}: a hit returns the cached
+     * window, a miss returns the tail of the durable transcript truncated to that window (D44). Use
+     * {@link #findRecent} to ask for a specific number of recent messages, and {@link #reload} to
+     * replay a whole session.</p>
      *
      * @param tenantId  hospital/tenant id, must not be blank
      * @param deptId    department id, must not be blank
@@ -318,6 +392,46 @@ public class MedChatMemoryRepository {
     }
 
     /**
+     * Inserts a row unless its primary key is already present, translating any storage failure.
+     *
+     * @return {@code 1} when a new row was written, {@code 0} when the message was already stored
+     */
+    private int insertIfAbsent(ChatMessageDO message) {
+        int rows;
+        try {
+            rows = messageMapper.insertIfAbsent(message);
+        } catch (DataAccessException ex) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "failed to persist message " + message.getMessageId() + " into mysql", ex);
+        }
+        if (rows < 0) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "mysql reported an invalid row count " + rows + " for message "
+                            + message.getMessageId());
+        }
+        return rows > 0 ? 1 : 0;
+    }
+
+    /**
+     * Publishes a freshly written window to the session cache.
+     *
+     * <p>The window is the newest state of the memory store, so the cache is set to it rather than to
+     * a re-read of MySQL: a re-read would publish the <em>whole</em> transcript (D44) into a cache
+     * whose readers expect a bounded window.</p>
+     */
+    private void publishWindowToCache(String tenantId, String deptId, String sessionId,
+                                     List<ChatMessageDO> window) {
+        try {
+            cache.replaceAll(tenantId, deptId, sessionId, window);
+        } catch (BizException ex) {
+            log.warn("failed to publish the window of session {} to redis, invalidating it instead",
+                    sessionId, ex);
+            invalidateWindowOrEscalate(tenantId, deptId, sessionId,
+                    "the transcript of session " + sessionId + " was persisted", ex);
+        }
+    }
+
+    /**
      * Mirrors already-persisted messages into their cache windows, invalidating instead of failing.
      */
     private void mirrorToCache(List<ChatMessageDO> messages) {
@@ -337,12 +451,21 @@ public class MedChatMemoryRepository {
      * Compensates a failed mirror write; escalates when the window cannot be invalidated either.
      */
     private void invalidateAfterFailedMirror(ChatMessageDO message, BizException cause) {
+        invalidateWindowOrEscalate(message.getTenantId(), message.getDeptId(), message.getSessionId(),
+                "message " + message.getMessageId() + " was persisted", cause);
+    }
+
+    /**
+     * Drops a session window after a failed cache write; when even the eviction fails the original
+     * failure is escalated, because a surviving stale window is worse than a failed request.
+     */
+    private void invalidateWindowOrEscalate(String tenantId, String deptId, String sessionId,
+                                            String subject, BizException cause) {
         try {
-            cache.evict(message.getTenantId(), message.getDeptId(), message.getSessionId());
+            cache.evict(tenantId, deptId, sessionId);
         } catch (BizException evictFailure) {
             BizException escalated = new BizException(ErrorCode.STORAGE_ERROR,
-                    "message " + message.getMessageId() + " was persisted but its cached window "
-                            + "could neither be updated nor invalidated", cause);
+                    subject + " but its cached window could neither be updated nor invalidated", cause);
             escalated.addSuppressed(evictFailure);
             throw escalated;
         }
@@ -350,13 +473,20 @@ public class MedChatMemoryRepository {
 
     /**
      * Reads a session from MySQL and warms the cache with it.
+     *
+     * <p>The replay is truncated to the cache window ({@link RedisMessageCache#windowSize()}) before
+     * it is returned and cached. MySQL now holds the whole transcript (D44), so without this bound a
+     * cold cache would hand the entire history of a long consultation to the caller — and, through
+     * the memory bridge, to the model prompt.</p>
      */
     private List<ChatMessageDO> loadAndBackFill(String tenantId, String deptId, String sessionId) {
         List<ChatMessageDO> stored = selectSession(tenantId, deptId, sessionId);
-        if (!stored.isEmpty()) {
-            backFillQuietly(tenantId, deptId, sessionId, stored);
+        int window = cache.windowSize();
+        List<ChatMessageDO> bounded = window > 0 ? tail(stored, window) : stored;
+        if (!bounded.isEmpty()) {
+            backFillQuietly(tenantId, deptId, sessionId, bounded);
         }
-        return stored;
+        return bounded;
     }
 
     /**
@@ -420,6 +550,23 @@ public class MedChatMemoryRepository {
     private static void requireText(String value, String name) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException(name + " must not be blank");
+        }
+    }
+
+    /**
+     * Rejects a message that would be written into a session it does not belong to. The session id is
+     * the sharding key and the tenant/department are part of the Redis key, so a message carrying a
+     * foreign coordinate would land in the wrong shard and the wrong cache window.
+     */
+    private static void requireBelongsTo(ChatMessageDO message, String tenantId, String deptId,
+                                        String sessionId) {
+        if (!sessionId.equals(message.getSessionId())
+                || !tenantId.equals(message.getTenantId())
+                || !deptId.equals(message.getDeptId())) {
+            throw new IllegalArgumentException("message " + message.getMessageId()
+                    + " belongs to session " + message.getTenantId() + ":" + message.getDeptId()
+                    + ":" + message.getSessionId() + " but was offered to " + tenantId + ":"
+                    + deptId + ":" + sessionId);
         }
     }
 }

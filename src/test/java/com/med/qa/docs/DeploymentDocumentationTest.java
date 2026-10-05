@@ -187,6 +187,22 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D44 transcript tiers and their triage query")
+    void transcriptTiersAreDocumented() {
+        // What an operator must be able to answer from the handbook alone: does shrinking the memory
+        // window lose data (no), and how do I count a session's real rows in the physical shard.
+        assertThat(handbook).contains("7.6");
+        assertThat(handbook).contains("insertIfAbsent");
+        assertThat(handbook).contains("不影响落库轨迹");
+        assertThat(handbook).contains("SESSION_LOCKED");
+        assertThat(handbook).contains("med_message_");
+        assertThat(handbook).contains("session_id");
+        // The second D44 defect, and the log line an operator will actually see.
+        assertThat(handbook).contains("patient_id");
+        assertThat(handbook).contains("cannot be attributed");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

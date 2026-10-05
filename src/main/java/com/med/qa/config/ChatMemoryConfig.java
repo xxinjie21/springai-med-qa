@@ -1,6 +1,8 @@
 package com.med.qa.config;
 
+import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.memory.MedSpringAiChatMemoryRepository;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.repository.MedChatMemoryRepository;
 import org.springframework.ai.chat.client.ChatClientCustomizer;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
@@ -31,12 +33,18 @@ public class ChatMemoryConfig {
      * The bridge that lets the official window memory read/write through the project's two-tier
      * repository (Redis cache + sharded MySQL).
      *
-     * @param repository the underlying conversation repository, must not be {@code null}
+     * @param repository         the underlying conversation repository, must not be {@code null}
+     * @param sessionLockService the per-session distributed lock serializing window writes (D44),
+     *                           must not be {@code null}
+     * @param sessionMapper      session lookup used to attribute a message to its session's patient
+     *                           (D44), must not be {@code null}
      * @return the Spring AI {@code ChatMemoryRepository} implementation
      */
     @Bean
-    public MedSpringAiChatMemoryRepository springAiChatMemoryRepository(MedChatMemoryRepository repository) {
-        return new MedSpringAiChatMemoryRepository(repository);
+    public MedSpringAiChatMemoryRepository springAiChatMemoryRepository(
+            MedChatMemoryRepository repository, SessionLockService sessionLockService,
+            ChatSessionMapper sessionMapper) {
+        return new MedSpringAiChatMemoryRepository(repository, sessionLockService, sessionMapper);
     }
 
     /**

@@ -30,6 +30,23 @@ public interface ChatMessageMapper {
     int insert(ChatMessageDO message);
 
     /**
+     * Inserts a chat message unless its {@code message_id} is already stored, in which case the
+     * existing row is left untouched.
+     *
+     * <p>This is the primitive the conversation memory window writes through (D44). Spring AI's
+     * {@code MessageWindowChatMemory} re-sends the <em>whole</em> rolling window on every turn, so
+     * the window write has to be idempotent: an already persisted message must be a no-op, never a
+     * duplicate row and never a reason to delete the messages that have already scrolled out of the
+     * window. The statement is {@code INSERT … ON DUPLICATE KEY UPDATE message_id = message_id},
+     * i.e. a duplicate-key collision is the only error it swallows — unlike {@code INSERT IGNORE},
+     * which would also hide truncation and constraint failures.</p>
+     *
+     * @param message the message to persist, must carry a non-blank messageId and sessionId
+     * @return {@code 1} when a new row was written, {@code 0} when the message was already stored
+     */
+    int insertIfAbsent(ChatMessageDO message);
+
+    /**
      * Loads a message by its primary key. Because the primary key is not the sharding column,
      * ShardingSphere broadcasts the lookup across all 16 physical tables and merges the single hit.
      *

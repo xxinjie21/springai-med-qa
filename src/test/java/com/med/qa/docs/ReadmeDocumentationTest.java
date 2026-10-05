@@ -372,6 +372,26 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D44 durable-transcript contract and its cross-component guards")
+    void apiChapterDocumentsTheDurableTranscriptContract() {
+        // The defect this guards: MySQL only ever held the 20-message memory window because the write
+        // path deleted the session before re-inserting the trimmed window, while the javadoc called it
+        // the authoritative copy. The README must state the three tiers, the idempotent primitive and
+        // the tests that cross the window/repository boundary.
+        assertThat(readme).contains("insertIfAbsent");
+        assertThat(readme).contains("ON DUPLICATE KEY UPDATE");
+        assertThat(readme).contains("saveWindow");
+        assertThat(readme).contains("ChatMemoryWindowIntegrationTest");
+        assertThat(readme).contains("memoryWindowTrimsButTranscriptKeepsEveryTurn");
+        // Lowering the window must be documented as a prompt-only change, never as data loss.
+        assertThat(readme).contains("MED_CHAT_MAX_MESSAGES");
+        assertThat(readme).contains("不影响落库轨迹");
+        // The second defect the same contract test found: a framework message carries no patient.
+        assertThat(readme).contains("patient_id");
+        assertThat(readme).contains("ChatSessionMapper");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

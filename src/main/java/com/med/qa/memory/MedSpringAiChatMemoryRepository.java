@@ -1,7 +1,12 @@
 package com.med.qa.memory;
 
+import com.med.qa.common.exception.BizException;
+import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.domain.entity.ChatMessageDO;
+import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.RoleType;
+import com.med.qa.mapper.ChatSessionMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.repository.MedChatMemoryRepository;
 import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -9,6 +14,7 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.dao.DataAccessException;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -40,12 +46,28 @@ import java.util.UUID;
  *       ({@link #MED_ROLE_CODE}) and restored when persisting.</li>
  *   <li>Application metadata attached to a message is round-tripped through the DO, but the reserved
  *       {@code med.*} keys are never stored into the DO metadata map.</li>
+ *   <li>The <b>patient</b> is not part of the conversation id (which is
+ *       {@code tenant:dept:session}), and Spring AI messages carry no project identity at all, so a
+ *       message that does not name a patient is attributed to the patient the session belongs to.
+ *       The column is {@code NOT NULL} in the unified storage spec and the assistant message is
+ *       always built by the framework, so without this every turn would fail to persist — the defect
+ *       the D44 integration test found on its first run.</li>
  * </ul>
  *
  * <h2>saveAll semantics</h2>
- * Spring AI calls {@code saveAll} to <em>replace</em> the whole window after each turn. This
- * repository honours that by deleting the session's messages and re-inserting the trimmed set,
- * which keeps MySQL (the authoritative copy) and the Redis window perfectly in sync.
+ * Spring AI calls {@code saveAll} to persist the <em>whole rolling window</em> after each turn. The
+ * window is what the model is allowed to see; it is not the record of the consultation, so this
+ * repository merges the window into the durable transcript instead of replacing it (D44). Every
+ * message is appended idempotently by its primary key, which means a message that has already
+ * scrolled out of the window stays stored, and re-sending the window on the next turn is a no-op
+ * rather than a duplicate. Before D44 this method deleted the session and re-inserted the window,
+ * which physically destroyed every turn beyond {@code med.chat.max-messages} — with the repository's
+ * own javadoc claiming MySQL was the authoritative copy.
+ *
+ * <p>The merge runs under the session's Redisson lock ({@code med:lock:chat:…}), so two instances
+ * handling the same consultation cannot interleave the transcript write and the cache rebuild; a
+ * session already busy elsewhere is refused with {@link com.med.qa.common.exception.ErrorCode#SESSION_LOCKED}
+ * rather than being allowed to write concurrently.</p>
  */
 public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
 
@@ -63,13 +85,27 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
 
     private final MedChatMemoryRepository repository;
 
+    private final SessionLockService sessionLockService;
+
+    private final ChatSessionMapper sessionMapper;
+
     /**
      * Creates the bridge.
      *
-     * @param repository the underlying two-tier conversation repository, must not be {@code null}
+     * @param repository         the underlying two-tier conversation repository, must not be
+     *                           {@code null}
+     * @param sessionLockService the per-session distributed lock serializing window writes, must not
+     *                           be {@code null}
+     * @param sessionMapper      lookup used to attribute a message to the patient of its session,
+     *                           must not be {@code null}
      */
-    public MedSpringAiChatMemoryRepository(MedChatMemoryRepository repository) {
+    public MedSpringAiChatMemoryRepository(MedChatMemoryRepository repository,
+                                          SessionLockService sessionLockService,
+                                          ChatSessionMapper sessionMapper) {
         this.repository = Objects.requireNonNull(repository, "repository must not be null");
+        this.sessionLockService =
+                Objects.requireNonNull(sessionLockService, "sessionLockService must not be null");
+        this.sessionMapper = Objects.requireNonNull(sessionMapper, "sessionMapper must not be null");
     }
 
     /**
@@ -104,13 +140,19 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
     }
 
     /**
-     * Replaces the whole window of a session with the given messages. Each message is converted to a
+     * Merges the given window into the session's durable transcript. Each message is converted to a
      * {@link ChatMessageDO}; existing message ids are reused and new ids are minted on demand.
+     * Nothing is deleted: messages that have scrolled out of the window remain stored.
+     *
+     * <p>The write is serialized across instances through the session's Redisson lock.</p>
      *
      * @param conversationId must decode to {@code tenantId:deptId:sessionId}
      * @param messages       the new full window, must not be {@code null}
      * @throws IllegalArgumentException if the conversation id is malformed or {@code messages} is
      *                                  {@code null}
+     * @throws com.med.qa.common.exception.BizException {@code SESSION_LOCKED} when another request
+     *                                  is writing the same session, {@code STORAGE_ERROR} when
+     *                                  neither storage tier can be updated
      */
     @Override
     public void saveAll(String conversationId, List<Message> messages) {
@@ -118,12 +160,50 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
             throw new IllegalArgumentException("messages must not be null");
         }
         SessionCoordinate coord = SessionCoordinate.parse(conversationId);
+        String sessionPatientId = resolveSessionPatientId(coord);
         List<ChatMessageDO> entities = new ArrayList<>(messages.size());
         for (Message message : messages) {
-            entities.add(toChatMessageDO(message, coord));
+            entities.add(toChatMessageDO(message, coord, sessionPatientId));
         }
-        repository.deleteSession(coord.tenantId(), coord.deptId(), coord.sessionId());
-        repository.appendAll(entities);
+        sessionLockService.runLocked(coord.tenantId(), coord.deptId(), coord.sessionId(),
+                () -> repository.saveWindow(coord.tenantId(), coord.deptId(), coord.sessionId(),
+                        entities));
+    }
+
+    /**
+     * Resolves the patient the session belongs to.
+     *
+     * <p>Spring AI hands over messages with no project identity: the patient the freshly typed
+     * question belongs to is not part of the conversation id, and the assistant message is built by
+     * the framework. Since {@code med_message.patient_id} is {@code NOT NULL} in the unified storage
+     * spec, the session is the only authority that can attribute a turn — without this lookup the
+     * very first turn of every consultation fails with {@code Column 'patient_id' cannot be null}
+     * (found by {@code MedStorageAndLockIntegrationTest} on D44).</p>
+     *
+     * @param coord the session coordinate decoded from the conversation id
+     * @return the session's patient id, never blank
+     * @throws BizException {@link ErrorCode#STORAGE_ERROR} when the session cannot be read, does not
+     *                      exist, or names no patient
+     */
+    private String resolveSessionPatientId(SessionCoordinate coord) {
+        ChatSessionDO session;
+        try {
+            session = sessionMapper.selectById(coord.sessionId());
+        } catch (DataAccessException ex) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "failed to load session " + coord.sessionId() + " while persisting its messages", ex);
+        }
+        if (session == null) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "session " + coord.sessionId() + " does not exist, so its messages cannot be "
+                            + "attributed to a patient");
+        }
+        String patientId = session.getPatientId();
+        if (patientId == null || patientId.isBlank()) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "session " + coord.sessionId() + " names no patient, so its messages cannot be stored");
+        }
+        return patientId;
     }
 
     /**
@@ -167,11 +247,13 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
     /**
      * Converts a Spring AI message into a persisted entity for the given session.
      *
-     * @param message the Spring AI message, must not be {@code null}
-     * @param coord   the owning session coordinate
+     * @param message         the Spring AI message, must not be {@code null}
+     * @param coord           the owning session coordinate
+     * @param sessionPatientId the patient of the owning session, used when the message names none
      * @return the equivalent {@link ChatMessageDO}
      */
-    static ChatMessageDO toChatMessageDO(Message message, SessionCoordinate coord) {
+    static ChatMessageDO toChatMessageDO(Message message, SessionCoordinate coord,
+                                         String sessionPatientId) {
         Map<String, Object> metadata = message.getMetadata() == null
                 ? Collections.emptyMap() : message.getMetadata();
         String messageId = asString(metadata.get(MED_MESSAGE_ID));
@@ -181,7 +263,10 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
         RoleType role = resolveRole(message);
         long createdAt = parseLong(metadata.get(MED_CREATED_AT), System.currentTimeMillis());
         String patientId = asString(metadata.get(MED_PATIENT_ID));
-        ChatMessageDO.Builder builder = ChatMessageDO.builder()
+        if (patientId == null || patientId.isBlank()) {
+            patientId = sessionPatientId;
+        }
+        return ChatMessageDO.builder()
                 .messageId(messageId)
                 .sessionId(coord.sessionId())
                 .tenantId(coord.tenantId())
@@ -189,11 +274,9 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
                 .role(role)
                 .content(message.getText() == null ? "" : message.getText())
                 .createdAt(createdAt)
-                .metadata(extractUserMetadata(metadata));
-        if (patientId != null) {
-            builder.patientId(patientId);
-        }
-        return builder.build();
+                .patientId(patientId)
+                .metadata(extractUserMetadata(metadata))
+                .build();
     }
 
     /**

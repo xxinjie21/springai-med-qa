@@ -345,6 +345,22 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D44 durable-transcript contract and its guards")
+    void apiChapterDocumentsTheDurableTranscriptContract() {
+        assertThat(english).contains("insertIfAbsent");
+        assertThat(english).contains("ON DUPLICATE KEY UPDATE");
+        assertThat(english).contains("saveWindow");
+        assertThat(english).contains("ChatMemoryWindowIntegrationTest");
+        assertThat(english).contains("memoryWindowTrimsButTranscriptKeepsEveryTurn");
+        // The operational sentence: shrinking the window bounds the prompt, it never deletes data.
+        assertThat(english).contains("MED_CHAT_MAX_MESSAGES");
+        assertThat(english).contains("bounds the prompt only");
+        // The second defect the same contract test found: a framework message carries no patient.
+        assertThat(english).contains("ChatSessionMapper");
+        assertThat(english).contains("patient_id");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

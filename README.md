@@ -311,6 +311,49 @@ JSON 里写上别人的 `deptId`，就能**跨科室读、写、甚至物理删�
 它只断言分类器，无法证明真实 indicator **会产出**被分类的那个形状。
 按项目惯例这条守卫**先被亲眼看过它变红**：还原两处缺陷后共 6 个用例失败（3 个测试类）。
 
+#### 会话轨迹的持久化契约（D44）
+
+`MessageWindowChatMemory` 决定**模型能看到多少条消息**（`MED_CHAT_MAX_MESSAGES`，默认 20），它不是
+病历的记录。但 D1–D43 的写路径是「先 `deleteSession` 再 `appendAll`」——而 Spring AI 的 `saveAll`
+交进来的正是**裁剪后的窗口**，于是每写一轮，落在窗口外的历史消息就被物理删除一次：一场问了几十轮
+的会诊，库里永远只剩最后 20 条，而仓储自己的 javadoc 却称 MySQL 是 "authoritative copy"。两个实例
+同时处理同一会话时更糟——两轮互相把对方的消息删掉。
+
+D44 把「窗口是视图、轨迹是记录」写成代码事实：
+
+| 层 | 保存什么 | 边界 |
+|---|---|---|
+| MySQL `med_message_{crc32(session_id)%16}` | **完整轨迹**，每轮只增不删 | 无上限 |
+| Redis `med:chat:{tenant}:{dept}:{session}` | 最近 `MED_CACHE_MAX_MESSAGES`（默认 200）条 | 有界缓存，未命中回源 MySQL |
+| `MessageWindowChatMemory` | 最近 `MED_CHAT_MAX_MESSAGES`（默认 20）条 | 只影响送进模型的消息 |
+
+换句话说：调小 `MED_CHAT_MAX_MESSAGES` 只让模型少看几轮上下文，**不影响落库轨迹**；调小
+`MED_CACHE_MAX_MESSAGES` 只让缓存窗口变窄，读未命中时回源 MySQL。
+
+- `ChatMessageMapper.insertIfAbsent`（`INSERT … ON DUPLICATE KEY UPDATE message_id = message_id`）按主键
+  去重：`1` = 新插入、`0` = 已存在。用它而不是 `INSERT IGNORE`，因为后者会把截断等错误一并吞掉。
+- `MedChatMemoryRepository.saveWindow` 只做幂等追加，**任何路径都不再删除**；写完后把该窗口发布到
+  Redis 缓存，缓存因此与模型窗口一致。冷缓存回源时按 `MED_CACHE_MAX_MESSAGES` 截断——D44 之后 MySQL
+  存的是完整轨迹，不截断就会把整段历史灌进模型 prompt。
+- 写路径由 `SessionLockService` 的 `RLock`（`med:lock:chat:…`）串行化：同一会话的并发轮次以
+  `SESSION_LOCKED` 快速失败，而不是交叉写入。
+- **刻意不加 `@Transactional`**：写入幂等、且 Spring AI 每轮都会重发整个窗口，部分失败会被下一轮自愈；
+  而在事务内刷新 Redis 会在回滚后留下「缓存里有、库里没有」的脏窗口——这是本层唯一拒绝制造的不一致。
+  该取舍写在 `saveWindow` 的 javadoc 里。
+
+跨组件契约由 `ChatMemoryWindowIntegrationTest`（离线：窗口 2 条 vs 轨迹 5 条）与
+`MedStorageAndLockIntegrationTest#memoryWindowTrimsButTranscriptKeepsEveryTurn`（真实 MySQL + Redis
+Stack：窗口 4 条 vs 分表 10 行）守住。单组件测试看不见这个差别——桥接层测试只观察交给仓储的消息，
+仓储测试从不运行窗口。
+
+**这条契约测试当场查出了第二个缺陷**（D44）：`med_message.patient_id` 在统一存储规范里是 `NOT NULL`，
+但 Spring AI 交进来的消息**不携带任何项目身份**——患者 id 不在会话 id（`tenant:dept:session`）里，
+助手消息更是完全由框架构造。于是生产环境里每一轮问诊的写入都会以
+`Column 'patient_id' cannot be null` 失败：此前所有单测都 mock 掉 mapper、所有集成测试都用
+`sampleMessage` 显式带了 patientId，没有一个测试走到「框架消息落库」这一步。修法：桥接层在写窗口前用
+`ChatSessionMapper.selectById` 解析会话所属患者（会话是「这条消息属于谁」的唯一权威），消息自带的
+`med.patientId` 优先；会话不存在或没有患者则拒绝写入（`STORAGE_ERROR`，绝不落一条无法归属的病历）。
+
 ---
 
 ## 错误码
@@ -606,6 +649,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
+| 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 进行中（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45 检索元数据不进入向量文本、D46 记忆层注释校正待做） |
 
 ---
 

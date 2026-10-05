@@ -36,6 +36,27 @@
         )
     </insert>
 
+    <!--
+      Idempotent variant used by the conversation memory window (D44). Spring AI re-sends the whole
+      rolling window on every turn, so a message that is already persisted must be a no-op rather
+      than a duplicate-key failure - and it must never be a reason to delete the messages that have
+      already scrolled out of the window. ON DUPLICATE KEY UPDATE with a self-assignment keeps the
+      collision handling to duplicate keys only; INSERT IGNORE would also swallow truncation and
+      other constraint errors. Affected rows: 1 = inserted, 0 = already present.
+    -->
+    <insert id="insertIfAbsent" parameterType="com.med.qa.domain.entity.ChatMessageDO" useGeneratedKeys="false">
+        INSERT INTO med_message (
+            message_id, session_id, tenant_id, dept_id, patient_id,
+            role, content, token_count, masked, created_at, metadata
+        ) VALUES (
+            #{messageId}, #{sessionId}, #{tenantId}, #{deptId}, #{patientId},
+            #{role, typeHandler=com.med.qa.mapper.typehandler.RoleTypeTypeHandler},
+            #{content}, #{tokenCount}, #{masked}, #{createdAt},
+            #{metadata, typeHandler=com.med.qa.mapper.typehandler.MetadataTypeHandler}
+        )
+        ON DUPLICATE KEY UPDATE message_id = message_id
+    </insert>
+
     <select id="selectById" resultMap="MessageResultMap">
         SELECT <include refid="allColumns"/>
         FROM med_message

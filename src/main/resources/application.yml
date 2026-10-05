@@ -91,14 +91,16 @@ springdoc:
     try-it-out-enabled: true
     persist-authorization: true
 
-# Conversation memory cache tuning; MySQL stays the source of truth so these values only
-# trade Redis footprint against read amplification.
+# Conversation memory cache tuning. MySQL holds the full transcript and is the source of truth; this
+# window is a bounded cache of its most recent tail, so these values only trade Redis footprint
+# against read amplification - lowering them can never lose a message (D44).
 med:
   cache:
     ttl: ${MED_CACHE_TTL:30m}
     max-messages: ${MED_CACHE_MAX_MESSAGES:200}
-  # Spring AI short-term memory window (MessageWindowChatMemory). Only the rolling window size is
-  # configured here; the window is persisted through the two-tier repository (Redis + sharded MySQL).
+  # Spring AI short-term memory window (MessageWindowChatMemory): how many of the most recent messages
+  # are handed to the model. It bounds the prompt only. The durable transcript (Redis window + sharded
+  # MySQL) is never trimmed to this value - a turn that scrolls out of the window stays stored (D44).
   chat:
     max-messages: ${MED_CHAT_MAX_MESSAGES:20}
     # SSE streaming consultation endpoint tuning. A heartbeat comment keeps a slow or quiet connection

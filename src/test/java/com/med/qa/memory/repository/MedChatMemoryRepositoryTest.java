@@ -402,6 +402,145 @@ class MedChatMemoryRepositoryTest {
         assertEquals(ErrorCode.STORAGE_ERROR, ex.getErrorCode());
     }
 
+    // -------------------------------------------------------------- saveWindow
+
+    @Test
+    @DisplayName("D44: saveWindow inserts only the messages that are not stored yet and deletes nothing")
+    void saveWindowIsAdditiveAndIdempotent() {
+        ChatMessageDO known = message("msg-known", 1000L);
+        ChatMessageDO fresh = message("msg-fresh", 2000L);
+        when(messageMapper.insertIfAbsent(known)).thenReturn(0);
+        when(messageMapper.insertIfAbsent(fresh)).thenReturn(1);
+
+        assertEquals(1, repository.saveWindow(TENANT, DEPT, SESSION, List.of(known, fresh)));
+
+        verify(messageMapper).insertIfAbsent(known);
+        verify(messageMapper).insertIfAbsent(fresh);
+        // The window is a view for the model; the durable transcript must never be replaced by it.
+        verify(messageMapper, never()).insert(any());
+        verify(messageMapper, never()).deleteBySessionId(anyString());
+        verify(messageMapper, never()).deleteById(anyString());
+    }
+
+    @Test
+    @DisplayName("D44: saveWindow publishes the window it wrote to the cache and never re-reads MySQL")
+    void saveWindowPublishesTheWindowToTheCache() {
+        ChatMessageDO fresh = message("msg-fresh", 2000L);
+        when(messageMapper.insertIfAbsent(fresh)).thenReturn(1);
+
+        repository.saveWindow(TENANT, DEPT, SESSION, List.of(fresh));
+
+        verify(cache).replaceAll(TENANT, DEPT, SESSION, List.of(fresh));
+        verify(cache, never()).append(any());
+        // Re-reading MySQL here would publish the whole transcript into a cache whose readers expect a
+        // bounded window.
+        verify(messageMapper, never()).selectBySessionIdOrderByCreatedAtAsc(anyString());
+    }
+
+    @Test
+    @DisplayName("D44: a cold cache replays only the cache window, not the whole transcript")
+    void findAllTruncatesTheReplayToTheCacheWindow() {
+        List<ChatMessageDO> transcript = List.of(
+                message("msg-1", 1000L), message("msg-2", 2000L), message("msg-3", 3000L));
+        when(cache.findAll(TENANT, DEPT, SESSION)).thenReturn(Collections.emptyList());
+        when(cache.windowSize()).thenReturn(2);
+        when(messageMapper.selectBySessionIdOrderByCreatedAtAsc(SESSION)).thenReturn(transcript);
+
+        List<ChatMessageDO> replay = repository.findAll(TENANT, DEPT, SESSION);
+
+        assertEquals(List.of("msg-2", "msg-3"),
+                replay.stream().map(ChatMessageDO::getMessageId).toList());
+        verify(cache).replaceAll(TENANT, DEPT, SESSION, replay);
+    }
+
+    @Test
+    @DisplayName("D44: an unbounded cache window replays the whole transcript")
+    void findAllReplaysEverythingWhenTheWindowIsUnbounded() {
+        List<ChatMessageDO> transcript = List.of(
+                message("msg-1", 1000L), message("msg-2", 2000L), message("msg-3", 3000L));
+        when(cache.findAll(TENANT, DEPT, SESSION)).thenReturn(Collections.emptyList());
+        when(cache.windowSize()).thenReturn(0);
+        when(messageMapper.selectBySessionIdOrderByCreatedAtAsc(SESSION)).thenReturn(transcript);
+
+        assertEquals(transcript, repository.findAll(TENANT, DEPT, SESSION));
+    }
+
+    @Test
+    @DisplayName("D44: an empty window touches neither tier")
+    void saveWindowEmptyIsANoOp() {
+        assertEquals(0, repository.saveWindow(TENANT, DEPT, SESSION, Collections.emptyList()));
+
+        verifyNoInteractions(messageMapper, cache);
+    }
+
+    @Test
+    @DisplayName("saveWindow rejects a null window and a blank identity segment")
+    void saveWindowRejectsInvalidArguments() {
+        assertThrows(IllegalArgumentException.class,
+                () -> repository.saveWindow(TENANT, DEPT, SESSION, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> repository.saveWindow(TENANT, "", SESSION, List.of(message("msg-1", 1000L))));
+
+        verifyNoInteractions(messageMapper, cache);
+    }
+
+    @Test
+    @DisplayName("saveWindow rejects a message that belongs to another session")
+    void saveWindowRejectsForeignMessage() {
+        ChatMessageDO foreign = ChatMessageDO.builder()
+                .messageId("msg-foreign").sessionId("other-session")
+                .tenantId(TENANT).deptId(DEPT).role(RoleType.PATIENT).content("x").build();
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> repository.saveWindow(TENANT, DEPT, SESSION, List.of(foreign)));
+
+        assertTrue(ex.getMessage().contains("other-session"));
+        verifyNoInteractions(messageMapper, cache);
+    }
+
+    @Test
+    @DisplayName("saveWindow surfaces a MySQL insert outage as STORAGE_ERROR")
+    void saveWindowTranslatesMysqlFailure() {
+        ChatMessageDO fresh = message("msg-fresh", 2000L);
+        when(messageMapper.insertIfAbsent(fresh)).thenThrow(new QueryTimeoutException("shard busy"));
+
+        BizException ex = assertThrows(BizException.class,
+                () -> repository.saveWindow(TENANT, DEPT, SESSION, List.of(fresh)));
+
+        assertEquals(ErrorCode.STORAGE_ERROR, ex.getErrorCode());
+        verifyNoInteractions(cache);
+    }
+
+    @Test
+    @DisplayName("saveWindow invalidates the window when publishing it to the cache fails")
+    void saveWindowInvalidatesWhenRefreshFails() {
+        ChatMessageDO fresh = message("msg-fresh", 2000L);
+        when(messageMapper.insertIfAbsent(fresh)).thenReturn(1);
+        doThrow(new BizException(ErrorCode.STORAGE_ERROR, "redis down"))
+                .when(cache).replaceAll(eq(TENANT), eq(DEPT), eq(SESSION), any());
+
+        assertEquals(1, repository.saveWindow(TENANT, DEPT, SESSION, List.of(fresh)));
+
+        verify(cache).evict(TENANT, DEPT, SESSION);
+    }
+
+    @Test
+    @DisplayName("saveWindow escalates when the cache can neither be published nor invalidated")
+    void saveWindowEscalatesWhenCacheUnrecoverable() {
+        ChatMessageDO fresh = message("msg-fresh", 2000L);
+        when(messageMapper.insertIfAbsent(fresh)).thenReturn(1);
+        doThrow(new BizException(ErrorCode.STORAGE_ERROR, "redis down"))
+                .when(cache).replaceAll(eq(TENANT), eq(DEPT), eq(SESSION), any());
+        when(cache.evict(TENANT, DEPT, SESSION))
+                .thenThrow(new BizException(ErrorCode.STORAGE_ERROR, "still down"));
+
+        BizException ex = assertThrows(BizException.class,
+                () -> repository.saveWindow(TENANT, DEPT, SESSION, List.of(fresh)));
+
+        assertEquals(ErrorCode.STORAGE_ERROR, ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("could neither be updated nor invalidated"));
+    }
+
     // ----------------------------------------------------------------- reload
 
     @Test

@@ -355,8 +355,8 @@ livenessProbe:
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MED_CACHE_TTL` | `30m` | 会话缓存 TTL |
-| `MED_CACHE_MAX_MESSAGES` | `200` | 缓存窗口消息数 |
-| `MED_CHAT_MAX_MESSAGES` | `20` | 短期记忆窗口 |
+| `MED_CACHE_MAX_MESSAGES` | `200` | 缓存窗口消息数（有界缓存，调小只影响缓存，不影响落库轨迹，见 7.6） |
+| `MED_CHAT_MAX_MESSAGES` | `20` | 短期记忆窗口：只影响送进模型的消息条数，**不影响落库轨迹**（见 7.6） |
 | `MED_CHAT_STREAM_HEARTBEAT` | `15` | SSE 心跳间隔（秒） |
 | `MED_CHAT_STREAM_TIMEOUT` | `120` | SSE 超时（秒） |
 | `MED_LOCK_WAIT_TIME` | `3s` | 会话锁等待时间 |
@@ -615,6 +615,47 @@ docker compose --profile observability up -d
 断言 Redis 不可达时出来的是 `CRITICAL` 的 `rag-index-probe-failed`、索引只是缺失时仍是 `WARNING`、
 以及「全部 sink 失败 → 指纹未写 → 下一次轮询重新告警」。按项目惯例这条守卫**先被亲眼看过它变红**：
 还原两处缺陷后共 6 个用例失败（3 个测试类）。
+
+### 7.6 会话轨迹的持久化契约（D44）
+
+三层存储各管一段，**不要把它们混为一谈**：
+
+| 层 | 保存什么 | 边界 | 调优变量 |
+|---|---|---|---|
+| MySQL `med_message_{crc32(session_id)%16}` | **完整病历轨迹**，每轮只增不删 | 无上限 | — |
+| Redis `med:chat:{tenant}:{dept}:{session}` | 最近一段消息（未命中回源 MySQL） | `MED_CACHE_MAX_MESSAGES` | `MED_CACHE_TTL` / `MED_CACHE_MAX_MESSAGES` |
+| `MessageWindowChatMemory` | 送进模型的最近消息 | `MED_CHAT_MAX_MESSAGES` | `MED_CHAT_MAX_MESSAGES` |
+
+**`MED_CHAT_MAX_MESSAGES` 只影响送进模型的消息条数，不影响落库轨迹。** D1–D43 的写路径是
+「先 `deleteSession` 再 `appendAll`」，而 Spring AI 的 `saveAll` 交进来的正是裁剪后的窗口，于是每写
+一轮都会把窗口外的历史消息物理删除——一场几十轮的会诊在库里只剩最后 20 条。D44 改为
+`insertIfAbsent`（`INSERT … ON DUPLICATE KEY UPDATE message_id = message_id`）的幂等追加，
+`MedChatMemoryRepository.saveWindow` 不再有任何删除路径，写完后把该窗口发布到 Redis 缓存；
+冷缓存回源时按 `MED_CACHE_MAX_MESSAGES` 截断，避免完整轨迹被整段灌进模型 prompt。
+
+运维含义：
+
+- 调小 `MED_CHAT_MAX_MESSAGES` 只会让模型少看几轮上下文，**不会**删数据；调小
+  `MED_CACHE_MAX_MESSAGES` 只会让缓存窗口变窄，读未命中时回源 MySQL。
+- 写路径由 `med:lock:chat:{tenant}:{dept}:{session}` 串行化，并发轮次会以 `SESSION_LOCKED`
+  （业务码 `40900`）快速失败；看到该码说明同一会话真的在被并发写入，而不是数据损坏。
+- **患者归属来自会话**：`med_message.patient_id` 是 `NOT NULL`，而 Spring AI 的消息不带任何项目身份
+  （患者 id 不在会话 id 里，助手消息由框架构造），所以桥接层写入前会用会话行解析患者；会话不存在或
+  没有患者时以 `STORAGE_ERROR` 拒绝写入。**排查**：若日志出现
+  `Column 'patient_id' cannot be null` 或 `does not exist, so its messages cannot be attributed`，
+  说明写入的会话在 `med_session` 里查不到——先确认会话是否真的创建过、是否被清理过。
+- 全量轨迹核查（绕开 ShardingSphere，直接看物理分表）：
+
+  ```bash
+  # 按会话统计真实行数：分片 = crc32(session_id) % 16
+  docker compose exec mysql mysql -umed_qa -pmed_qa med_qa \
+    -e "SELECT COUNT(*) FROM med_message_7 WHERE session_id='<sessionId>';"
+  ```
+
+  若该计数小于医生实际看到的轮数，说明有人在 D44 之前删过数据（历史行为），新写入不再有此问题。
+- 跨组件契约：`ChatMemoryWindowIntegrationTest`（离线，窗口 2 条 vs 轨迹 5 条）与
+  `MedStorageAndLockIntegrationTest#memoryWindowTrimsButTranscriptKeepsEveryTurn`（真实 MySQL +
+  Redis Stack，窗口 4 条 vs 分表 10 行）。
 
 ---
 

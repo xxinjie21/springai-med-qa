@@ -311,6 +311,56 @@ else's identity is refused with no service interaction at all, and that when the
 coordinates reaching the services are the **principal's**. Following project convention the guard was
 **watched failing first**: restoring "body wins" broke 12 cases across the two test classes.
 
+#### What the durable transcript keeps (D44)
+
+`MessageWindowChatMemory` decides **how many messages the model may see** (`MED_CHAT_MAX_MESSAGES`,
+20 by default). It is not the record of the consultation. Yet the write path up to D43 was
+"`deleteSession`, then `appendAll`" — and what Spring AI hands to `saveAll` is precisely the **trimmed
+window**, so every turn physically deleted the messages that had scrolled out of it: after a
+consultation of several dozen turns the database permanently held the last 20, while the repository's own
+javadoc called MySQL the "authoritative copy". With two instances serving the same session it was worse
+still: two turns deleted each other's messages.
+
+D44 turns "the window is a view, the transcript is the record" into a code fact:
+
+| Tier | What it holds | Bound |
+|---|---|---|
+| MySQL `med_message_{crc32(session_id)%16}` | the **full transcript**; every turn is only ever added | none |
+| Redis `med:chat:{tenant}:{dept}:{session}` | the most recent `MED_CACHE_MAX_MESSAGES` (200 by default) | a bounded cache, re-read from MySQL on a miss |
+| `MessageWindowChatMemory` | the most recent `MED_CHAT_MAX_MESSAGES` (20 by default) | bounds the prompt only |
+
+- `ChatMessageMapper.insertIfAbsent` (`INSERT … ON DUPLICATE KEY UPDATE message_id = message_id`)
+  deduplicates by primary key: `1` means "inserted", `0` means "already stored". `INSERT IGNORE` was
+  rejected because it would also swallow truncation and other constraint failures.
+- `MedChatMemoryRepository.saveWindow` only ever appends idempotently — **no code path deletes any more** —
+  and then publishes the window it wrote to the Redis cache, so the cache matches what the model sees. A
+  cold-cache replay is truncated to `MED_CACHE_MAX_MESSAGES`: MySQL now holds the whole transcript, and an
+  untruncated replay would push a long consultation's entire history into the model prompt.
+- The write runs under `SessionLockService`'s `RLock` (`med:lock:chat:…`): a second concurrent turn for the
+  same session fails fast with `SESSION_LOCKED` instead of interleaving its write.
+- **No `@Transactional`, deliberately**: the write is idempotent and Spring AI re-sends the whole window on
+  every turn, so a partial batch heals itself on the next turn — whereas refreshing Redis inside a
+  transaction that later rolls back would leave a window holding messages the database never accepted,
+  the one inconsistency this layer refuses to create. The trade-off is documented on `saveWindow`.
+
+The cross-component contract is guarded by `ChatMemoryWindowIntegrationTest` (offline: a 2-message window
+against a 5-message transcript) and by
+`MedStorageAndLockIntegrationTest#memoryWindowTrimsButTranscriptKeepsEveryTurn` (real MySQL + Redis Stack:
+a 4-message window against 10 rows in the shard). Single-component tests cannot see the difference — the
+bridge test only observes the messages handed to the repository, and the repository test never runs the
+window.
+
+**That contract test found a second defect on its first run** (D44): `med_message.patient_id` is `NOT NULL`
+in the unified storage spec, but the messages Spring AI hands over carry **no project identity at all** —
+the patient is not part of the conversation id (`tenant:dept:session`) and the assistant message is built
+entirely by the framework. Every turn of every consultation therefore failed to persist with
+`Column 'patient_id' cannot be null`: every unit test mocked the mapper and every integration test used
+`sampleMessage`, which sets the patient explicitly, so no test ever exercised "a framework message is
+stored". The fix resolves the session's patient through `ChatSessionMapper.selectById` before the window is
+written (the session is the only authority on who a message belongs to); a patient id carried by the
+message itself wins, and an unknown session or a session without a patient refuses the write with
+`STORAGE_ERROR` rather than storing an unattributable medical record.
+
 ---
 
 ## Error codes
@@ -796,6 +846,7 @@ the loop of code, unit tests, commit and push:
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
+| Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | In progress (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45 keeping isolation metadata out of the embedded text and D46 documentation corrections are still to come) |
 
 ---
 

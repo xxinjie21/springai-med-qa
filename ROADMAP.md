@@ -227,11 +227,25 @@ springai-med-qa/
 > `StreamingIdentityContractTest` / `RagAdminAuthorizationContractTest` / `AlertDeliveryContractTest`），
 > 每一条都按项目惯例**先被亲眼看过它变红**。
 >
-> **阶段 8 之后仍待处理（留给后续阶段，当前 ROADMAP 尚无 D44 及以后）**：P1-1 `metadata-mode: EMBED`
+> **阶段 8 之后仍待处理（见阶段 9）**：P1-1 `metadata-mode: EMBED`
 > 实际**包含**元数据（与上方注释相反，隔离标签会被写进向量）、P1-2 MySQL 只保存
 > `MessageWindowChatMemory` 的 20 条滚动窗口（javadoc 却称其为 "authoritative copy"）、P1-3 记忆写路径
-> 无锁且非事务，以及 P2-1/P2-3/P2-4 的注释与部署前置条件校正。**下一次运行必须先扩写本节新增阶段，
-> 不得自造迭代编号。**
+> 无锁，以及 P2-1/P2-3/P2-4 的注释与部署前置条件校正。
+
+### 阶段 9：会话轨迹持久化与检索元数据隔离（D44–D46）
+
+> 阶段 9 的出发点：2026-09-25 全量审查在阶段 8 收敛掉 3 处 P0 与 P1-4/5/6 之后，仍留下
+> P1-1 / P1-2 / P1-3 三条。三者依旧是同一种偏差——**注释与文档承诺的行为和代码实际行为相反**，
+> 只是这次偏差发生在**数据本身**上：P1-2 让「权威副本」只有 20 条，超出窗口的病历轨迹被
+> `saveAll` 的「先删后插」永久删除；P1-1 让「标签不进入向量」的注释与实际把元数据拼进
+> embedding 输入的行为相反，隔离标签污染了相似度；P1-3 让窗口写入在跨实例并发下没有互斥。
+> 阶段 9 把这三条从「注释承诺」改成「代码事实」，并各配一条跨组件契约测试。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D44 | 会话轨迹持久化契约 | MySQL 必须保存**完整病历轨迹**，而不是 `MessageWindowChatMemory` 的 20 条滚动窗口：`MedSpringAiChatMemoryRepository.saveAll` 不再「先 `deleteSession` 再 `appendAll`」（该顺序把落在窗口外的历史消息物理删除，且并发两轮会互相清空），改为经 Redisson `RLock` 串行化的**幂等追加**——新增 `ChatMessageMapper.insertIfAbsent`（`INSERT … ON DUPLICATE KEY UPDATE message_id = message_id`，按主键去重，`1` = 新插入、`0` = 已存在），`MedChatMemoryRepository.saveWindow` 只做「已存在则跳过」的追加、随后把该窗口发布到 Redis 缓存，**任何路径都不再删除**；同时把**冷缓存回源**截断到缓存窗口（`RedisMessageCache#windowSize`）——D44 之后 MySQL 存的是完整轨迹，不截断就会把整段历史灌进模型 prompt。窗口裁剪仍完全由官方 `MessageWindowChatMemory` 负责，项目零自研窗口逻辑。**不引入 `@Transactional`**：写入幂等且 Spring AI 每轮都会重发整个窗口，部分失败会被下一轮自愈，而在事务内刷新 Redis 缓存反而会在回滚后留下「缓存有、库中没有」的脏窗口——该取舍写在 `saveWindow` 的 javadoc 里。契约测试：`ChatMemoryWindowIntegrationTest` 断言「窗口只交 2 条、持久层留 5 条」，`MedStorageAndLockIntegrationTest` 用真实 MySQL + Redis 断言窗口 4 条而分表 10 行。**该契约测试当场查出第二个缺陷并当次修掉**：`med_message.patient_id` 是 `NOT NULL`，而 Spring AI 的消息不带任何项目身份（患者 id 不在 `tenant:dept:session` 里、助手消息由框架构造），于是生产的每一轮问诊写入都会以 `Column 'patient_id' cannot be null` 失败——此前单测全 mock mapper、集成测试全用自带 patientId 的 `sampleMessage`，没有一个测试走到「框架消息落库」；修法是桥接层写入前用 `ChatSessionMapper.selectById` 解析会话所属患者（消息自带者优先，会话缺失/无患者则 `STORAGE_ERROR` 拒绝） | `fix(memory): keep the full transcript instead of the memory window` |
+| D45 | 检索元数据不进入向量文本 | `spring.ai.openai.embedding.metadata-mode` 由 `EMBED` 改为 `NONE`——Spring AI 1.0.0 的 `OpenAiEmbeddingModel.embed(Document)` 走 `getFormattedContent(metadataMode)`，`DefaultContentFormatter.metadataFilter` 把 `EMBED` 解释为「全部键减去 `excludedEmbedMetadataKeys`」，因此现配置把 `tenant_id`/`dept_id`/`patient_id` 一并拼进 embedding 输入，既污染相似度又把隔离标签泄进向量；配套契约测试用 `Binder` 绑定**实际生效值**并断言为 `NONE`，再断言 `metadata-fields` 的 TAG 项仍齐全（过滤能力不因 `NONE` 而丢失） | `fix(rag): stop embedding isolation metadata into the vector` |
+| D46 | 记忆层注释与部署前置条件校正 | P2-1/P2-3/P2-4：`MedChatMemoryRepository` / `RedisMessageCache` 的窗口语义与 `med.cache.max-messages` 注释对齐（D44 已顺手改掉「读路径返回整段会话」与两处 yml 注释，本日只收剩余项）；`docs/DEPLOYMENT.md` 补「`MED_CHAT_MAX_MESSAGES` 只影响送进模型的消息条数，不影响落库轨迹」的运维说明，并校正部署前置条件表述 | `docs(memory): correct the memory tier documentation` |
 
 ---
 

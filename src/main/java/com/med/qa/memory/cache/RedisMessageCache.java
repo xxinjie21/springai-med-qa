@@ -181,6 +181,20 @@ public class RedisMessageCache {
     }
 
     /**
+     * Returns the configured size of the cached window.
+     *
+     * <p>Callers on the read path use it to bound what they ask the durable transcript for: MySQL
+     * holds every message ever written (D44), so replaying a whole long consultation into a prompt
+     * would be unbounded. A return value of {@code 0} means the window is unbounded by configuration
+     * and the caller should not truncate.</p>
+     *
+     * @return the maximum number of messages the cache keeps, or {@code 0} when unbounded
+     */
+    public int windowSize() {
+        return properties.isWindowBounded() ? properties.getMaxMessages() : 0;
+    }
+
+    /**
      * Reads the whole cached window of a session in chronological order.
      *
      * @param tenantId  hospital/tenant id, must not be blank

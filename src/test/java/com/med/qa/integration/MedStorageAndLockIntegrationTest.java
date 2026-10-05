@@ -16,6 +16,7 @@ import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.typehandler.MetadataTypeHandler;
 import com.med.qa.mapper.typehandler.RoleTypeTypeHandler;
 import com.med.qa.mapper.typehandler.SessionStatusTypeHandler;
+import com.med.qa.memory.MedSpringAiChatMemoryRepository;
 import com.med.qa.memory.cache.MedCacheProperties;
 import com.med.qa.memory.cache.RedisMessageCache;
 import com.med.qa.memory.lock.MedLockProperties;
@@ -62,6 +63,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mybatis.spring.SqlSessionTemplate;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.boot.autoconfigure.data.redis.RedisProperties;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -113,6 +118,7 @@ class MedStorageAndLockIntegrationTest {
     private static RedissonClient redissonClient;
     private static RedisMessageCache cache;
     private static MedChatMemoryRepository repository;
+    private static ChatSessionMapper sessionMapper;
     private static SessionLockService lockService;
     private static MedChatSessionService sessionService;
 
@@ -166,7 +172,7 @@ class MedStorageAndLockIntegrationTest {
         sqlSession = new SqlSessionTemplate(sqlSessionFactory);
 
         ChatMessageMapper messageMapper = sqlSession.getMapper(ChatMessageMapper.class);
-        ChatSessionMapper sessionMapper = sqlSession.getMapper(ChatSessionMapper.class);
+        sessionMapper = sqlSession.getMapper(ChatSessionMapper.class);
 
         redissonClient = buildRedissonClient();
 
@@ -245,6 +251,44 @@ class MedStorageAndLockIntegrationTest {
         repository.append(b);
         assertSameRowCountInShards(first, a.getMessageId(), 1);
         assertSameRowCountInShards(second, b.getMessageId(), 1);
+    }
+
+    @Test
+    @DisplayName("D44: the memory window trims to 4 while the sharded transcript keeps all 10 turns")
+    void memoryWindowTrimsButTranscriptKeepsEveryTurn() throws Exception {
+        // A real session row first: the messages the model produces carry no patient of their own, and
+        // med_message.patient_id is NOT NULL in the unified storage spec, so the session is what
+        // attributes a turn to a patient (the defect this test found on its first run).
+        String patientId = "patient-it-" + UUID.randomUUID();
+        ChatSessionDO session = sessionService.createSession(TENANT, DEPT, patientId, "长期随访");
+        String sessionId = session.getSessionId();
+        String conversationId = TENANT + ":" + DEPT + ":" + sessionId;
+
+        MedSpringAiChatMemoryRepository bridge =
+                new MedSpringAiChatMemoryRepository(repository, lockService, sessionMapper);
+        MessageWindowChatMemory memory = MessageWindowChatMemory.builder()
+                .chatMemoryRepository(bridge)
+                .maxMessages(4)
+                .build();
+
+        for (int turn = 1; turn <= 5; turn++) {
+            memory.add(conversationId, new UserMessage("patient question " + turn));
+            memory.add(conversationId, new AssistantMessage("assistant answer " + turn));
+        }
+
+        // What the model sees is bounded by the window, and the cache mirrors exactly that window...
+        List<Message> window = memory.get(conversationId);
+        assertEquals(4, window.size());
+        assertEquals("assistant answer 5", window.get(3).getText());
+        assertEquals(4, cache.findAll(TENANT, DEPT, sessionId).size());
+        // ...while the durable copy of the consultation keeps every turn, in the crc32-selected shard.
+        assertEquals(10, countSessionRows(sessionId),
+                "MySQL must hold the whole transcript, not just the memory window");
+        // Every stored turn was attributed to the session's patient.
+        assertEquals(10, countSessionRowsOfPatient(sessionId, patientId));
+        // And a cold cache replays the transcript again (bounded by the cache window, here 200).
+        cache.evict(TENANT, DEPT, sessionId);
+        assertEquals(10, repository.findAll(TENANT, DEPT, sessionId).size());
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -489,6 +533,40 @@ class MedStorageAndLockIntegrationTest {
         try (PreparedStatement ps = rawMysql.prepareStatement(
                 "SELECT COUNT(*) FROM med_message_" + shard + " WHERE message_id = ?")) {
             ps.setString(1, messageId);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                return rs.getLong(1);
+            }
+        }
+    }
+
+    /**
+     * Counts the rows a session really holds in the crc32-selected physical shard, querying the real
+     * MySQL instance directly. Used by the D44 contract: the memory window may trim, the transcript
+     * must not.
+     */
+    private static long countSessionRows(String sessionId) throws Exception {
+        int shard = Crc32ShardingAlgorithm.shardIndex(sessionId, SHARD_COUNT);
+        try (PreparedStatement ps = rawMysql.prepareStatement(
+                "SELECT COUNT(*) FROM med_message_" + shard + " WHERE session_id = ?")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                return rs.getLong(1);
+            }
+        }
+    }
+
+    /**
+     * Counts the rows of a session that were attributed to the given patient — the assertion behind
+     * the D44 finding that a framework message carries no patient of its own.
+     */
+    private static long countSessionRowsOfPatient(String sessionId, String patientId) throws Exception {
+        int shard = Crc32ShardingAlgorithm.shardIndex(sessionId, SHARD_COUNT);
+        try (PreparedStatement ps = rawMysql.prepareStatement(
+                "SELECT COUNT(*) FROM med_message_" + shard + " WHERE session_id = ? AND patient_id = ?")) {
+            ps.setString(1, sessionId);
+            ps.setString(2, patientId);
             try (ResultSet rs = ps.executeQuery()) {
                 assertTrue(rs.next());
                 return rs.getLong(1);
