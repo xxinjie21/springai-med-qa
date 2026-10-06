@@ -657,6 +657,38 @@ docker compose --profile observability up -d
   `MedStorageAndLockIntegrationTest#memoryWindowTrimsButTranscriptKeepsEveryTurn`（真实 MySQL +
   Redis Stack，窗口 4 条 vs 分表 10 行）。
 
+### 7.7 隔离标签不进入向量文本（D45）
+
+`spring.ai.openai.embedding.metadata-mode` 必须是 **`NONE`**，这不是调优项而是硬要求：
+
+- Spring AI 1.0.0 的 `OpenAiEmbeddingModel.embed(Document)` 先按该模式格式化文档
+  （`Document#getFormattedContent(MetadataMode)`），而 `DefaultContentFormatter` 把 `EMBED` 解释为
+  「**全部元数据键** 减去 `excludedEmbedMetadataKeys`」。也就是说 `EMBED` 会把 `tenant_id` /
+  `dept_id` / `patient_id` 拼进送进 embedding 接口的文本——相似度被标签污染，隔离标签本身也被写进向量。
+- `EMBED` 还是 Spring AI 自己 `OpenAiEmbeddingProperties.metadataMode` 字段的**默认值**。所以
+  **「这个键没配」不等于安全**：把配置项清空或删掉，行为会退回 `EMBED`。代码侧的回落值
+  （`EmbeddingModelConfig.SAFE_METADATA_MODE`）同样收敛为 `NONE`，使「没配」fail-safe。
+- 该键**刻意不做成环境变量**：部署方不应该有能力把隔离标签重新塞回向量里。
+- 关掉 `EMBED` **不影响过滤**：标签仍然留在文档的 JSON 值里，RediSearch 仍按
+  `med.rag.vector-store.metadata-fields` 把三个标签索引成 `TAG` 字段，`med.rag.index.expected-tag-fields`
+  仍与之一致（否则 D37 的探针会把重建好的索引误报为 `schema-drift`）。
+
+运维含义：
+
+- **不要**为了「提升检索质量」把它调回 `EMBED`。若真的怀疑检索质量下降，用 D39 的金标集
+  （`MedRetrievalBaseline*`）量化，而不是动这个开关——调回 `EMBED` 只会让相似度被标签污染，
+  并且把科室/患者标识写进向量库。
+- 排查命令（`/actuator/env` 刻意未暴露，因此直接读镜像里的配置）：
+
+  ```bash
+  docker compose exec app sh -c "grep -A2 'metadata-mode' /app/BOOT-INF/classes/application.yml"
+  ```
+
+  输出应为 `metadata-mode: NONE`；若为 `EMBED` 或该键缺失，说明镜像里的配置被改过或退回框架默认值。
+- 跨组件契约：`EmbeddingMetadataContractTest` 用 `YamlPropertySourceLoader` + `Binder` 绑定**实际生效值**
+  （逐 profile 叠加），并用真实的 Spring AI formatter 演示同一个 `Document` 在 `NONE` 与 `EMBED` 下
+  嵌入文本的差别，同时断言守卫会拒绝 `EMBED` 与「属性缺失」两种情形。
+
 ---
 
 ## 8. 日志与故障排查

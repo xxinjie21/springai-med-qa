@@ -94,7 +94,9 @@ class EmbeddingModelContextTest {
         OpenAiEmbeddingProperties properties = context.getBean(OpenAiEmbeddingProperties.class);
 
         assertThat(properties.getEmbeddingsPath()).isEqualTo("/v1/embeddings");
-        assertThat(properties.getMetadataMode()).isEqualTo(MetadataMode.EMBED);
+        // NONE, not EMBED (D45): EMBED is Spring AI's own default and splices every metadata key -
+        // including the tenant/dept/patient isolation tags - into the embedded text.
+        assertThat(properties.getMetadataMode()).isEqualTo(MetadataMode.NONE);
         assertThat(properties.getOptions().getModel()).isEqualTo("text-embedding-3-small");
         assertThat(properties.getOptions().getDimensions()).isEqualTo(1536);
     }

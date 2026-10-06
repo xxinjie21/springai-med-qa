@@ -77,6 +77,23 @@ public class EmbeddingModelConfig {
     public static final String PROJECT_HEADER = "OpenAI-Project";
 
     /**
+     * Metadata mode the embedding model falls back to when
+     * {@code spring.ai.openai.embedding.metadata-mode} is not configured.
+     *
+     * <p>Deliberately {@link MetadataMode#NONE}, and deliberately <em>not</em> Spring AI's own
+     * default ({@link MetadataMode#EMBED}, the field initializer of
+     * {@code OpenAiEmbeddingProperties}): {@code OpenAiEmbeddingModel.embed(Document)} formats the
+     * document through this mode and {@code DefaultContentFormatter} reads {@code EMBED} as "every
+     * metadata key minus {@code excludedEmbedMetadataKeys}", so {@code EMBED} would splice the
+     * {@code tenant_id} / {@code dept_id} / {@code patient_id} isolation tags into the embedded
+     * text — polluting similarity and writing the isolation labels into the vector. A deployment
+     * that clears or omits the property has to fail safe, not inherit the framework default (D45).
+     * {@code EmbeddingMetadataContractTest} pins the effective configuration value to this
+     * constant.</p>
+     */
+    public static final MetadataMode SAFE_METADATA_MODE = MetadataMode.NONE;
+
+    /**
      * Creates the OpenAI-compatible API client used by the embedding model.
      *
      * @param connectionProperties         connection-wide {@code spring.ai.openai.*} settings, must
@@ -180,6 +197,11 @@ public class EmbeddingModelConfig {
     /**
      * Builds the embedding model and validates it against the vector index topology.
      *
+     * <p>The metadata mode is taken from the official property and falls back to
+     * {@link #SAFE_METADATA_MODE} when it is absent, so a deployment can never silently inherit
+     * Spring AI's {@code EMBED} default and start writing the isolation tags into the vector
+     * (D45).</p>
+     *
      * @param openAiApi           API client, must not be {@code null}
      * @param embeddingProperties embedding options, must not be {@code null}
      * @param medProperties       project-side tuning, must not be {@code null}
@@ -214,7 +236,7 @@ public class EmbeddingModelConfig {
 
         MetadataMode metadataMode = embeddingProperties.getMetadataMode() != null
                 ? embeddingProperties.getMetadataMode()
-                : MetadataMode.EMBED;
+                : SAFE_METADATA_MODE;
         return new OpenAiEmbeddingModel(openAiApi, metadataMode, options, retryTemplate, observationRegistry);
     }
 

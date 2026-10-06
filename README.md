@@ -354,6 +354,42 @@ Stack：窗口 4 条 vs 分表 10 行）守住。单组件测试看不见这个�
 `ChatSessionMapper.selectById` 解析会话所属患者（会话是「这条消息属于谁」的唯一权威），消息自带的
 `med.patientId` 优先；会话不存在或没有患者则拒绝写入（`STORAGE_ERROR`，绝不落一条无法归属的病历）。
 
+#### 检索元数据不进入向量文本（D45）
+
+`spring.ai.openai.embedding.metadata-mode` 曾经是 `EMBED`，而它上方那行注释写着「metadata tags stay
+out of the vector」——注释与代码正好相反，又是阶段 8/9 反复出现的那一类偏差，只不过这次偏差落在
+**数据**上。
+
+字节码级核实 Spring AI 1.0.0：`OpenAiEmbeddingModel.embed(Document)` 先把文档交给
+`document.getFormattedContent(metadataMode)`，而 `DefaultContentFormatter` 把 `EMBED` 解释为
+「**全部元数据键** 减去 `excludedEmbedMetadataKeys`」。于是 `tenant_id` / `dept_id` / `patient_id`
+三个隔离标签被一并拼进送进 embedding 接口的文本：相似度被标签污染，隔离标签本身也被写进了向量。
+更麻烦的是 `EMBED` 同时是 Spring AI `OpenAiEmbeddingProperties.metadataMode` 字段的**默认值**，所以
+「这个键没配」并不等于安全。
+
+D45 把这条规则改成代码事实：
+
+- `metadata-mode: NONE`：只嵌入文档正文，标签留在 JSON 值里。RediSearch 仍按
+  `med.rag.vector-store.metadata-fields` 把三个标签索引成 `TAG` 字段，所以**按科室/患者过滤的能力
+  一点没少**——变的只是「进向量的是哪段文本」。
+- **刻意不做成环境变量**：部署方不应该有能力把隔离标签重新塞回向量里。
+- `EmbeddingModelConfig.SAFE_METADATA_MODE = NONE`：属性缺失（被清空、被误删）时回落到 `NONE`，而不是
+  继承 Spring AI 的 `EMBED` 默认值——「没配」必须 fail-safe，不能 fail-open。
+
+跨组件契约由 `EmbeddingMetadataContractTest` 守住：它用 Spring Boot 自己的 `YamlPropertySourceLoader`
++ `Binder` 绑定**实际生效值**（逐个 profile 叠加，因此任何 profile 都无法把 `EMBED` 重新引回来），并断言
+
+1. 生效值是 `NONE`，且等于代码里的回落常量；
+2. `med.rag.vector-store.metadata-fields` 仍声明三个 `TAG` 字段、`med.rag.index.expected-tag-fields`
+   仍与之一致（否则 D37 的探针会把重建好的索引报成漂移）；
+3. **用真实的 Spring AI formatter 演示差别**：同一个 `Document` 在 `NONE` 下的嵌入文本不含任何标签，
+   在 `EMBED` 下三个标签全在——「为什么这个配置值重要」不再依赖注释；
+4. 守卫本身会拒绝 `EMBED`、也会拒绝「属性缺失」，即它不可能空转。
+
+按项目惯例，这条守卫**先被亲眼看过它变红**：把 `application.yml` 改回 `EMBED` 后 3 个用例失败
+（`effectiveMetadataModeEmbedsTextOnly` / `noProfileReintroducesEmbeddedMetadata` /
+`configuredModeMatchesTheCodeFallback`），还原后重跑全绿。
+
 ---
 
 ## 错误码
@@ -470,7 +506,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -649,7 +685,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
-| 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 进行中（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45 检索元数据不进入向量文本、D46 记忆层注释校正待做） |
+| 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 进行中（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46 记忆层注释校正待做） |
 
 ---
 

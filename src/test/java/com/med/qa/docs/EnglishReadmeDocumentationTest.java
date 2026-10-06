@@ -361,6 +361,20 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D45 rule that isolation metadata stays out of the vector")
+    void apiChapterDocumentsTheEmbeddingMetadataRule() {
+        // The defect this guards: the YAML said EMBED under a comment claiming the tags stay out of
+        // the vector, so the isolation tags were spliced into the embedded text.
+        assertThat(english).contains("metadata-mode: NONE");
+        assertThat(english).contains("EmbeddingMetadataContractTest");
+        assertThat(english).contains("SAFE_METADATA_MODE");
+        assertThat(english).contains("DefaultContentFormatter");
+        assertThat(english).contains("excludedEmbedMetadataKeys");
+        // Turning EMBED off must never be described as costing the tag filter.
+        assertThat(english).contains("med.rag.vector-store.metadata-fields");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

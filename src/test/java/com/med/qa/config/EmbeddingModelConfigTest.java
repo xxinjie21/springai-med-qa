@@ -287,14 +287,20 @@ class EmbeddingModelConfigTest {
         }
 
         @Test
-        @DisplayName("embeds document text only when no metadata mode is configured")
-        void defaultsToEmbedMetadataMode() {
+        @DisplayName("a missing metadata mode falls back to embedding the document text alone (D45)")
+        void defaultsToMetadataFreeMode() {
+            // Spring AI's own default for this property is EMBED, which DefaultContentFormatter reads
+            // as "every metadata key minus the excluded ones" - for this project that means the
+            // tenant_id / dept_id / patient_id isolation tags are spliced into the embedded text.
+            // A cleared or absent property must therefore fall back to NONE, not inherit it (D45).
             embedding.setMetadataMode(null);
 
             OpenAiEmbeddingModel model = EmbeddingModelConfig.buildEmbeddingModel(api, embedding,
                     medProperties, RetryUtils.DEFAULT_RETRY_TEMPLATE, ObservationRegistry.NOOP);
 
-            assertThat(ReflectionTestUtils.getField(model, "metadataMode")).isEqualTo(MetadataMode.EMBED);
+            assertThat(ReflectionTestUtils.getField(model, "metadataMode"))
+                    .isEqualTo(MetadataMode.NONE)
+                    .isEqualTo(EmbeddingModelConfig.SAFE_METADATA_MODE);
         }
 
         @Test

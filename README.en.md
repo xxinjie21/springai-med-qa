@@ -361,6 +361,49 @@ written (the session is the only authority on who a message belongs to); a patie
 message itself wins, and an unknown session or a session without a patient refuses the write with
 `STORAGE_ERROR` rather than storing an unattributable medical record.
 
+#### Keeping isolation metadata out of the embedded text (D45)
+
+`spring.ai.openai.embedding.metadata-mode` used to be `EMBED`, directly under a comment claiming
+"metadata tags stay out of the vector" — the comment and the code contradicted each other, the same
+deviation phases 8 and 9 keep removing, except this time the deviation was in the **data**.
+
+Verified at bytecode level against Spring AI 1.0.0: `OpenAiEmbeddingModel.embed(Document)` first
+hands the document to `document.getFormattedContent(metadataMode)`, and `DefaultContentFormatter`
+reads `EMBED` as "**every** metadata key minus `excludedEmbedMetadataKeys`". So `tenant_id`,
+`dept_id` and `patient_id` were spliced into the text sent to the embedding endpoint: similarity
+was polluted by the tags, and the isolation labels were themselves written into the vector. Worse,
+`EMBED` is also the field initializer of Spring AI's own `OpenAiEmbeddingProperties.metadataMode`,
+so "this key is not configured" is not the same thing as safe.
+
+D45 turns the rule into a code fact:
+
+- `metadata-mode: NONE` embeds the document text alone; the tags stay in the JSON value. RediSearch
+  still indexes all three as `TAG` fields per `med.rag.vector-store.metadata-fields`, so
+  **department/patient filtering loses nothing** — only the text that reaches the vector changes.
+- **Deliberately not an environment variable**: a deployment must not be able to switch the
+  isolation tags back into the vector.
+- `EmbeddingModelConfig.SAFE_METADATA_MODE = NONE`, the fallback when the property is absent
+  (cleared, or deleted): "not configured" has to fail safe rather than inherit Spring AI's `EMBED`
+  default.
+
+The cross-component contract lives in `EmbeddingMetadataContractTest`. It binds the **effective**
+value through Spring Boot's own `YamlPropertySourceLoader` and `Binder` (overlaying every profile,
+so no profile can bring `EMBED` back) and asserts that
+
+1. the effective value is `NONE` and equals the code's fallback constant;
+2. `med.rag.vector-store.metadata-fields` still declares the three `TAG` fields and
+   `med.rag.index.expected-tag-fields` still matches them (otherwise the D37 probe would report a
+   freshly rebuilt index as drifted);
+3. **the difference is demonstrated against the real Spring AI formatter**: the same `Document`
+   yields an embedded text with no tags at all under `NONE` and with all three under `EMBED`, so
+   "why this setting matters" no longer rests on a comment;
+4. the guard rejects `EMBED` and rejects a missing value, i.e. it cannot pass vacuously.
+
+As this project requires, the guard was **seen to fail first**: switching `application.yml` back to
+`EMBED` turned 3 cases red (`effectiveMetadataModeEmbedsTextOnly`,
+`noProfileReintroducesEmbeddedMetadata`, `configuredModeMatchesTheCodeFallback`), and the file was
+restored and re-verified green.
+
 ---
 
 ## Error codes
@@ -480,7 +523,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), and `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43), and `EmbeddingMetadataContractTest` binds the effective `metadata-mode` and demonstrates with the real Spring AI formatter whether the tags enter the vector (D45). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -846,7 +889,7 @@ the loop of code, unit tests, commit and push:
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
-| Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | In progress (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45 keeping isolation metadata out of the embedded text and D46 documentation corrections are still to come) |
+| Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | In progress (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46 documentation corrections are still to come) |
 
 ---
 

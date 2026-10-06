@@ -392,6 +392,21 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D45 rule that isolation metadata stays out of the vector")
+    void apiChapterDocumentsTheEmbeddingMetadataRule() {
+        // The defect this guards: the YAML said EMBED under a comment claiming the tags stay out of
+        // the vector, so tenant_id / dept_id / patient_id were spliced into the embedded text. The
+        // README has to name the mode, the mechanism and the test that demonstrates the difference.
+        assertThat(readme).contains("metadata-mode: NONE");
+        assertThat(readme).contains("EmbeddingMetadataContractTest");
+        assertThat(readme).contains("SAFE_METADATA_MODE");
+        assertThat(readme).contains("DefaultContentFormatter");
+        assertThat(readme).contains("excludedEmbedMetadataKeys");
+        // Turning EMBED off must never be described as costing the tag filter.
+        assertThat(readme).contains("med.rag.vector-store.metadata-fields");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

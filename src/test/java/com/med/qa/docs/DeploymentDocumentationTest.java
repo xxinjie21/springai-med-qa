@@ -203,6 +203,22 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D45 embedding-metadata rule and its triage command")
+    void embeddingMetadataRuleIsDocumented() {
+        // What an operator must be able to answer from the handbook alone: which mode the deployment
+        // must run, why "not configured" is not safe, and how to read the value out of the image
+        // (actuator/env is deliberately not exposed, so the handbook has to name the real path).
+        assertThat(handbook).contains("7.7");
+        assertThat(handbook).contains("metadata-mode");
+        assertThat(handbook).contains("SAFE_METADATA_MODE");
+        assertThat(handbook).contains("EmbeddingMetadataContractTest");
+        assertThat(handbook).contains("excludedEmbedMetadataKeys");
+        assertThat(handbook).contains("BOOT-INF/classes/application.yml");
+        // Turning EMBED off must never be described as costing the tag filter.
+        assertThat(handbook).contains("med.rag.vector-store.metadata-fields");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

@@ -62,9 +62,17 @@ spring:
       api-key: ${OPENAI_API_KEY:}
       embedding:
         embeddings-path: ${OPENAI_EMBEDDINGS_PATH:/v1/embeddings}
-        # Only the document text is embedded; metadata tags stay out of the vector so they can be
-        # used as filters without polluting similarity.
-        metadata-mode: EMBED
+        # NONE is a hard requirement, not a tuning knob (D45). Spring AI 1.0.0's
+        # OpenAiEmbeddingModel.embed(Document) formats the document through this mode, and
+        # DefaultContentFormatter reads EMBED as "every metadata key minus excludedEmbedMetadataKeys"
+        # - so EMBED splices tenant_id/dept_id/patient_id into the embedded text, polluting
+        # similarity and pushing the isolation tags into the vector. NONE embeds the document text
+        # alone; the tags stay in the JSON value, where RediSearch still indexes them as TAG fields
+        # (med.rag.vector-store.metadata-fields), so scoped retrieval keeps working.
+        # Deliberately NOT an environment variable: a deployment must not be able to switch the
+        # isolation tags back into the vector. EmbeddingMetadataContractTest pins the effective value
+        # (EMBED is also Spring AI's own default, so simply deleting this line is a regression too).
+        metadata-mode: NONE
         options:
           model: ${MED_EMBEDDING_MODEL:text-embedding-3-small}
           dimensions: ${MED_EMBEDDING_DIMENSIONS:1536}

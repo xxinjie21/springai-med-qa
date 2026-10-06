@@ -247,6 +247,18 @@ springai-med-qa/
 | D45 | 检索元数据不进入向量文本 | `spring.ai.openai.embedding.metadata-mode` 由 `EMBED` 改为 `NONE`——Spring AI 1.0.0 的 `OpenAiEmbeddingModel.embed(Document)` 走 `getFormattedContent(metadataMode)`，`DefaultContentFormatter.metadataFilter` 把 `EMBED` 解释为「全部键减去 `excludedEmbedMetadataKeys`」，因此现配置把 `tenant_id`/`dept_id`/`patient_id` 一并拼进 embedding 输入，既污染相似度又把隔离标签泄进向量；配套契约测试用 `Binder` 绑定**实际生效值**并断言为 `NONE`，再断言 `metadata-fields` 的 TAG 项仍齐全（过滤能力不因 `NONE` 而丢失） | `fix(rag): stop embedding isolation metadata into the vector` |
 | D46 | 记忆层注释与部署前置条件校正 | P2-1/P2-3/P2-4：`MedChatMemoryRepository` / `RedisMessageCache` 的窗口语义与 `med.cache.max-messages` 注释对齐（D44 已顺手改掉「读路径返回整段会话」与两处 yml 注释，本日只收剩余项）；`docs/DEPLOYMENT.md` 补「`MED_CHAT_MAX_MESSAGES` 只影响送进模型的消息条数，不影响落库轨迹」的运维说明，并校正部署前置条件表述 | `docs(memory): correct the memory tier documentation` |
 
+> 阶段 9 进度：**D44 与 D45 已完成**，仅剩 D46（记忆层注释与部署前置条件校正）。D44 收敛 P1-2 / P1-3，
+> D45 收敛 P1-1，两条都按项目惯例**先被亲眼看过它变红**。
+>
+> D45 由两处改动构成：`application.yml` 的 `metadata-mode` 由 `EMBED` 改为 `NONE`（`EMBED` 同时是 Spring AI
+> `OpenAiEmbeddingProperties.metadataMode` 的**框架默认值**，所以「键缺失」同样不安全），以及
+> `EmbeddingModelConfig.SAFE_METADATA_MODE` 把代码侧回落值同步收敛为 `NONE`；跨组件契约
+> `EmbeddingMetadataContractTest` 用 `YamlPropertySourceLoader` + `Binder` 绑定**实际生效值**（逐 profile
+> 叠加），并用真实 `Document#getFormattedContent` 演示同一个文档在 `NONE` 与 `EMBED` 下嵌入文本的差别，
+> 从而把「为什么这个配置值重要」从注释变成可执行断言。
+>
+> **D46 之后没有 D47**：下次运行必须先扩写本路线图再实现，不得自造迭代编号。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）
