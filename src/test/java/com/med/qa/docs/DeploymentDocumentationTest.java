@@ -219,6 +219,23 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D46 prerequisites: the utf8mb4 default and the H2 console")
+    void deploymentPrerequisitesAreDocumented() {
+        // Both are silent failures: a non-utf8mb4 database stores Chinese clinical text as mojibake
+        // without an error, and an H2 console would be an unauthenticated SQL console on the
+        // production classpath. The handbook has to state both and say how to verify them.
+        assertThat(handbook).contains("utf8mb4");
+        assertThat(handbook).contains("SHOW CREATE DATABASE");
+        assertThat(handbook).contains("characterEncoding");
+        assertThat(handbook).contains("UnsupportedEncodingException");
+        assertThat(handbook).contains("spring.h2.console");
+        assertThat(handbook).contains("H2 Web Console");
+        // The handbook's claims are owned by other files; that split is asserted in
+        // DeploymentPrerequisiteTest rather than duplicated here.
+        assertThat(handbook).contains("DeploymentPrerequisiteTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

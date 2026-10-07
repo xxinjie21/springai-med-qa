@@ -42,6 +42,36 @@ flowchart LR
 > Redis **必须**是 Redis Stack（或挂载 RediSearch/RedisJSON 模块）。普通 Redis 无法创建向量索引，
 > `RedisVectorStore` 初始化会失败。
 
+**MySQL 字符集是硬前置条件，不是可选项（D46）**
+
+Flyway V1 的建表语句**刻意不 pin `ENGINE` / `DEFAULT CHARSET`**——同一份脚本还要跑在 H2 的 MySQL 兼容模式
+（测试替身）上，所以它只写可移植的列定义。代价是**库的默认字符集必须由部署方保证为 `utf8mb4`**：
+
+- Compose 部署由两处兜住：`docker-compose.yml` 的 `--character-set-server=utf8mb4
+  --collation-server=utf8mb4_unicode_ci`，以及 `docker/mysql/init/01-create-db.sql` 建库时的字符集声明。
+- **自建 MySQL 若库默认不是 `utf8mb4`，中文病历会静默存成乱码**——不报错、不告警、健康检查全绿，
+  只有医生在问诊记录里看到问号。上线前请核对：
+
+  ```sql
+  SHOW VARIABLES LIKE 'character_set_server';   -- 期望 utf8mb4
+  SHOW CREATE DATABASE med_qa;                  -- 期望 DEFAULT CHARACTER SET utf8mb4
+  ```
+
+- 连接串一侧是另一个陷阱：`characterEncoding` 取的是 **Java** 字符集名，必须写 `UTF-8`。
+  写成 MySQL 侧的 `utf8mb4` 会让 Hikari 建池时抛 `UnsupportedEncodingException: utf8mb4`，
+  服务连不上库（D33 真机冒烟测试抓到，现由 `ShardingRuleConfigTest` / `MedMigrationPropertiesTest` 守住）。
+
+**H2 留在生产 classpath 上是已记录的权衡（D46）**
+
+`pom.xml` 里 H2 的 scope 是 `runtime` 而**不是** `test`：收窄为 `test` 会让 ShardingSphere-JDBC
+在启动时找不到驱动类而失败。它只作为测试替身存在，因此：
+
+- **H2 Web Console 在任何配置文件中都没有开启**，`spring.h2.console.*` 在整个仓库里不存在，也不允许开启——
+  那是未鉴权的进程内 SQL 控制台，等于把数据库直接暴露给任何能访问该端口的人；
+- 这条约束由 `DeploymentPrerequisiteTest` 直接扫描 Spring 自己的配置文件（`src/main/resources` 下的
+  `application*.yml` / `application*.yaml` / `application*.properties`）守住，而不是靠"记得别开"——
+  它把 YAML 里的嵌套写法与点号写法归一成同一个属性名，所以换个写法也绕不过去。
+
 **端口占用**
 
 | 端口 | 服务 | 说明 |
@@ -405,6 +435,11 @@ livenessProbe:
 > 独立部署（不用 Compose）时，请自行执行 `docker/mysql/init/01-create-db.sql` 等价语句；
 > 表结构无需手工建，Flyway 会迁移。
 
+> **字符集（D46）**：V1 的 DDL 不含 `ENGINE` / `DEFAULT CHARSET`，所以**库的默认字符集必须是
+> `utf8mb4`**（见第 1 节）。独立部署时，等价建库语句里也要显式写
+> `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`，否则中文病历会**静默**乱码——这是
+> 「不报错、不告警、健康检查全绿」的一类故障，只能靠上线前核对字符集变量发现。
+
 **迁移为什么直连物理 MySQL，而不是走 `spring.datasource`：** `spring.datasource` 指向的是
 ShardingSphere 代理，它把 `med_message_0..15` 这 16 张物理分表**藏起来**只暴露逻辑表
 `med_message`；而 V1 迁移脚本要建的正是这 16 张物理表。经代理执行会连续失败两次：
@@ -656,6 +691,13 @@ docker compose --profile observability up -d
 - 跨组件契约：`ChatMemoryWindowIntegrationTest`（离线，窗口 2 条 vs 轨迹 5 条）与
   `MedStorageAndLockIntegrationTest#memoryWindowTrimsButTranscriptKeepsEveryTurn`（真实 MySQL +
   Redis Stack，窗口 4 条 vs 分表 10 行）。
+- **口径与代码注释同源（D46）**：这三层的行为写在三个类的 javadoc 里，改行为时请一并改注释——
+  `MedChatMemoryRepository`（`findAll` 返回的是有界窗口、`reload` 是全仓库唯一返回完整轨迹的读）、
+  `RedisMessageCache#windowSize()`（读路径回源时的截断上界）、
+  `MedCacheProperties`（`med.cache.max-messages` 只约束缓存，不约束轨迹）。
+  `reload` 虽然返回全量，但它回填的缓存仍会被原生 `LTRIM` 裁到窗口内；
+  而 **`MED_CACHE_MAX_MESSAGES=0` 会同时解除缓存截断与回源截断**，等于把整段历史交给模型 prompt——
+  这是运维风险，不是常规调优项。
 
 ### 7.7 隔离标签不进入向量文本（D45）
 
@@ -755,6 +797,8 @@ docker compose exec -T mysql mysql -uroot -p"$MED_MYSQL_ROOT_PASSWORD" med_qa < 
 - [ ] LLM / Embedding 出网走院内网关，密钥由密钥管理系统注入
 - [ ] 客户端不要依赖请求体里的身份字段：`/api/chat/stream` 的 tenant/dept/patientId 只是**一致性声明**，与 API Key 不一致即 403（D41，见 10.1）
 - [ ] 运维脚本不要用「按 documentId 删除」的旧姿势：`/api/rag/documents/delete` 已**只支持按隔离 scope 删除**，且部门级删除必须显式带 `confirmDepartmentWide=true`（D42，见 10.2）
+- [ ] **不开启 H2 Web Console**（`spring.h2.console.*` 不得出现在任何配置文件中）；H2 只是 `runtime` scope 的测试替身，收窄为 `test` 会让 ShardingSphere 启动失败（D46，见第 1 节）
+- [ ] **MySQL 库默认字符集为 `utf8mb4`**，并在上线前用 `SHOW CREATE DATABASE med_qa` 核对；连接串 `characterEncoding` 必须写 Java 字符集名 `UTF-8`（D46，见第 1 节）
 
 ### 10.1 流式问诊的身份来源与拒绝语义（D41）
 
@@ -826,7 +870,7 @@ docker compose exec -T mysql mysql -uroot -p"$MED_MYSQL_ROOT_PASSWORD" med_qa < 
 |---|---|
 | JVM | 容器内已设 `MaxRAMPercentage=75.0` + `ExitOnOutOfMemoryError`，按 cgroup 限制自动伸缩 |
 | MySQL 连接池 | `sharding/med-sharding.yaml`：`minimumIdle=4` / `maximumPoolSize=32`，按并发问诊量调整 |
-| Redis 缓存窗口 | `MED_CACHE_MAX_MESSAGES` 控制单会话缓存条数；读 miss 会自动回源 MySQL 并回填 |
+| Redis 缓存窗口 | `MED_CACHE_MAX_MESSAGES` 控制单会话缓存条数；读 miss 会自动回源 MySQL 并回填。**置 `0` 会同时解除缓存与回源截断**，等于把整段历史交给模型 prompt（D46，见 7.6） |
 | 会话锁 | `MED_LOCK_LEASE_TIME=0`（看门狗）适配慢 LLM 往返；崩溃节点最迟 `MED_LOCK_WATCHDOG_TIMEOUT` 释放 |
 | 向量检索 | 语量小可切 `MED_RAG_VECTOR_ALGORITHM=FLAT` 做精确检索；量大保持 `HNSW` |
 | 限流 | 默认 10 次/秒/调用方；可按接口用 `@RateLimit(rate=..., durationSeconds=...)` 细调 |

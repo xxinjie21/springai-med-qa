@@ -404,6 +404,42 @@ As this project requires, the guard was **seen to fail first**: switching `appli
 `noProfileReintroducesEmbeddedMetadata`, `configuredModeMatchesTheCodeFallback`), and the file was
 restored and re-verified green.
 
+#### Window semantics and deployment prerequisites corrected (D46)
+
+D46 adds no behaviour; it aligns the last three places where the comment promised something the code
+did not do, each with its own guard test:
+
+- **Window semantics (the residual P2 item)**: the javadoc of
+  `MedChatMemoryRepository#findAll` still said the read path "replays the whole transcript from
+  MySQL", contradicting the paragraph right below it that bounds the answer by
+  `med.cache.max-messages`. It now states that `findAll` returns a **bounded window** (the cached
+  window on a hit; on a miss the transcript replayed from MySQL and truncated to that window) and
+  that `reload` is the repository's **only** read that returns the whole transcript (for verification
+  and repair, and even then the cache it warms is trimmed by the native `LTRIM`).
+  `RedisMessageCache`, `MedCacheProperties` and `MedChatMemoryProperties` now say the same thing:
+  `med.cache.max-messages` bounds the cache and a cold-cache replay, `med.chat.max-messages` bounds
+  the prompt, and **neither bounds the stored transcript** — while `MED_CACHE_MAX_MESSAGES=0`
+  disables both bounds at once (an operational risk, not a tuning knob).
+- **Deployment prerequisites (P2-3 and P2-4)**: section 1 of `docs/DEPLOYMENT.md` promotes "the MySQL
+  database default charset must be `utf8mb4`" from a passing remark to an **explicit prerequisite** —
+  the V1 DDL deliberately omits `DEFAULT CHARSET` so the same script can run against H2, Compose
+  covers it with `--character-set-server=utf8mb4`, and a self-hosted MySQL that does not will store
+  Chinese clinical text as **silent mojibake**. It also records that `characterEncoding` must be the
+  **Java** charset name `UTF-8`. The same section explains why H2 stays on the production classpath
+  (`runtime` scope: narrowing it to `test` breaks ShardingSphere startup) and that the **H2 console is
+  not enabled in any configuration file and must not be**.
+- **The privacy layer contradicting itself (P2-1)**: `MaskType`, `privacy/package-info` and
+  `@Desensitize` all claimed that no mask pattern is hand-written here, while
+  `MaskType.maskKeepEdges` is exactly that. They now say what is true: phone numbers and national ID
+  cards are delegated to Hutool, and the medical record number uses a keep-edges mask because Hutool
+  ships no strategy for it.
+
+Guards: `MemoryWindowSemanticsTest` (the window contract plus **the retired wording must not come
+back**), `PrivacyMaskingDocumentationTest` (the absolute claims must not reappear) and
+`DeploymentPrerequisiteTest` (the prerequisites are in the handbook, a scan of Spring's own
+configuration files (`application*`) proves none of them enables the H2 console, `pom.xml` still keeps
+H2 at `runtime` scope, and compose really pins `utf8mb4`).
+
 ---
 
 ## Error codes
@@ -889,7 +925,7 @@ the loop of code, unit tests, commit and push:
 | Phase 6, production startup and real middleware | D34 to D36 | Done (D34 migration chain, D35 CI integration stage, D36 RAG retrieval verification) |
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
-| Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | In progress (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46 documentation corrections are still to come) |
+| Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | Complete (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46: window-semantics comments aligned, deployment prerequisites (utf8mb4, H2 console) corrected, and the privacy-layer comments fixed, guarded by `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`) |
 
 ---
 

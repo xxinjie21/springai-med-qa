@@ -17,6 +17,13 @@ import java.time.Duration;
  *
  * <p>Setters validate eagerly so an operator typo (a negative TTL, a negative window) fails the
  * application context at startup instead of silently degrading the cache at runtime.</p>
+ *
+ * <p><b>What {@code max-messages} does and does not bound (D44).</b> It is the size of the Redis
+ * window only. MySQL keeps the full consultation transcript and is append-only, so lowering this
+ * value narrows a cache and shortens a cold-cache replay — it never deletes a turn. The prompt is
+ * bounded separately, and more tightly, by {@code med.chat.max-messages}. Setting this to
+ * {@code 0} is the one way to make the read path unbounded; see
+ * {@link #setMaxMessages(int)}.</p>
  */
 @ConfigurationProperties(prefix = "med.cache")
 public class MedCacheProperties {
@@ -24,7 +31,7 @@ public class MedCacheProperties {
     /** Default time-to-live applied to every cached session key. */
     public static final Duration DEFAULT_TTL = Duration.ofMinutes(30);
 
-    /** Default number of most recent messages kept per session key. */
+    /** Default number of most recent messages kept per session key (a cache bound, not a transcript bound). */
     public static final int DEFAULT_MAX_MESSAGES = 200;
 
     private Duration ttl = DEFAULT_TTL;
@@ -58,7 +65,8 @@ public class MedCacheProperties {
     /**
      * Returns the size of the cached message window.
      *
-     * @return the maximum number of messages kept per session, {@code 0} meaning unbounded
+     * @return the maximum number of messages kept per session key — the cached tail only, never the
+     *         durable transcript — {@code 0} meaning unbounded
      */
     public int getMaxMessages() {
         return maxMessages;
@@ -66,6 +74,12 @@ public class MedCacheProperties {
 
     /**
      * Sets the size of the cached message window.
+     *
+     * <p>{@code 0} disables trimming, and because the read path uses the same value as its
+     * back-fill bound ({@code RedisMessageCache#windowSize()}) it also stops a cold-cache replay
+     * from being truncated — a long consultation would then hand its entire history to the model
+     * prompt. The durable transcript is unaffected either way; this is a prompt-size risk, so leave
+     * it at the default unless the deployment really wants an unbounded window.</p>
      *
      * @param maxMessages maximum messages kept per session key; {@code 0} disables trimming
      * @throws IllegalArgumentException if {@code maxMessages} is negative

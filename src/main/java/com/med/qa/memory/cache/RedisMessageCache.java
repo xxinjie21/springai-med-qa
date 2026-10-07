@@ -37,6 +37,16 @@ import java.util.concurrent.TimeUnit;
  * <p>Trimming to the configured window is delegated to the native Redis {@code LTRIM} command; no
  * eviction policy is implemented in Java.</p>
  *
+ * <h2>Tier contract — what the window does and does not bound (D44)</h2>
+ * <p>This class caches a <em>bounded window of the recent tail</em>, never the consultation: MySQL
+ * holds every message ever written and is append-only, while the cached list is trimmed on every
+ * write. {@link #windowSize()} is the same bound the read path applies when it has to replay a
+ * session from MySQL, so the cache can never widen what reaches the model prompt, and lowering
+ * {@code med.cache.max-messages} shrinks a cache rather than losing a turn. The one exception is
+ * {@code med.cache.max-messages: 0}, which switches trimming off and therefore unbounds both the
+ * cache and that replay — a deliberate operator risk, documented on
+ * {@link MedCacheProperties#setMaxMessages(int)}, not a routine tuning knob.</p>
+ *
  * <h2>Failure semantics</h2>
  * <ul>
  *   <li><b>Reads degrade to a miss.</b> MySQL is the source of truth, so a Redis outage or a
@@ -140,6 +150,10 @@ public class RedisMessageCache {
 
     /**
      * Replaces the whole cached window of a session, typically to back-fill it from MySQL.
+     *
+     * <p>A list longer than the configured window is legal and is trimmed to its newest
+     * {@code max-messages} elements by the same native {@code LTRIM} the append path uses, so a caller
+     * replaying a whole transcript cannot blow the window open.</p>
      *
      * <p>An empty list is a legal argument and simply drops the key, so a session known to hold no
      * message is not re-read from MySQL on every request.</p>

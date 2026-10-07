@@ -22,10 +22,12 @@ import java.lang.annotation.Target;
  * }
  * }</pre>
  *
- * <p>The masking strategy is delegated to {@link MaskType} and ultimately to Hutool's
- * {@code DesensitizedUtil}; no hand-written masking logic lives in this project. Place the
- * annotation on a bean property (field or getter) of type {@code String}. A {@code null} value is
- * serialized as JSON {@code null} and left untouched.</p>
+ * <p>The masking strategy is delegated to {@link MaskType}: phone numbers and national ID cards go to
+ * Hutool's {@code DesensitizedUtil}, while the medical record number uses the enum's own keep-edges
+ * mask because Hutool has no strategy for it. That is the only masking logic written here; an earlier
+ * version of this javadoc denied it, and the claim was corrected in D46. Place the annotation on a
+ * bean property (field or getter) of type {@code String}. A {@code null} value is serialized as JSON
+ * {@code null} and left untouched.</p>
  *
  * <p>This annotation carries {@link JsonSerialize} through {@link JacksonAnnotationsInside}, so no
  * explicit serializer registration is required — Jackson picks up {@link DesensitizeSerializer}

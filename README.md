@@ -390,6 +390,32 @@ D45 把这条规则改成代码事实：
 （`effectiveMetadataModeEmbedsTextOnly` / `noProfileReintroducesEmbeddedMetadata` /
 `configuredModeMatchesTheCodeFallback`），还原后重跑全绿。
 
+#### 窗口语义与部署前置条件校正（D46）
+
+D46 不新增行为，只把最后三处「注释承诺 ≠ 代码事实」对齐，并各配一条守护测试：
+
+- **窗口语义（P2 残留）**：`MedChatMemoryRepository#findAll` 的 javadoc 仍写着读路径会「把整段轨迹从
+  MySQL 重放」，与紧随其后那段「答案受 `med.cache.max-messages` 约束」自相矛盾。现在写清：
+  `findAll` 返回的是**有界窗口**（缓存命中即缓存窗口；未命中则回源 MySQL 后截断到窗口），
+  `reload` 才是全仓库**唯一**返回完整轨迹的读（供核查/修复，且它回填的缓存仍被原生 `LTRIM` 裁到窗口内）。
+  `RedisMessageCache` / `MedCacheProperties` / `MedChatMemoryProperties` 同步写明：
+  `med.cache.max-messages` 只约束缓存与冷缓存回源，`med.chat.max-messages` 只约束 prompt，
+  **两者都不约束落库轨迹**；并点名 `MED_CACHE_MAX_MESSAGES=0` 会同时解除这两种截断（运维风险）。
+- **部署前置条件（P2-3 / P2-4）**：`docs/DEPLOYMENT.md` 第 1 节把「MySQL 库默认字符集必须 `utf8mb4`」
+  从顺带说明升级为**显式前置条件**——V1 的 DDL 为兼容 H2 刻意不 pin `DEFAULT CHARSET`，Compose 靠
+  `--character-set-server=utf8mb4` 兜底，自建 MySQL 不保证就会**静默乱码**；连接串一侧
+  `characterEncoding` 必须写 Java 字符集名 `UTF-8`。同时说明 H2 留在生产 classpath 是 `runtime` scope
+  的权衡（收窄为 `test` 会让 ShardingSphere 启动失败），而 **H2 Console 在任何配置中都未开启、也不允许
+  开启**。
+- **脱敏层自我否定（P2-1）**：`MaskType` / `privacy/package-info` / `@Desensitize` 三处「本项目零手写
+  掩码」与 `MaskType.maskKeepEdges` 直接冲突，改为「手机号 / 身份证委托 Hutool，病历号因 Hutool 没有
+  对应策略而使用保留首尾掩码」——即只承认这一处例外，不再绝对化。
+
+守护测试：`MemoryWindowSemanticsTest`（窗口口径 + **已废弃措辞不得回归**）、
+`PrivacyMaskingDocumentationTest`（三处不得再出现绝对化措辞）、`DeploymentPrerequisiteTest`
+（前置条件已写入手册 + 扫描 Spring 配置文件（`application*`）证明没有开启 H2 Console + `pom.xml` 的 H2
+仍是 `runtime` + compose 确实 pin 了 `utf8mb4`）。
+
 ---
 
 ## 错误码
@@ -685,7 +711,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 6 生产启动与真实中间件验证 | D34–D36 | 已完成（D34 迁移链路、D35 CI 集成阶段、D36 RAG 检索验证） |
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
-| 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 进行中（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46 记忆层注释校正待做） |
+| 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
 
 ---
 

@@ -123,6 +123,13 @@ public class MedSpringAiChatMemoryRepository implements ChatMemoryRepository {
      * Loads a session's conversation from the two-tier repository and converts each persisted
      * message into a Spring AI {@link Message}, attaching the bookkeeping metadata needed later.
      *
+     * <p>The read is the repository's <em>bounded</em> window, not the whole transcript
+     * ({@code MedChatMemoryRepository#findAll}): a warm cache answers from the cached tail and a miss
+     * replays MySQL truncated to {@code med.cache.max-messages}. The official
+     * {@code MessageWindowChatMemory} then trims that to {@code med.chat.max-messages} before the
+     * model sees it, so this method is deliberately not the place where the durable record is read
+     * back in full (D44).</p>
+     *
      * @param conversationId must decode to {@code tenantId:deptId:sessionId}
      * @return the messages, oldest first; empty when the session holds none
      * @throws IllegalArgumentException if the conversation id is malformed

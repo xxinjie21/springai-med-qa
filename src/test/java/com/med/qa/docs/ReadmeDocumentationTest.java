@@ -407,6 +407,22 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D46 window-semantics and prerequisite corrections")
+    void apiChapterDocumentsTheD46Corrections() {
+        // The README has to admit that the read path is bounded (so nobody "fixes" it into replaying
+        // the whole transcript again), name the one value that unbounds it, and record the two
+        // deployment prerequisites and the privacy wording that were corrected.
+        assertThat(readme).contains("（D46）");
+        assertThat(readme).contains("MED_CACHE_MAX_MESSAGES=0");
+        assertThat(readme).contains("reload");
+        assertThat(readme).contains("maskKeepEdges");
+        assertThat(readme).contains("utf8mb4");
+        assertThat(readme).contains("MemoryWindowSemanticsTest");
+        assertThat(readme).contains("PrivacyMaskingDocumentationTest");
+        assertThat(readme).contains("DeploymentPrerequisiteTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

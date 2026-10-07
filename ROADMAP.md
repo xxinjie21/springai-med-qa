@@ -247,8 +247,8 @@ springai-med-qa/
 | D45 | 检索元数据不进入向量文本 | `spring.ai.openai.embedding.metadata-mode` 由 `EMBED` 改为 `NONE`——Spring AI 1.0.0 的 `OpenAiEmbeddingModel.embed(Document)` 走 `getFormattedContent(metadataMode)`，`DefaultContentFormatter.metadataFilter` 把 `EMBED` 解释为「全部键减去 `excludedEmbedMetadataKeys`」，因此现配置把 `tenant_id`/`dept_id`/`patient_id` 一并拼进 embedding 输入，既污染相似度又把隔离标签泄进向量；配套契约测试用 `Binder` 绑定**实际生效值**并断言为 `NONE`，再断言 `metadata-fields` 的 TAG 项仍齐全（过滤能力不因 `NONE` 而丢失） | `fix(rag): stop embedding isolation metadata into the vector` |
 | D46 | 记忆层注释与部署前置条件校正 | P2-1/P2-3/P2-4：`MedChatMemoryRepository` / `RedisMessageCache` 的窗口语义与 `med.cache.max-messages` 注释对齐（D44 已顺手改掉「读路径返回整段会话」与两处 yml 注释，本日只收剩余项）；`docs/DEPLOYMENT.md` 补「`MED_CHAT_MAX_MESSAGES` 只影响送进模型的消息条数，不影响落库轨迹」的运维说明，并校正部署前置条件表述 | `docs(memory): correct the memory tier documentation` |
 
-> 阶段 9 进度：**D44 与 D45 已完成**，仅剩 D46（记忆层注释与部署前置条件校正）。D44 收敛 P1-2 / P1-3，
-> D45 收敛 P1-1，两条都按项目惯例**先被亲眼看过它变红**。
+> 阶段 9 进度：**D44 / D45 / D46 全部完成，阶段 9 收尾**。D44 收敛 P1-2 / P1-3，D45 收敛 P1-1，
+> D46 收敛 P2-1 / P2-3 / P2-4，三条都按项目惯例**先被亲眼看过它变红**。
 >
 > D45 由两处改动构成：`application.yml` 的 `metadata-mode` 由 `EMBED` 改为 `NONE`（`EMBED` 同时是 Spring AI
 > `OpenAiEmbeddingProperties.metadataMode` 的**框架默认值**，所以「键缺失」同样不安全），以及
@@ -257,7 +257,22 @@ springai-med-qa/
 > 叠加），并用真实 `Document#getFormattedContent` 演示同一个文档在 `NONE` 与 `EMBED` 下嵌入文本的差别，
 > 从而把「为什么这个配置值重要」从注释变成可执行断言。
 >
-> **D46 之后没有 D47**：下次运行必须先扩写本路线图再实现，不得自造迭代编号。
+> D46 只做口径校正、不改行为，三处收尾：① `MedChatMemoryRepository#findAll` 的 javadoc 仍写着读路径
+> 「重放整段轨迹」，与紧随其后的「答案受 `med.cache.max-messages` 约束」自相矛盾——现已写明
+> `findAll` 返回有界窗口、`reload` 是全仓库唯一返回完整轨迹的读，`RedisMessageCache` /
+> `MedCacheProperties` / `MedChatMemoryProperties` 同步声明「`med.cache.max-messages` 只约束缓存与冷缓存
+> 回源、`med.chat.max-messages` 只约束 prompt、两者都不约束落库轨迹」，并点名
+> `MED_CACHE_MAX_MESSAGES=0` 会同时解除两种截断；② `docs/DEPLOYMENT.md` 把「MySQL 库默认字符集必须
+> `utf8mb4`」升级为显式前置条件（V1 DDL 为兼容 H2 刻意不 pin `DEFAULT CHARSET`；Compose 靠
+> `--character-set-server` 兜底；连接串 `characterEncoding` 必须写 Java 字符集名 `UTF-8`），并说明 H2
+> 留在生产 classpath 是 `runtime` scope 的权衡且 **H2 Console 在任何配置中都未开启**；③ 脱敏层三处
+> 「本项目零手写掩码」与 `MaskType.maskKeepEdges` 冲突，改为「手机号/身份证委托 Hutool、病历号因
+> Hutool 无对应策略而保留首尾」。守护测试：`MemoryWindowSemanticsTest`（含**已废弃措辞不得回归**的
+> 反向断言）、`DeploymentPrerequisiteTest`（扫描 `src/main/resources/**` 证明无配置开启 H2 Console、
+> `pom.xml` 的 H2 仍是 `runtime`、compose 确实 pin `utf8mb4`）、`PrivacyMaskingDocumentationTest`。
+>
+> **阶段 9 之后没有 D47**：下次运行必须先扩写本路线图（新增阶段 10）再实现，不得自造迭代编号。
+> 候选方向：把「文档/注释与代码行为一致」这类偏差做成更系统的检查、或补齐仍未覆盖的运行时能力。
 
 ---
 

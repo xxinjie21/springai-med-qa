@@ -375,6 +375,21 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D46 window-semantics and prerequisite corrections")
+    void apiChapterDocumentsTheD46Corrections() {
+        // The English README is a translation of the same handbook: it must carry the bounded-read
+        // statement, the value that unbounds it, the deployment prerequisites and the privacy fix.
+        assertThat(english).contains("D46");
+        assertThat(english).contains("MED_CACHE_MAX_MESSAGES=0");
+        assertThat(english).contains("reload");
+        assertThat(english).contains("maskKeepEdges");
+        assertThat(english).contains("utf8mb4");
+        assertThat(english).contains("MemoryWindowSemanticsTest");
+        assertThat(english).contains("PrivacyMaskingDocumentationTest");
+        assertThat(english).contains("DeploymentPrerequisiteTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

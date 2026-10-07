@@ -6,9 +6,10 @@ import cn.hutool.core.util.DesensitizedUtil;
  * Masking strategies for sensitive patient / contact fields (D24).
  *
  * <p>Each constant knows how to redact a single {@code String} value. Mobile phone numbers and
- * national ID cards delegate to the maintained Hutool {@link DesensitizedUtil} implementation; the
- * medical record number has no dedicated Hutool strategy, so a simple keep-edges mask is applied.
- * No mask pattern is hand-written in this project.</p>
+ * national ID cards delegate to the maintained Hutool {@link DesensitizedUtil} implementation. The
+ * medical record number has no dedicated Hutool strategy, so it uses {@link #maskKeepEdges} — the one
+ * masking pattern this project computes itself, which an earlier version of this javadoc denied
+ * (corrected in D46).</p>
  *
  * <p>Masking is presentation-only: the raw value is never altered or persisted by this enum.</p>
  */
@@ -42,7 +43,8 @@ public enum MaskType {
 
     /**
      * Keeps the leading and trailing characters of a value, replacing everything in between with
-     * asterisks. Used for identifiers (medical record numbers) that Hutool does not mask natively.
+     * asterisks. Used for identifiers (medical record numbers) that Hutool does not mask natively —
+     * the only masking pattern this project computes itself (D46).
      *
      * @param value raw value, never {@code null}
      * @param front number of leading characters to keep (must be {@code >= 0})

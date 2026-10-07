@@ -192,13 +192,17 @@ public class MedChatMemoryRepository {
     }
 
     /**
-     * Returns the conversation of a session in chronological order: the cached window when it is
-     * warm, otherwise the whole transcript replayed from MySQL and back-filled into the cache.
+     * Returns the most recent part of a session's conversation in chronological order: the cached
+     * window when it is warm, otherwise the tail of the durable transcript replayed from MySQL and
+     * back-filled into the cache.
      *
      * <p>Either way the answer is bounded by {@code med.cache.max-messages}: a hit returns the cached
-     * window, a miss returns the tail of the durable transcript truncated to that window (D44). Use
-     * {@link #findRecent} to ask for a specific number of recent messages, and {@link #reload} to
-     * replay a whole session.</p>
+     * window, a miss returns the tail of the durable transcript truncated to that window (D44). This
+     * is the read the memory bridge uses ({@code MedSpringAiChatMemoryRepository#findByConversationId})
+     * and it deliberately returns a window rather than the consultation —
+     * {@code MessageWindowChatMemory} trims it further to {@code med.chat.max-messages} before the
+     * model sees it. Use {@link #findRecent} to ask for a specific number of recent messages, and
+     * {@link #reload} for the one read that does return the whole transcript.</p>
      *
      * @param tenantId  hospital/tenant id, must not be blank
      * @param deptId    department id, must not be blank
@@ -272,6 +276,12 @@ public class MedChatMemoryRepository {
 
     /**
      * Rebuilds the cached window of a session from MySQL, bypassing the cache on the way in.
+     *
+     * <p>This is the only read here that returns the <em>whole</em> durable transcript, and it is not
+     * on the memory bridge's read path (that is {@link #findAll(String, String, String)}) — it exists
+     * for verification and repair. Even so it cannot widen what reaches the model: the list handed to
+     * {@link RedisMessageCache#replaceAll} is trimmed to the cache window by the native {@code LTRIM}
+     * before it becomes the cached value, so the prompt path stays bounded (D44).</p>
      *
      * <p>Unlike {@link #findAll(String, String, String)} this also drops the key when the session
      * turns out to hold no message, so a window left behind by deleted rows cannot survive.</p>
