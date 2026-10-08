@@ -122,7 +122,13 @@ class MedProductionStartupIntegrationTest {
                         .contains("med_message_" + shard);
             }
             assertThat(tables).contains("flyway_schema_history");
-            assertThat(appliedMigrationCount()).as("V1, V2 and V3 must all be applied").isEqualTo(3);
+            assertThat(appliedMigrationCount()).as("V1, V2, V3 and V4 must all be applied").isEqualTo(4);
+            // V4 exists for the D47 retention sweep, whose query is the only one in the repository
+            // without a tenant dimension. Asserted against the real server because the index is what
+            // keeps that sweep off a full table scan: H2 accepting the DDL does not prove MySQL does.
+            assertThat(indexColumns(MIGRATED_SCHEMA, "med_session", "idx_med_session_retention"))
+                    .as("migration V4 must create the retention index on the real server")
+                    .containsExactly("status", "updated_at");
         }
     }
 
@@ -176,6 +182,33 @@ class MedProductionStartupIntegrationTest {
              ResultSet rs = statement.executeQuery()) {
             assertThat(rs.next()).isTrue();
             return rs.getInt(1);
+        }
+    }
+
+    /**
+     * Lists the columns of one index, in index order, as MySQL reports them.
+     *
+     * @param schema    the schema holding the table
+     * @param table     the table the index belongs to
+     * @param indexName the index to inspect
+     * @return the indexed column names, empty when the index does not exist
+     */
+    private static List<String> indexColumns(String schema, String table, String indexName) throws Exception {
+        try (Connection connection = rawConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT column_name FROM information_schema.statistics "
+                             + "WHERE table_schema = ? AND table_name = ? AND index_name = ? "
+                             + "ORDER BY seq_in_index")) {
+            statement.setString(1, schema);
+            statement.setString(2, table);
+            statement.setString(3, indexName);
+            try (ResultSet rs = statement.executeQuery()) {
+                List<String> columns = new ArrayList<>();
+                while (rs.next()) {
+                    columns.add(rs.getString(1));
+                }
+                return columns;
+            }
         }
     }
 

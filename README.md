@@ -416,6 +416,45 @@ D46 不新增行为，只把最后三处「注释承诺 ≠ 代码事实」对�
 （前置条件已写入手册 + 扫描 Spring 配置文件（`application*`）证明没有开启 H2 Console + `pom.xml` 的 H2
 仍是 `runtime` + compose 确实 pin 了 `utf8mb4`）。
 
+#### 陈旧会话自动归档（D47）
+
+`MedChatSessionService#archiveSession` 的注释从 D20 起就写着会诊有两种结束方式——显式关闭，或
+**保留策略作业扫描陈旧会话**——但**这个作业从来不存在**。于是 `ARCHIVED` 只能由一次显式 API 调用
+到达：患者开了会话问一句就再也不回来，那一行永远停在 `ACTIVE`，它的 Redis 窗口在 TTL 到期后每次读
+都会从 MySQL 重新灌满，`med_session` 只增不减。这又是阶段 8/9 那一类偏差——**注释承诺了代码没有的
+行为**——只是这次承诺的是一个后台能力，而且它的缺失不会让任何测试变红。
+
+D47 把它变成真的，并回答随之而来的两个问题：
+
+- **凭什么不会误伤正在进行的会诊**——不靠「作业跑得够快」，靠两条彼此独立的机制：
+  ① 陈旧判据与状态迁移**在同一条 SQL 里**（`ChatSessionMapper#updateStatusIfStale`：
+  `UPDATE … SET status=ARCHIVED WHERE session_id=? AND status=ACTIVE AND updated_at <= :idleBefore`），
+  作业先查候选、再逐个归档，中间患者回来问下一句时数据库直接拒绝这行，而不是先读再写；
+  ② 归档在**与消息写入路径同一把会话锁**内执行，锁被占用按 `skipped` 计数而不是失败——忙着的会话
+  就是活着的会话。
+- **凭什么不能直接复用 `archiveSession`**——请求态的 `PatientAccessGuard` 对**无主体**调用 fail-closed
+  （D21 的设计），后台作业恰恰没有主体，复用会让每个候选都以 `FORBIDDEN` 被拒；反向的捷径（在
+  `MedChatSessionService` 上加一个跳过守卫的方法）同样危险，那等于给所有请求态路径发一把无守卫的
+  归档原语。所以 `MedSessionRetentionService` 自带一条系统态归档路径，只复用真正承载不变量的协作者
+  （mapper 的 compare-and-set、会话锁、缓存驱逐），并把理由写在类注释里。
+
+其余工程取舍：集群内互斥用 Redisson `RLock`（键 `med:lock:session:retention`，抢不到即报
+`skipped-lock-held` 而不碰 MySQL）；`med.session.retention.enabled` 默认 `false`（可选能力必须有开关）
+**且** `dry-run` 默认 `true`（开启能力后仍然只报告不动作，与 D38 的两道开关同源）；`batch-size ×
+max-batches` 给单次运行封顶，`remaining` 报告积压量；**不删任何消息**，误归档可以改回来。新增 V4 迁移
+补 `idx_med_session_retention (status, updated_at)`——这是全仓库唯一不带租户维度的查询，没有这个索引
+每次运行都是全表扫描。告警码 `session-retention-completed`（INFO，只在真的归档了东西时发）与
+`session-retention-failed`（WARNING，不 page 但绝不静默：**「作业停了」和「医院没有废弃会话」看起来
+完全一样**）。
+
+守护测试：`MedSessionRetentionServiceTest`（锁被占时不碰 MySQL、dry-run 零写入、CAS 返回 0 记
+`skipped`、单个候选失败不中断整轮）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下三条语句的
+谓词与状态码映射）、`MedSessionRetentionConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在
+`application.yml` 里真实存在——否则作业会静默退回注解里的字面默认值，运维改了配置不生效）。
+按项目惯例，`updateStatusIfStale` 的陈旧谓词**先被亲眼看过它变红**：从 SQL 里删掉
+`AND updated_at <= :idleBefore` 后 `updateStatusIfStaleRefusesARefreshedSession` 立刻失败
+（`expected: <0> but was: <1>`），还原后重跑全绿。
+
 ---
 
 ## 错误码
@@ -461,6 +500,9 @@ D46 不新增行为，只把最后三处「注释承诺 ≠ 代码事实」对�
 | `MED_CHAT_MAX_MESSAGES` | `20` | 短期记忆窗口 |
 | `MED_CHAT_STREAM_HEARTBEAT` / `MED_CHAT_STREAM_TIMEOUT` | `15` / `120` | SSE 心跳与超时（秒） |
 | `MED_LOCK_WAIT_TIME` / `MED_LOCK_LEASE_TIME` / `MED_LOCK_WATCHDOG_TIMEOUT` | `3s` / `0s` / `30s` | 会话锁（lease 0 = 看门狗续期） |
+| `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | 陈旧会话自动归档（默认关闭且只报告，见 D47） |
+| `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | 陈旧阈值与单次运行的批量上限 |
+| `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | 保留策略轮询间隔与启动宽限期 |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | 检索参数 |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | 入库上限 |
@@ -532,7 +574,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下验证归档语句自身携带陈旧谓词，D47）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -712,6 +754,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
 | 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
+| 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 进行中（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run，配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest`；D48 待定） |
 
 ---
 

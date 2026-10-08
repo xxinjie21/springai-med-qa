@@ -390,6 +390,22 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D47 retention sweep and its conservative defaults")
+    void apiChapterDocumentsTheD47RetentionSweep() {
+        // The English README is a translation of the same handbook: it must carry the two mechanisms
+        // that keep the sweep away from live consultations, the mutex key, the switch, and the guards.
+        assertThat(english).contains("D47");
+        assertThat(english).contains("MedSessionRetentionService");
+        assertThat(english).contains("med:lock:session:retention");
+        assertThat(english).contains("updateStatusIfStale");
+        assertThat(english).contains("MED_SESSION_RETENTION_ENABLED");
+        assertThat(english).contains("session-retention-failed");
+        assertThat(english).contains("idx_med_session_retention");
+        assertThat(english).contains("ChatSessionMapperRetentionShardingTest");
+        assertThat(english).contains("MedSessionRetentionConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

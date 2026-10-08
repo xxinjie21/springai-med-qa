@@ -1,0 +1,22 @@
+-- Flyway migration: index the retention sweep of med_session (D47).
+--
+-- The sweep is the only query in the application that reads med_session without a tenant/department
+-- scope: it has to find the sessions of every hospital that nobody has touched for a while, i.e.
+--
+--   SELECT ... FROM med_session WHERE status = ? AND updated_at <= ? ORDER BY updated_at LIMIT ?
+--
+-- The two existing indexes (idx_med_session_patient, idx_med_session_status) both start with
+-- tenant_id, so neither can serve that predicate: MySQL would fall back to a full table scan of the
+-- whole session table on every run, which is exactly the kind of unbounded work an unattended
+-- background job must not do. This index leads with the two columns the predicate actually filters on.
+--
+-- It also covers the archiving statement (updateStatusIfStale), whose WHERE clause is
+-- `session_id = ? AND status = ? AND updated_at <= ?`: the primary key resolves the row and this index
+-- confirms the status/staleness predicate without touching the table.
+--
+-- Plain CREATE INDEX rather than `CREATE INDEX IF NOT EXISTS` (MySQL does not support the latter);
+-- Flyway runs each migration exactly once, so idempotency is not needed. The statement is
+-- backend-agnostic and runs unchanged against MySQL and against the in-memory H2 schema (MySQL
+-- compatibility mode) used by the tests.
+
+CREATE INDEX idx_med_session_retention ON med_session (status, updated_at);

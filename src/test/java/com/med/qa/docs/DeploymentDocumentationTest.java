@@ -236,6 +236,23 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D47 retention sweep, its two switches and its index")
+    void retentionSweepIsDocumented() {
+        // The two ways this job goes wrong are both silent: arming it without a dry run archives
+        // sessions an operator never reviewed, and leaving it off (or mis-set) means stale sessions
+        // accumulate while the handbook claims they are archived. So the handbook has to name both
+        // switches, the mutex, the statement that carries the staleness predicate, and the index.
+        assertThat(handbook).contains("（D47）");
+        assertThat(handbook).contains("MED_SESSION_RETENTION_ENABLED");
+        assertThat(handbook).contains("MED_SESSION_RETENTION_DRY_RUN");
+        assertThat(handbook).contains("MED_SESSION_RETENTION_IDLE_THRESHOLD");
+        assertThat(handbook).contains("med:lock:session:retention");
+        assertThat(handbook).contains("updateStatusIfStale");
+        assertThat(handbook).contains("idx_med_session_retention");
+        assertThat(handbook).contains("ChatSessionMapperRetentionShardingTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
@@ -286,14 +303,19 @@ class DeploymentDocumentationTest {
         assertThat(handbook).contains("docker/mysql/init/01-create-db.sql");
         assertThat(Path.of(System.getProperty("user.dir"), "docker/mysql/init/01-create-db.sql")).exists();
 
-        assertThat(handbook).contains("Flyway V1–V3");
+        assertThat(handbook).contains("Flyway V1–V4");
         Path migrationDir = Path.of(System.getProperty("user.dir"), "src/main/resources/db/migration");
         try (var stream = Files.list(migrationDir)) {
             List<String> migrations = stream.map(p -> p.getFileName().toString()).sorted().toList();
-            assertThat(migrations).hasSize(3);
+            assertThat(migrations).hasSize(4);
             assertThat(migrations.get(0)).startsWith("V1__");
             assertThat(migrations.get(1)).startsWith("V2__");
             assertThat(migrations.get(2)).startsWith("V3__");
+            // Every migration has to be named in the handbook: an undocumented schema change is how an
+            // operator ends up debugging a missing index in production (V4 exists for the retention
+            // sweep, whose cross-tenant query is a full table scan without it).
+            assertThat(migrations.get(3)).startsWith("V4__");
+            assertThat(handbook).contains("idx_med_session_retention");
         }
         assertThat(handbook).contains("med_message_{0..15}");
         assertThat(sharding).contains("MED_CRC32_MOD");

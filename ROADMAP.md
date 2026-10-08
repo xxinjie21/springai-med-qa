@@ -274,6 +274,28 @@ springai-med-qa/
 > **阶段 9 之后没有 D47**：下次运行必须先扩写本路线图（新增阶段 10）再实现，不得自造迭代编号。
 > 候选方向：把「文档/注释与代码行为一致」这类偏差做成更系统的检查、或补齐仍未覆盖的运行时能力。
 
+### 阶段 10：会话生命周期治理与保留策略（D47–D48）
+
+> 阶段 10 的出发点：`MedChatSessionService#archiveSession` 的 javadoc 从 D20 起就写着会诊有两种结束
+> 方式——「显式关闭，或**保留策略作业扫描陈旧会话**」——但**这个作业从来不存在**。于是
+> `SessionStatus#ARCHIVED` 只能由一次显式 API 调用到达：患者开了会话问一句就再也不回来，那一行就
+> 永远停在 `ACTIVE`，它的 Redis 窗口也永远温热（TTL 到期后每次读都会从 MySQL 回源重新灌满），
+> `med_session` 只增不减，而「陈旧会诊自动转冷」这条写在注释里的运维承诺在代码里没有任何对应物。
+> 这仍然是阶段 8/9 那一类偏差——**注释承诺了代码没有的行为**——只是这次承诺的是一个后台能力，
+> 而且它的缺失不会让任何测试变红。
+>
+> 阶段 10 把它变成真的，并回答随之而来的两个问题：**自动归档凭什么不会误伤正在进行的会诊**
+> （答案必须是「归档语句自身带陈旧谓词」，而不是「作业跑得快」），以及**它凭什么不能直接复用
+> `archiveSession`**（答案见 D47：请求态的 `PatientAccessGuard` 对无主体调用 fail-closed，
+> 后台作业没有主体）。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D47 | 陈旧会话自动归档（保留策略） | 把「陈旧的 ACTIVE 会话自动转 `ARCHIVED`」做成一次受控的后台扫描。**不能复用 `MedChatSessionService#archiveSession`**：它先经 `findSession` → `PatientAccessGuard.assertOwned`，而该守卫在**无主体**时 fail-closed 抛 `FORBIDDEN`（D21 的设计），后台作业恰恰没有主体——于是每个候选都会被拒。**也不能在 `MedChatSessionService` 上开一个「跳过守卫」的公开方法**：那等于给请求态路径发一把无守卫的归档原语，正是 D41/D42 收敛掉的那类缺口。因此 `MedSessionRetentionService`（`com.med.qa.service`）自带一条系统态归档路径，只复用同源协作者（`ChatSessionMapper` + `SessionLockService` + `RedisMessageCache`），并把「为什么另起一条」写进 javadoc。**防误伤靠 SQL 谓词而不是靠时序**：新增 `ChatSessionMapper#updateStatusIfStale(sessionId, status, expectedStatus, idleBefore, updatedAt)`，`UPDATE … WHERE session_id = ? AND status = ACTIVE AND updated_at <= :idleBefore` —— 陈旧判据与状态迁移在同一条语句里原子完成，即使有绕过会话锁的写入者也归档不了一个刚被问过的会话；会话锁（与消息写入路径同一把）再保证「读候选 → 归档」之间不会有新消息插进来。扫描本身用 `selectStaleActiveSessions(idleBefore, limit)`（跨租户，`status = ACTIVE AND updated_at <= ?` 按 `updated_at` 升序，只走一条 `status, updated_at` 索引，故 V4 迁移补 `idx_med_session_retention`）与 `countStaleActiveSessions(idleBefore)`（给出积压量）。集群内互斥用 Redisson `RLock`（键 `med:lock:session:retention`，`tryLock` 失败即报 `skipped-lock-held` 而不碰 MySQL，与 D38 同源）；`med.session.retention.*` 默认 `enabled=false`（可选能力，必须有开关）**且** `dry-run=true`（第一版部署只报告不动作，与 D38 的两道开关同源），`dry-run` 下扫完一批即停——因为什么都没改，再扫一批只会拿到同一批行；`batch-size`/`max-batches` 给单次运行封顶。`SessionRetentionReport` 给出 `completed`/`skipped-lock-held` 与 `candidates`/`archived`/`skipped`/`failed`/`batches`/`remaining`/`durationMillis`/`failures`（单个候选失败不中断整轮，计入 `failed`）。`MedSessionRetentionScheduler` 按 `check-interval` 驱动并复用既有 `MedAlertNotifier` 链路（`session-retention-completed` INFO 只在真的归档了东西时发、`session-retention-failed` WARNING），Prometheus 规则 `MedQaSessionRetentionFailed`；`MedSessionRetentionConfig` 单独声明 `@EnableScheduling`，因为 `MedAlertConfig` 只在 `med.alert.enabled=true` 时才装配调度器。守护测试：`MedSessionRetentionServiceTest`（含「锁被占时不碰 MySQL」「dry-run 零写入」「CAS 返回 0 记 skipped」）、`ChatSessionMapperRetentionShardingTest`（H2 + Flyway + ShardingSphere 真跑三条新语句，钉住 `<=` 与状态码映射）、`MedSessionRetentionConfigTest`（开关真的增删 Bean，且 `@Scheduled` 占位符键在 application.yml 里真实存在——否则作业会静默退回注解默认值、运维改了配置不生效） | `feat(session): archive stale consultation sessions on a schedule` |
+| D48 | 待定（planned） | 候选方向：`med_session` 的归档只翻状态、轨迹仍在热表里，可继续做「已归档会话的冷热分层与轨迹导出」；或把统一存储协议的「两套系统可互读互迁」从路线图第四节的承诺变成可执行的金标报文契约（冻结的 Protobuf 字节 + 独立解码器） | — |
+
+> 阶段 10 进度：**D47 已完成**，D48 未开始。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

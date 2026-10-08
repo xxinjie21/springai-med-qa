@@ -221,6 +221,7 @@ class AlertingStackConfigTest {
                 "MedQaRagIndexDegraded",
                 "MedQaRagIndexProbeFailed",
                 "MedQaRagIndexRebuildFailed",
+                "MedQaSessionRetentionFailed",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -320,6 +321,41 @@ class AlertingStackConfigTest {
         // A failed rebuild can leave the index unusable, which is worse than the drift it repaired,
         // so this rule must page rather than warn.
         assertThat(read(ALERT_RULES)).contains("severity: critical");
+    }
+
+    @Test
+    @DisplayName("the D47 retention rule selects the code the scheduler actually exports")
+    void retentionRuleMatchesTheExportedCode() throws IOException {
+        // Same two-literals trap as the RAG rules: the code string in the rule and the constant the
+        // scheduler raises are declared in different files and must agree. A drifted one leaves a rule
+        // that parses, scrapes and never fires - and the failure it exists for (a retention job that
+        // stopped running) looks exactly like a hospital with no abandoned sessions.
+        assertThat(read("src/main/java/com/med/qa/service/MedSessionRetentionScheduler.java"))
+                .contains("session-retention-failed");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-retention-failed\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionRetentionFailed");
+        // Consultations keep working when the sweep fails; the cost is unbounded table growth, so this
+        // warns rather than pages.
+        assertThat(read(ALERT_RULES)).contains("component: session-retention");
+    }
+
+    @Test
+    @DisplayName("the retention switches are declared in application.yml and default to off and dry")
+    void retentionPropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_SESSION_RETENTION_ENABLED",
+                "MED_SESSION_RETENTION_DRY_RUN",
+                "MED_SESSION_RETENTION_IDLE_THRESHOLD",
+                "MED_SESSION_RETENTION_BATCH_SIZE",
+                "MED_SESSION_RETENTION_MAX_BATCHES");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // The two conservative defaults are the whole safety story of this capability: a deployment
+        // that flips them by accident must at least have been warned by a failing guard here.
+        assertThat(applicationYml).contains("MED_SESSION_RETENTION_ENABLED:false");
+        assertThat(applicationYml).contains("MED_SESSION_RETENTION_DRY_RUN:true");
     }
 
     @Test

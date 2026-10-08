@@ -440,6 +440,59 @@ back**), `PrivacyMaskingDocumentationTest` (the absolute claims must not reappea
 configuration files (`application*`) proves none of them enables the H2 console, `pom.xml` still keeps
 H2 at `runtime` scope, and compose really pins `utf8mb4`).
 
+#### Stale consultations archived automatically (D47)
+
+The javadoc of `MedChatSessionService#archiveSession` has documented two ways a consultation ends
+since D20: an explicit close, or **a retention job sweeping stale sessions**. That job did not exist.
+`ARCHIVED` was therefore reachable only through one explicit API call: a patient who opened a session,
+asked a single question and never came back left a row that stayed `ACTIVE` forever, keeping its Redis
+window warm (re-filled from MySQL on every read once the TTL expires), while `med_session` only ever
+grew. Same class of defect as phases 8 and 9 — **a comment promising behaviour the code does not
+have** — except that this time what was promised is a background capability, and its absence could not
+turn a single test red.
+
+D47 makes it real and answers the two questions that follow:
+
+- **Why it cannot archive a live consultation** — not because the job is fast, but through two
+  independent mechanisms. (1) The staleness predicate travels **inside the archiving statement**
+  (`ChatSessionMapper#updateStatusIfStale`:
+  `UPDATE … SET status=ARCHIVED WHERE session_id=? AND status=ACTIVE AND updated_at <= :idleBefore`).
+  The sweep reads its candidates first and archives them afterwards, so a patient may well come back
+  in between — the database then refuses that row instead of a read-then-write window losing the race.
+  (2) The archive runs under **the same session lock the message-append path takes**, and a lock held
+  by a live turn counts as `skipped`, never as a failure: a busy session is an alive one.
+- **Why it cannot reuse `archiveSession`** — the request-scoped `PatientAccessGuard` fails closed when
+  there is no principal (by design, D21), which is exactly the situation of a background job, so every
+  candidate would be rejected with `FORBIDDEN`. The inverse shortcut is just as wrong: adding a
+  "skip the guard" method to `MedChatSessionService` would hand every request path an unguarded
+  archive primitive. So `MedSessionRetentionService` owns a system-side archive path and reuses only
+  the collaborators that actually encode the invariants (the mapper's compare-and-set, the session
+  lock, the cache eviction), with the reasoning written into its class javadoc.
+
+The remaining engineering choices: cluster-wide mutual exclusion through a Redisson `RLock`
+(`med:lock:session:retention`; a replica that loses the race reports `skipped-lock-held` without
+touching MySQL); `med.session.retention.enabled` defaults to `false` (an optional capability needs a
+switch) **and** `dry-run` defaults to `true` (enabling the capability still changes nothing until an
+operator has read a report — the same two-switch design as the D38 index rebuild); `batch-size ×
+max-batches` bounds one run and `remaining` reports the backlog; **no message is ever deleted**, so a
+wrongly archived session can be moved back. A new V4 migration adds
+`idx_med_session_retention (status, updated_at)`, because this is the only query in the repository
+with no tenant dimension — without the index every run would be a full table scan. Alert codes:
+`session-retention-completed` (INFO, only when something was really archived) and
+`session-retention-failed` (WARNING — it does not page, but it must not be silent either, because
+**"the job stopped running" and "the hospital has no abandoned sessions" look identical**).
+
+Guards: `MedSessionRetentionServiceTest` (a held mutex means MySQL is never touched, a dry run writes
+nothing, a compare-and-set that returns 0 counts as skipped, one failing candidate never aborts the
+run), `ChatSessionMapperRetentionShardingTest` (the predicate and the status-code mapping of all three
+statements against the real DDL) and `MedSessionRetentionConfigTest` (the switch really adds and
+removes the beans, and the `@Scheduled` placeholder keys really exist in `application.yml` — otherwise
+the job silently falls back to the annotation's literal default and the operator's value is ignored).
+As usual for this repository, the staleness predicate was **watched going red first**: deleting
+`AND updated_at <= :idleBefore` from the SQL made
+`updateStatusIfStaleRefusesARefreshedSession` fail immediately (`expected: <0> but was: <1>`), and it
+was restored and re-verified green.
+
 ---
 
 ## Error codes
@@ -486,6 +539,9 @@ H2 at `runtime` scope, and compose really pins `utf8mb4`).
 | `MED_CHAT_MAX_MESSAGES` | `20` | Short-term memory window |
 | `MED_CHAT_STREAM_HEARTBEAT` / `MED_CHAT_STREAM_TIMEOUT` | `15` / `120` | SSE heartbeat and timeout in seconds |
 | `MED_LOCK_WAIT_TIME` / `MED_LOCK_LEASE_TIME` / `MED_LOCK_WATCHDOG_TIMEOUT` | `3s` / `0s` / `30s` | Session lock (a lease of `0` hands renewal to the watchdog) |
+| `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | Stale-session retention sweep (off and report-only by default, see D47) |
+| `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | Staleness window and per-run batch bounds |
+| `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | Retention sweep period and startup grace period |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | Retrieval parameters |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | Ingestion limits |
@@ -559,7 +615,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43), and `EmbeddingMetadataContractTest` binds the effective `metadata-mode` and demonstrates with the real Spring AI formatter whether the tags enter the vector (D45). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43), and `EmbeddingMetadataContractTest` binds the effective `metadata-mode` and demonstrates with the real Spring AI formatter whether the tags enter the vector (D45), and `ChatSessionMapperRetentionShardingTest` verifies against the real DDL that the archiving statement carries the staleness predicate itself (D47). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -926,6 +982,7 @@ the loop of code, unit tests, commit and push:
 | Phase 7, RAG index operations and retrieval observability | D37 to D39 | Done (D37 index health and drift detection, D38 controlled index rebuild, D39 retrieval-quality regression baseline) |
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
 | Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | Complete (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46: window-semantics comments aligned, deployment prerequisites (utf8mb4, H2 console) corrected, and the privacy-layer comments fixed, guarded by `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`) |
+| Phase 10, session lifecycle governance and retention | D47 to D48 | In progress (D47: the "retention job sweeping stale sessions" that `archiveSession`'s javadoc has promised since D20 now exists — stale `ACTIVE` sessions move to `ARCHIVED`, the staleness predicate travels inside the archiving statement itself, the archive runs under the session lock, cluster-wide mutual exclusion uses an `RLock`, and the capability is off and report-only by default, guarded by `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest`; D48 to be decided) |
 
 ---
 

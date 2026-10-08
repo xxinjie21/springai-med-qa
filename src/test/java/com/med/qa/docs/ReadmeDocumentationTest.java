@@ -423,6 +423,25 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D47 retention sweep and why it cannot archive a live session")
+    void apiChapterDocumentsTheD47RetentionSweep() {
+        // The README has to admit that the job `archiveSession` promised for 27 iterations now exists,
+        // name the two mechanisms that keep it off live consultations, and record the conservative
+        // defaults - a README that only said "stale sessions are archived" would invite an operator to
+        // arm it without a dry run.
+        assertThat(readme).contains("（D47）");
+        assertThat(readme).contains("MedSessionRetentionService");
+        assertThat(readme).contains("med:lock:session:retention");
+        assertThat(readme).contains("updateStatusIfStale");
+        assertThat(readme).contains("MED_SESSION_RETENTION_ENABLED");
+        assertThat(readme).contains("session-retention-failed");
+        assertThat(readme).contains("idx_med_session_retention");
+        assertThat(readme).contains("MedSessionRetentionServiceTest");
+        assertThat(readme).contains("ChatSessionMapperRetentionShardingTest");
+        assertThat(readme).contains("MedSessionRetentionConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

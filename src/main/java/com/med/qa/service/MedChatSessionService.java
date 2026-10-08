@@ -335,9 +335,11 @@ public class MedChatSessionService {
      * Archives a session as cold data and drops its cached message window.
      *
      * <p>Both an active and an already closed session can be archived, which mirrors the two ways a
-     * consultation ends (explicit close, or a retention job sweeping stale sessions). Idempotent for
-     * an already archived session, in which case the cached window is evicted again — a leftover key
-     * from a previously failed eviction must not survive.</p>
+     * consultation ends (explicit close, or the scheduled retention sweep of
+     * {@link MedSessionRetentionService}, which archives the sessions nobody has touched for
+     * {@code med.session.retention.idle-threshold}). Idempotent for an already archived session, in
+     * which case the cached window is evicted again — a leftover key from a previously failed eviction
+     * must not survive.</p>
      *
      * @param tenantId  hospital/tenant id, must not be blank
      * @param deptId    department id, must not be blank

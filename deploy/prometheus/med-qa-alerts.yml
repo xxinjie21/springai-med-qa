@@ -118,6 +118,28 @@ groups:
             documents.
           runbook: "docs/DEPLOYMENT.md#72-索引重建d38"
 
+      - alert: MedQaSessionRetentionFailed
+        # D47. The retention sweep archives consultations nobody has touched for idle-threshold. When
+        # it fails, nothing breaks for a patient - consultations keep working - but med_session grows
+        # without bound and the "stale sessions are archived automatically" guarantee quietly stops
+        # holding. A warning rather than a page for exactly that reason, and a rule rather than a log
+        # line because a job that stopped running looks identical to a hospital with no abandoned
+        # sessions.
+        expr: increase(med_qa_alert_total{code="session-retention-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-retention
+        annotations:
+          summary: "The consultation retention sweep is failing"
+          description: >-
+            MedSessionRetentionScheduler reported a failed run, so stale ACTIVE sessions are not being
+            archived. Check MySQL reachability and Redis (the sweep takes the cluster-wide mutex
+            med:lock:session:retention before touching any row), then review
+            med.session.retention.* - a dry-run deployment reports what it would do and never archives,
+            which is not a failure.
+          runbook: "docs/DEPLOYMENT.md#78-会话保留策略d47"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.

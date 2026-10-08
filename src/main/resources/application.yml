@@ -132,6 +132,42 @@ med:
     default-page-size: ${MED_SESSION_DEFAULT_PAGE_SIZE:20}
     max-page-size: ${MED_SESSION_MAX_PAGE_SIZE:100}
     max-title-length: ${MED_SESSION_MAX_TITLE_LENGTH:200}
+    # Consultation retention sweep (D47). MedChatSessionService#archiveSession has always documented
+    # two ways a consultation ends - an explicit close, or "a retention job sweeping stale sessions" -
+    # but until D47 that job did not exist, so ARCHIVED was reachable only through one explicit API
+    # call: an abandoned session stayed ACTIVE forever, kept its Redis window warm and grew med_session
+    # without bound. The sweep moves ACTIVE sessions nobody has touched for idle-threshold to ARCHIVED.
+    #
+    # Two switches, not one, and both conservative: enabled defaults to FALSE (the sweep changes the
+    # lifecycle state of records nobody asked about, so its presence is a deployment decision), and
+    # dry-run defaults to TRUE on top of that (enabling the capability still archives nothing until an
+    # operator has read a report and agreed with the threshold). This mirrors the two-switch design of
+    # med.rag.index.rebuild below.
+    #
+    # The staleness predicate is part of the archiving UPDATE itself (updated_at <= now - idle-threshold
+    # in the same WHERE clause as the status change), so a session that received a question between the
+    # candidate query and the archive is rejected by the database instead of being archived - the sweep
+    # cannot misfire on a live consultation, whatever the timing. The session lock shared with the
+    # message-append path is held on top of that.
+    #
+    # Nothing here deletes a message: archiving is a status transition plus a cache eviction, so a
+    # wrongly archived session is recoverable and no "allow deletion" switch is needed.
+    #
+    # batch-size * max-batches bounds how many sessions one run may touch; a run that hits that bound
+    # reports the remaining backlog and the next run continues (oldest idle first). idle-threshold must
+    # comfortably exceed the longest realistic consultation, otherwise the sweep archives a session that
+    # a clinician is still working on - the atomic predicate above will refuse it, but the report will be
+    # full of skips.
+    retention:
+      enabled: ${MED_SESSION_RETENTION_ENABLED:false}
+      dry-run: ${MED_SESSION_RETENTION_DRY_RUN:true}
+      idle-threshold: ${MED_SESSION_RETENTION_IDLE_THRESHOLD:24h}
+      batch-size: ${MED_SESSION_RETENTION_BATCH_SIZE:100}
+      max-batches: ${MED_SESSION_RETENTION_MAX_BATCHES:10}
+      check-interval: ${MED_SESSION_RETENTION_CHECK_INTERVAL:1h}
+      initial-delay: ${MED_SESSION_RETENTION_INITIAL_DELAY:5m}
+      lock-wait-time: ${MED_SESSION_RETENTION_LOCK_WAIT:5s}
+      lock-lease-time: ${MED_SESSION_RETENTION_LOCK_LEASE:5m}
   # Schema migration target (D34). Flyway must talk to the physical MySQL server, never to the
   # ShardingSphere data source declared under spring.datasource: the migrations create the physical
   # shard tables med_message_0..15, which are precisely the tables the sharding proxy treats as

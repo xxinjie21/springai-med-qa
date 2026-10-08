@@ -394,6 +394,15 @@ livenessProbe:
 | `MED_LOCK_WATCHDOG_TIMEOUT` | `30s` | 看门狗超时 |
 | `MED_SESSION_DEFAULT_PAGE_SIZE` | `20` | 会话分页默认页大小 |
 | `MED_SESSION_MAX_PAGE_SIZE` | `100` | 单页上限 |
+| `MED_SESSION_RETENTION_ENABLED` | `false` | 陈旧会话自动归档总开关（见 7.8） |
+| `MED_SESSION_RETENTION_DRY_RUN` | `true` | 开启后仍只报告不动作 |
+| `MED_SESSION_RETENTION_IDLE_THRESHOLD` | `24h` | 多久未更新算「陈旧」 |
+| `MED_SESSION_RETENTION_BATCH_SIZE` | `100` | 每批取多少行 |
+| `MED_SESSION_RETENTION_MAX_BATCHES` | `10` | 单次运行最多几批 |
+| `MED_SESSION_RETENTION_CHECK_INTERVAL` | `1h` | 两次运行之间的固定延迟 |
+| `MED_SESSION_RETENTION_INITIAL_DELAY` | `5m` | 启动后首次运行的延迟 |
+| `MED_SESSION_RETENTION_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
+| `MED_SESSION_RETENTION_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
 
 ### 5.5 RAG
 
@@ -425,7 +434,7 @@ livenessProbe:
 | 层次 | 归属 | 内容 |
 |---|---|---|
 | 数据库 + 账号 | `docker/mysql/init/01-create-db.sql`（Compose 首次启动执行一次，幂等） | 建 `med_qa` 库（utf8mb4）、建 `med_qa@%` / `med_qa@localhost` 账号并授权 |
-| 表结构 | Flyway V1–V3（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log` |
+| 表结构 | Flyway V1–V4（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8） |
 | 向量索引 | Spring AI `RedisVectorStore`（`initialize-schema=true`） | RediSearch 索引 `med-doc-index`，TAG 字段 `tenant_id` / `dept_id` / `patient_id` |
 
 分片规则见 `src/main/resources/sharding/med-sharding.yaml`：
@@ -730,6 +739,77 @@ docker compose --profile observability up -d
 - 跨组件契约：`EmbeddingMetadataContractTest` 用 `YamlPropertySourceLoader` + `Binder` 绑定**实际生效值**
   （逐 profile 叠加），并用真实的 Spring AI formatter 演示同一个 `Document` 在 `NONE` 与 `EMBED` 下
   嵌入文本的差别，同时断言守卫会拒绝 `EMBED` 与「属性缺失」两种情形。
+
+### 7.8 会话保留策略（D47）
+
+`MedChatSessionService#archiveSession` 的注释从 D20 起就写着会诊有两种结束方式——显式关闭，或
+**保留策略作业扫描陈旧会话**——但直到 D47 这个作业才真正存在。在那之前 `ARCHIVED` 只能由一次显式
+API 调用到达：患者开了会话问一句就再也不回来，那一行会永远停在 `ACTIVE`，它的 Redis 窗口也会在
+TTL 到期后每次读都从 MySQL 重新灌满，`med_session` 只增不减。
+
+D47 的作业把「`ACTIVE` 且超过 `MED_SESSION_RETENTION_IDLE_THRESHOLD` 未被更新」的会话转为
+`ARCHIVED`，并顺手丢掉它的缓存窗口。**它不删任何消息**：归档只是状态迁移 + 缓存驱逐，轨迹仍在分表里，
+误归档可以改回来。
+
+两把钥匙，都默认保守（与 D38 的索引重建同源）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MED_SESSION_RETENTION_ENABLED` | `false` | 总开关；关闭时作业与调度器都不存在，定时器不碰 `med_session` |
+| `MED_SESSION_RETENTION_DRY_RUN` | `true` | **开启能力后仍然只报告不动作**：先读一次报告，确认阈值合理再关掉它 |
+| `MED_SESSION_RETENTION_IDLE_THRESHOLD` | `24h` | 多久没动过算「陈旧」；必须明显大于最长的一次真实会诊 |
+| `MED_SESSION_RETENTION_BATCH_SIZE` | `100` | 每批取多少行 |
+| `MED_SESSION_RETENTION_MAX_BATCHES` | `10` | 单次运行最多几批（`batch-size × max-batches` = 单次最多触碰多少会话） |
+| `MED_SESSION_RETENTION_CHECK_INTERVAL` | `1h` | 两次运行之间的间隔（固定延迟，不是固定频率：慢的一轮不会叠上下一轮） |
+| `MED_SESSION_RETENTION_INITIAL_DELAY` | `5m` | 启动后多久开始第一轮 |
+| `MED_SESSION_RETENTION_LOCK_WAIT` | `5s` | 抢集群互斥锁的等待时间 |
+| `MED_SESSION_RETENTION_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 交给 Redisson 看门狗续期 |
+
+**为什么自动归档不会误伤正在进行的会诊**——两条彼此独立的机制，都不依赖「作业跑得够快」：
+
+1. **陈旧判据与状态迁移在同一条 SQL 里**。归档语句是
+   `UPDATE med_session SET status=ARCHIVED, updated_at=? WHERE session_id=? AND status=ACTIVE AND updated_at <= ?`。
+   作业先查候选、再逐个归档，中间患者完全可能回来问下一句；把
+   `updated_at <= 截止时间` 放进 `WHERE`，数据库会直接拒绝这行（返回 0 行），而不是先读一次再写一次。
+   该语句由 `ChatSessionMapper#updateStatusIfStale` 承载，跨组件契约测试
+   `ChatSessionMapperRetentionShardingTest#updateStatusIfStaleRefusesARefreshedSession` 钉住它——
+   把谓词从 SQL 里去掉，这条测试立刻变红。
+2. **归档在会话锁内执行**（`med:lock:chat:{tenant}:{dept}:{session}`，与消息写入路径同一把锁）。
+   锁被占用（说明有轮次正在写）按 `skipped` 计数，**不算失败**——忙着的会话就是活着的会话。
+
+**为什么不复用 `archiveSession`**：请求态的 `PatientAccessGuard` 对**无主体**调用 fail-closed
+（D21 的设计），后台作业恰恰没有主体，复用会让每个候选都以 `FORBIDDEN` 被拒。反向的捷径同样危险：
+在 `MedChatSessionService` 上加一个「跳过守卫」的方法，等于给所有请求态路径发一把无守卫的归档原语。
+所以 `MedSessionRetentionService` 自带一条系统态归档路径，只复用真正承载不变量的协作者
+（mapper 的 compare-and-set、会话锁、缓存驱逐），并把理由写在类注释里。
+
+**运维含义**：
+
+- **单实例调试**：先 `MED_SESSION_RETENTION_ENABLED=true` + 保持 `DRY_RUN=true`，看一轮日志
+  （`dry run: session ... would be archived`）确认阈值；再关掉 `DRY_RUN` 真正归档。
+- **集群**：多个副本同时开启是安全的。抢到 `med:lock:session:retention` 的副本才动手，其余副本
+  报 `skipped-lock-held`（这是互斥生效，不是故障）。**不要**把 `MED_SESSION_RETENTION_LOCK_WAIT`
+  调大——抢不到就该让位，不该排队堆积。
+- **积压量**：报告里的 `remaining` 是运行结束时仍陈旧的会话数；若每轮都非 0，说明
+  `batch-size × max-batches` 追不上积压，调大 `MAX_BATCHES`（或缩短 `CHECK_INTERVAL`）。
+- **失败**：单个候选失败不会中断整轮，会计入 `failed` 并出现在 `failures` 里（`BizException` 按
+  `ErrorCode` 渲染，例如 `STORAGE_ERROR`）。整轮失败（例如 Redis 不可达拿不到互斥锁）会以
+  `session-retention-failed`（WARNING）推送告警——**不 page**，因为会诊本身仍然正常，代价只是
+  `med_session` 持续增长；但也不能静默，因为「作业停了」和「医院没有废弃会话」看起来完全一样。
+- **排查**：直接查有多少陈旧会话，无需等作业：
+
+  ```sql
+  -- 直接连物理 MySQL（绕开 ShardingSphere），status: ACTIVE=0
+  SELECT COUNT(*) FROM med_session
+  WHERE status = 0 AND updated_at <= (UNIX_TIMESTAMP() * 1000 - 24 * 3600 * 1000);
+  ```
+
+  该查询走 V4 迁移建的 `idx_med_session_retention (status, updated_at)`；没有这个索引就是全表扫描，
+  这也是 V4 存在的原因。
+- 跨组件契约：`MedSessionRetentionServiceTest`（锁被占时不碰 MySQL、dry-run 零写入、CAS 返回 0 记
+  `skipped`）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下三条语句的谓词与状态码映射）、
+  `MedSessionRetentionConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在
+  `application.yml` 里真实存在——否则作业会静默退回注解里的字面默认值，运维改配置不生效）。
 
 ---
 
