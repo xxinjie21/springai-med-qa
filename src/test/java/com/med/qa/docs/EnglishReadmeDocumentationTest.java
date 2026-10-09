@@ -406,6 +406,22 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D48 cold archive and what it refuses to do")
+    void apiChapterDocumentsTheD48ColdArchive() {
+        // The English README is a translation of the same handbook: it must carry the certification
+        // digest, the mutex key, the switch and - most importantly - that nothing is deleted.
+        assertThat(english).contains("D48");
+        assertThat(english).contains("MedSessionArchiveExportService");
+        assertThat(english).contains("med:lock:session:archive:export");
+        assertThat(english).contains("med_message_archive");
+        assertThat(english).contains("SessionArchiveChecksum");
+        assertThat(english).contains("MED_SESSION_ARCHIVE_ENABLED");
+        assertThat(english).contains("session-archive-mismatch");
+        assertThat(english).contains("SessionArchiveMapperShardingTest");
+        assertThat(english).contains("MedSessionArchiveConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

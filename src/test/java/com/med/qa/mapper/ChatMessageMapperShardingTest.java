@@ -136,11 +136,14 @@ class ChatMessageMapperShardingTest {
     @Test
     @DisplayName("flyway migration creates all 16 physical shards on the H2 schema")
     void flywayCreatesSixteenShards() throws Exception {
+        // 只统计「分片族」：med_message_ 后面必须紧跟数字。冷归档表 med_message_archive（D48）与分片共享前缀，
+        // 却不是分片——若继续用 LIKE 'med_message_%'，这张表会被误算成第 17 个分片，门禁就失去了「分片数正好 16」的含义。
         try (PreparedStatement ps = rawH2.prepareStatement(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE 'med_message_%'")) {
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES"
+                        + " WHERE REGEXP_LIKE(TABLE_NAME, '^med_message_[0-9]+$')")) {
             try (ResultSet rs = ps.executeQuery()) {
                 assertTrue(rs.next());
-                assertEquals(SHARD_COUNT, rs.getLong(1), "exactly 16 med_message_* tables expected");
+                assertEquals(SHARD_COUNT, rs.getLong(1), "exactly 16 med_message_{n} shard tables expected");
             }
         }
     }

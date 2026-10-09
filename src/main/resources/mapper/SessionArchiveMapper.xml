@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+    "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.med.qa.mapper.SessionArchiveMapper">
+
+    <!--
+      Local projection of med_session. It duplicates the columns ChatSessionMapper maps, on purpose:
+      the candidate query is an archive-domain query (it filters on the manifest table), and the
+      session mapper must not learn that an archive exists. Only the columns the export needs are
+      selected, so a future column added to med_session cannot silently change this query's shape.
+    -->
+    <resultMap id="ArchivedSessionResultMap" type="com.med.qa.domain.entity.ChatSessionDO">
+        <id column="session_id" property="sessionId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="patient_id" property="patientId"/>
+        <result column="title" property="title"/>
+        <result column="status" property="status"
+                typeHandler="com.med.qa.mapper.typehandler.SessionStatusTypeHandler"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="ArchivedMessageResultMap" type="com.med.qa.domain.entity.ArchivedMessageDO">
+        <id column="session_id" property="sessionId"/>
+        <id column="message_id" property="messageId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="patient_id" property="patientId"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="archived_at" property="archivedAt"/>
+        <result column="payload" property="payload"/>
+    </resultMap>
+
+    <resultMap id="ArchiveManifestResultMap" type="com.med.qa.domain.entity.SessionArchiveManifestDO">
+        <id column="session_id" property="sessionId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="dept_id" property="deptId"/>
+        <result column="patient_id" property="patientId"/>
+        <result column="message_count" property="messageCount"/>
+        <result column="payload_checksum" property="payloadChecksum"/>
+        <result column="exported_at" property="exportedAt"/>
+    </resultMap>
+
+    <!--
+      Candidate query of the export (D48). NOT EXISTS rather than a two-step "page then filter": the
+      oldest archived sessions are the ones an earlier run already exported, so filtering in Java
+      would make every run re-fetch the same fully exported page and never reach the backlog behind
+      it. status is a parameter (not a literal) so the numeric spec code keeps exactly one source of
+      truth, SessionStatusTypeHandler.
+    -->
+    <select id="selectUnexportedArchivedSessions" resultMap="ArchivedSessionResultMap">
+        SELECT s.session_id, s.tenant_id, s.dept_id, s.patient_id, s.title,
+               s.status, s.created_at, s.updated_at
+        FROM med_session s
+        WHERE s.status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+          AND NOT EXISTS (
+              SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id
+          )
+        ORDER BY s.updated_at ASC, s.session_id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countUnexportedArchivedSessions" resultType="long">
+        SELECT COUNT(*)
+        FROM med_session s
+        WHERE s.status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+          AND NOT EXISTS (
+              SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id
+          )
+    </select>
+
+    <!--
+      Idempotent copy into the cold store. The primary key (session_id, message_id) is what makes a
+      re-run a no-op rather than a duplicate; ON DUPLICATE KEY UPDATE with a self-assignment keeps the
+      collision handling to duplicate keys only (INSERT IGNORE would also swallow truncation and other
+      constraint errors). Affected rows: 1 = copied now, 0 = already in the cold store.
+    -->
+    <insert id="insertIfAbsent" parameterType="com.med.qa.domain.entity.ArchivedMessageDO"
+            useGeneratedKeys="false">
+        INSERT INTO med_message_archive (
+            session_id, message_id, tenant_id, dept_id, patient_id, created_at, archived_at, payload
+        ) VALUES (
+            #{sessionId}, #{messageId}, #{tenantId}, #{deptId}, #{patientId},
+            #{createdAt}, #{archivedAt}, #{payload}
+        )
+        ON DUPLICATE KEY UPDATE message_id = message_id
+    </insert>
+
+    <!-- Total order, so two reads of an unchanged transcript always produce the same checksum. -->
+    <select id="selectBySessionId" resultMap="ArchivedMessageResultMap">
+        SELECT session_id, message_id, tenant_id, dept_id, patient_id, created_at, archived_at, payload
+        FROM med_message_archive
+        WHERE session_id = #{sessionId}
+        ORDER BY created_at ASC, message_id ASC
+    </select>
+
+    <!--
+      Manifest insert as a compare-and-set on "has this session been exported?": 1 = written now,
+      0 = already exported by an earlier (or concurrent) run. The manifest is written only after the
+      cold copy has been read back and compared, so its presence is a verified claim, not a hope.
+    -->
+    <insert id="insertManifestIfAbsent" parameterType="com.med.qa.domain.entity.SessionArchiveManifestDO"
+            useGeneratedKeys="false">
+        INSERT INTO med_session_archive (
+            session_id, tenant_id, dept_id, patient_id, message_count, payload_checksum, exported_at
+        ) VALUES (
+            #{sessionId}, #{tenantId}, #{deptId}, #{patientId},
+            #{messageCount}, #{payloadChecksum}, #{exportedAt}
+        )
+        ON DUPLICATE KEY UPDATE session_id = session_id
+    </insert>
+
+    <select id="selectManifest" resultMap="ArchiveManifestResultMap">
+        SELECT session_id, tenant_id, dept_id, patient_id, message_count, payload_checksum, exported_at
+        FROM med_session_archive
+        WHERE session_id = #{sessionId}
+    </select>
+
+</mapper>

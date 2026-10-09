@@ -359,6 +359,43 @@ class AlertingStackConfigTest {
     }
 
     @Test
+    @DisplayName("the D48 archive rules select the codes the scheduler actually exports")
+    void archiveRulesMatchTheExportedCodes() throws IOException {
+        // Two rules, two constants, two files. The mismatch rule matters most: "the cold copy does not
+        // match the source" is a data-integrity signal, and a rule that silently stopped selecting it
+        // would leave the export's refusals visible only in a log line nobody reads.
+        String scheduler = read("src/main/java/com/med/qa/service/MedSessionArchiveExportScheduler.java");
+        assertThat(scheduler).contains("session-archive-failed");
+        assertThat(scheduler).contains("session-archive-mismatch");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-archive-failed\"");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-archive-mismatch\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionArchiveExportFailed");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionArchiveMismatch");
+        // Nothing is lost when either fires (the export only ever inserts), so both warn rather than
+        // page - but neither may be silent.
+        assertThat(read(ALERT_RULES)).contains("component: session-archive");
+        assertThat(read(ALERT_RULES)).contains("severity: warning");
+    }
+
+    @Test
+    @DisplayName("the archive switches are declared in application.yml and default to off and dry")
+    void archivePropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_SESSION_ARCHIVE_ENABLED",
+                "MED_SESSION_ARCHIVE_DRY_RUN",
+                "MED_SESSION_ARCHIVE_BATCH_SIZE",
+                "MED_SESSION_ARCHIVE_MAX_BATCHES");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // A capability that copies clinical records must not be armed by the repository, and arming it
+        // must still require a second decision.
+        assertThat(applicationYml).contains("MED_SESSION_ARCHIVE_ENABLED:false");
+        assertThat(applicationYml).contains("MED_SESSION_ARCHIVE_DRY_RUN:true");
+    }
+
+    @Test
     @DisplayName("the rebuild switches are declared in application.yml and default to off")
     void rebuildPropertiesAreDeclared() {
         List<String> variables = List.of(

@@ -403,6 +403,14 @@ livenessProbe:
 | `MED_SESSION_RETENTION_INITIAL_DELAY` | `5m` | 启动后首次运行的延迟 |
 | `MED_SESSION_RETENTION_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
 | `MED_SESSION_RETENTION_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
+| `MED_SESSION_ARCHIVE_ENABLED` | `false` | 已归档会话轨迹冷归档导出总开关（见 7.9） |
+| `MED_SESSION_ARCHIVE_DRY_RUN` | `true` | 开启后仍只报告不拷贝 |
+| `MED_SESSION_ARCHIVE_BATCH_SIZE` | `50` | 每批取多少会话 |
+| `MED_SESSION_ARCHIVE_MAX_BATCHES` | `5` | 单次运行最多几批 |
+| `MED_SESSION_ARCHIVE_CHECK_INTERVAL` | `6h` | 两次运行之间的固定延迟 |
+| `MED_SESSION_ARCHIVE_INITIAL_DELAY` | `10m` | 启动后首次运行的延迟 |
+| `MED_SESSION_ARCHIVE_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
+| `MED_SESSION_ARCHIVE_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
 
 ### 5.5 RAG
 
@@ -434,12 +442,16 @@ livenessProbe:
 | 层次 | 归属 | 内容 |
 |---|---|---|
 | 数据库 + 账号 | `docker/mysql/init/01-create-db.sql`（Compose 首次启动执行一次，幂等） | 建 `med_qa` 库（utf8mb4）、建 `med_qa@%` / `med_qa@localhost` 账号并授权 |
-| 表结构 | Flyway V1–V4（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8） |
+| 表结构 | Flyway V1–V5（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8）；V5：冷归档表 `med_message_archive` + `med_session_archive`（D48，见 7.9） |
 | 向量索引 | Spring AI `RedisVectorStore`（`initialize-schema=true`） | RediSearch 索引 `med-doc-index`，TAG 字段 `tenant_id` / `dept_id` / `patient_id` |
 
 分片规则见 `src/main/resources/sharding/med-sharding.yaml`：
 `med_message` 按 `session_id` 经 `MED_CRC32_MOD` 算法插件路由到 16 张物理表；
-`med_session` / `med_audit_log` 走 `!SINGLE` 规则落在同一数据源。
+`med_session` / `med_audit_log` / `med_message_archive` / `med_session_archive` 走 `!SINGLE` 规则落在同一数据源。
+
+> **冷归档表为什么显式写进 `!SINGLE`（D48）**：`med_message_archive` 与 `med_session_archive` 是
+> **刻意不分片**的（一次会话的轨迹是一条连续范围读，而不是散在 16 张分表里），把它写进规则就是把这
+> 个决定写下来——否则下一位读者会以为「漏了分片规则」而顺手补上。
 
 > 独立部署（不用 Compose）时，请自行执行 `docker/mysql/init/01-create-db.sql` 等价语句；
 > 表结构无需手工建，Flyway 会迁移。
@@ -813,6 +825,97 @@ D47 的作业把「`ACTIVE` 且超过 `MED_SESSION_RETENTION_IDLE_THRESHOLD` 未
 
 ---
 
+### 7.9 冷归档导出（D48）
+
+7.8 的作业把陈旧会话的状态翻成 `ARCHIVED` 并丢掉它的 Redis 窗口，但**轨迹一行没动**：它仍躺在 16 张
+`med_message_*` 热分表里。也就是说「这个会话已归档」这句话在存储层没有任何可验证的凭据——既没有冷副本，
+也没有一份能证明冷副本完整的摘要。
+
+D48 补上这一半：把已归档会话的**完整轨迹**按统一存储规范（Protobuf 二进制）复制到**非分片**冷表
+`med_message_archive`，并在 `med_session_archive` 写一行**导出清单**。存的是冻结的 Protobuf 字节，因此
+异构 Python 中间件用自己的 `med_session.proto` 就能解——这是路线图第四节「两套系统可互读互迁」承诺的
+第一个可执行落点。
+
+| 表 | 内容 | 主键 |
+|---|---|---|
+| `med_message_archive` | 每条消息一行：`session_id` / `message_id` / 租户科室患者 / `created_at` / `archived_at` / `payload`（冻结的 Protobuf 字节，`LONGBLOB`） | `(session_id, message_id)` |
+| `med_session_archive` | 每个已导出会话一行（导出清单）：`message_count` / `payload_checksum` / `exported_at` | `session_id` |
+
+> **为什么冷表不分片**：一次会话的轨迹是一条连续范围读（`idx_med_message_archive_session`），而不是
+> 散在 16 张分表里的散射查询。分片规则存在的意义是让**在线问诊的写入路径**便宜，冷数据没有写入路径。
+
+**校验和怎么算（`SessionArchiveChecksum`）**：逐条按 `message_id \t created_at \t sha256hex(payload)`
+组成规范行，用 `\n` 连接后再做一次 SHA-256，得到 64 位小写十六进制。空轨迹的摘要是 `sha256("")`
+（`e3b0c442…`），与「从未导出」区分得开——后者由清单行的**存在与否**表达。Python 侧不需要本项目的任何
+代码，按同一份规范就能复算出同一个摘要。
+
+两把钥匙，都默认保守（与 D38 的索引重建、D47 的保留策略同源）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MED_SESSION_ARCHIVE_ENABLED` | `false` | 总开关；关闭时导出与调度器都不存在，定时器不碰数据库 |
+| `MED_SESSION_ARCHIVE_DRY_RUN` | `true` | **开启能力后仍然只报告不拷贝**：先读一次报告，确认范围合理再关掉它 |
+| `MED_SESSION_ARCHIVE_BATCH_SIZE` | `50` | 每批取多少会话 |
+| `MED_SESSION_ARCHIVE_MAX_BATCHES` | `5` | 单次运行最多几批（`batch-size × max-batches` = 单次最多导出多少会话） |
+| `MED_SESSION_ARCHIVE_CHECK_INTERVAL` | `6h` | 两次运行之间的间隔（固定延迟，不是固定频率） |
+| `MED_SESSION_ARCHIVE_INITIAL_DELAY` | `10m` | 启动后多久开始第一轮 |
+| `MED_SESSION_ARCHIVE_LOCK_WAIT` | `5s` | 抢集群互斥锁的等待时间 |
+| `MED_SESSION_ARCHIVE_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 交给 Redisson 看门狗续期 |
+
+**凭什么相信这份冷副本**——清单只在拿到证据之后才写，两条检查都在写清单之前：
+
+1. **源轨迹在拷贝期间没动过**。轨迹先读一遍用于建副本，写完冷表后再读一遍，两次的摘要必须一致，否则
+   **拒绝写清单**。支撑这条不变量的是「`ARCHIVED` 是终态且写入路径每轮问诊前都过
+   `MedChatSessionService#requireWritableSession`（`SessionStatus#isWritable()` 只对 `ACTIVE` 为真）」——
+   但这条不变量**属于另一个组件**，所以导出不靠「相信它」：将来若有人让归档会话重新可写，这里会以
+   `mismatched` 报警，而不是留下一份静默过期的冷副本。
+2. **冷副本能复现源摘要**。冷表读回来按同一规范重算摘要，必须等于源摘要。这一步才把「INSERT 返回 1」
+   变成「现在躺在冷表里的字节就是轨迹里的字节」。
+
+**拒绝认证不是死路**：行是**先拷贝、后认证**的，而拷贝是幂等的（主键 `(session_id, message_id)` +
+`ON DUPLICATE KEY UPDATE message_id = message_id`）。被拒绝的会话没有清单，因此**下一轮仍是候选**，
+只补缺的那几条消息然后重新认证——重试会收敛。
+
+> **本迭代不做删除**：导出只增不删，热分表一行不动，冷表也没有删除路径。7.8 的类注释承诺「误归档可以
+> 改回来」，删掉热行会让这句话失效；真正冷热分层的「清」需要自己的守卫与自己的迭代，本阶段没有给它编号。
+
+**运维含义**：
+
+- **单实例调试**：先 `MED_SESSION_ARCHIVE_ENABLED=true` + 保持 `DRY_RUN=true`，看一轮日志
+  （`dry run: transcript of archived session ... would be exported`）；再关掉 `DRY_RUN` 真正拷贝。
+- **集群**：多个副本同时开启是安全的。抢到 `med:lock:session:archive:export` 的副本才动手，其余副本报
+  `skipped-lock-held`（互斥生效，不是故障）。
+- **积压量**：报告里的 `remaining` 是运行结束时仍没有清单的已归档会话数；若每轮都非 0，说明
+  `batch-size × max-batches` 追不上积压，调大 `MAX_BATCHES`（或缩短 `CHECK_INTERVAL`）。
+- **复核单个会话**：`MedSessionArchiveExportService#verify(sessionId)` 返回
+  `VERIFIED` / `MANIFEST_MISSING` / `TRANSCRIPT_CHANGED` / `COLD_COPY_DIFFERS`。前两个是「导出没发生」，
+  第三个是「源在导出后又动过」（重新导出即可，作业会自己做），**第四个才指向冷表本身**——它才是需要
+  人去查冷存储的信号。该方法刻意**不挂任何控制器**：它按 sessionId 读轨迹、不带租户维度，不能交给
+  请求态调用者（与 D41/D42 收敛掉的那类缺口同源）。
+- **直接查积压，无需等作业**：
+
+  ```sql
+  -- 直接连物理 MySQL（绕开 ShardingSphere），status: ACTIVE=0 / CLOSED=1 / ARCHIVED=2
+  SELECT COUNT(*) FROM med_session s
+  WHERE s.status = 2
+    AND NOT EXISTS (SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id);
+  ```
+
+  候选查询正是这条语句（`SessionArchiveMapper#selectUnexportedArchivedSessions`）。**为什么把
+  `NOT EXISTS` 放进 SQL**：若改成「按 `updated_at` 翻一页再逐行问有没有清单」，最旧的那批恰好就是已
+  导出的那批，作业会永远原地打转、永远够不到后面的积压。
+- **告警**：`session-archive-completed`（INFO，只在真的导出了东西时发）、`session-archive-mismatch`
+  （WARNING，有副本被拒绝认证）、`session-archive-failed`（WARNING，整轮失败）。三者都不 page：导出只
+  增不删，任何一条触发时临床数据都完好无损；但也都不能静默——**「作业停了」和「医院没有可归档的会话」
+  外观完全一样**，而「有副本没通过校验」与「作业正常跟上了」同样外观一致。
+- 跨组件契约：`MedSessionArchiveExportServiceTest`（锁被占时不碰 MySQL、dry-run 零写入、源在拷贝中途
+  变化/冷副本摘要不符时**拒绝写清单**、单会话失败不中断整轮）、`SessionArchiveMapperShardingTest`
+  （真实 DDL 下 V5 建表、`NOT EXISTS` 候选查询排除已导出会话、`insertIfAbsent` 幂等、BLOB 逐字节往返、
+  清单 CAS）、`MedSessionArchiveConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在
+  `application.yml` 里真实存在）。
+
+---
+
 ## 8. 日志与故障排查
 
 ```bash
@@ -840,7 +943,7 @@ docker compose logs -f mysql redis-stack
 **备份**
 
 ```bash
-# MySQL 逻辑备份（含 16 张分表 + 会话 + 审计）
+# MySQL 逻辑备份（含 16 张分表 + 会话 + 审计 + 冷归档表）
 docker exec med-qa-mysql mysqldump -uroot -p"$MED_MYSQL_ROOT_PASSWORD" \
   --single-transaction --routines --triggers med_qa > med_qa_$(date +%F).sql
 

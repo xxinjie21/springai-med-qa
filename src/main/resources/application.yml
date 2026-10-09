@@ -168,6 +168,32 @@ med:
       initial-delay: ${MED_SESSION_RETENTION_INITIAL_DELAY:5m}
       lock-wait-time: ${MED_SESSION_RETENTION_LOCK_WAIT:5s}
       lock-lease-time: ${MED_SESSION_RETENTION_LOCK_LEASE:5m}
+    # Cold transcript archive (D48). D47 turns an abandoned consultation into ARCHIVED and drops its
+    # Redis window, but the transcript stays in the 16 sharded med_message tables - so "archived" had no
+    # verifiable counterpart in storage. This job copies the transcript of every archived session into
+    # the non-sharded med_message_archive table in the storage-spec Protobuf encoding, then writes a
+    # manifest (message count + SHA-256 of the canonical transcript form) only after reading the cold
+    # copy back and comparing it with the source. "The INSERT returned 1" is not evidence; a digest that
+    # reproduces is.
+    #
+    # enabled=false because it writes copies of clinical records nobody asked about; dry-run=true on top
+    # of that so arming the capability still copies nothing until an operator has read a report. Same two
+    # switches as the D38 index rebuild and the D47 sweep.
+    #
+    # Nothing here deletes anything: the hot transcript is read-only for this job and no code path
+    # removes an archive row. Purging the hot rows is irreversible and deliberately out of scope.
+    #
+    # batch-size * max-batches bounds how many sessions one run may export; a run that hits that bound
+    # reports the remaining backlog and the next run continues (oldest first).
+    archive:
+      enabled: ${MED_SESSION_ARCHIVE_ENABLED:false}
+      dry-run: ${MED_SESSION_ARCHIVE_DRY_RUN:true}
+      batch-size: ${MED_SESSION_ARCHIVE_BATCH_SIZE:50}
+      max-batches: ${MED_SESSION_ARCHIVE_MAX_BATCHES:5}
+      check-interval: ${MED_SESSION_ARCHIVE_CHECK_INTERVAL:6h}
+      initial-delay: ${MED_SESSION_ARCHIVE_INITIAL_DELAY:10m}
+      lock-wait-time: ${MED_SESSION_ARCHIVE_LOCK_WAIT:5s}
+      lock-lease-time: ${MED_SESSION_ARCHIVE_LOCK_LEASE:5m}
   # Schema migration target (D34). Flyway must talk to the physical MySQL server, never to the
   # ShardingSphere data source declared under spring.datasource: the migrations create the physical
   # shard tables med_message_0..15, which are precisely the tables the sharding proxy treats as

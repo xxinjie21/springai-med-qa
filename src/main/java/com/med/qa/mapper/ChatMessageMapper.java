@@ -74,6 +74,24 @@ public interface ChatMessageMapper {
     List<ChatMessageDO> selectBySessionIdOrderByCreatedAtAsc(@Param("sessionId") String sessionId);
 
     /**
+     * Loads the full transcript of a session in a <em>total</em> order, for the cold archive export
+     * (D48).
+     *
+     * <p>Deliberately separate from
+     * {@link #selectBySessionIdOrderByCreatedAtAsc(String)}: replaying a window into a chat memory
+     * only needs "the messages, roughly in order", while the export certifies the copy with a checksum
+     * over the exact sequence. Two messages written in the same millisecond have no defined order under
+     * {@code created_at} alone, so the export would occasionally compute a different digest for an
+     * unchanged transcript and report a false mismatch. Ordering by {@code (created_at, message_id)}
+     * removes that ambiguity; the extra key costs nothing on a single-shard, index-backed read.</p>
+     *
+     * @param sessionId the owning session id, also the sharding key
+     * @return the transcript ordered by {@code created_at} then {@code message_id}, possibly empty,
+     *         never {@code null}
+     */
+    List<ChatMessageDO> selectTranscriptBySessionId(@Param("sessionId") String sessionId);
+
+    /**
      * Updates the privacy {@code masked} flag of a single message.
      *
      * @param messageId the message primary key

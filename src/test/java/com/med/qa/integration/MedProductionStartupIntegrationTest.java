@@ -11,6 +11,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
@@ -122,13 +123,26 @@ class MedProductionStartupIntegrationTest {
                         .contains("med_message_" + shard);
             }
             assertThat(tables).contains("flyway_schema_history");
-            assertThat(appliedMigrationCount()).as("V1, V2, V3 and V4 must all be applied").isEqualTo(4);
+            assertThat(appliedMigrationCount()).as("V1 to V5 must all be applied").isEqualTo(5);
             // V4 exists for the D47 retention sweep, whose query is the only one in the repository
             // without a tenant dimension. Asserted against the real server because the index is what
             // keeps that sweep off a full table scan: H2 accepting the DDL does not prove MySQL does.
             assertThat(indexColumns(MIGRATED_SCHEMA, "med_session", "idx_med_session_retention"))
                     .as("migration V4 must create the retention index on the real server")
                     .containsExactly("status", "updated_at");
+            // V5 creates the D48 cold archive. Asserted here because the export job's first symptom
+            // without it is "table 'med_qa.med_message_archive' doesn't exist" on a timer, hours after
+            // a green build - and because the payload column has to be a real BLOB type on MySQL, not
+            // just something H2 accepted in MySQL compatibility mode.
+            assertThat(tables).as("migration V5 must create both cold archive tables")
+                    .contains("med_message_archive", "med_session_archive");
+            assertThat(columnType(MIGRATED_SCHEMA, "med_message_archive", "payload"))
+                    .as("the frozen Protobuf payload must survive as a binary large object")
+                    .isEqualTo("longblob");
+            assertThat(indexColumns(MIGRATED_SCHEMA, "med_message_archive",
+                    "idx_med_message_archive_session"))
+                    .as("a session's transcript must be one contiguous range read")
+                    .containsExactly("session_id", "created_at", "message_id");
         }
     }
 
@@ -208,6 +222,28 @@ class MedProductionStartupIntegrationTest {
                     columns.add(rs.getString(1));
                 }
                 return columns;
+            }
+        }
+    }
+
+    /**
+     * Returns the data type MySQL reports for one column, in lower case.
+     *
+     * @param schema the schema holding the table
+     * @param table  the table holding the column
+     * @param column the column to inspect
+     * @return the lower-case data type, or an empty string when the column does not exist
+     */
+    private static String columnType(String schema, String table, String column) throws Exception {
+        try (Connection connection = rawConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT data_type FROM information_schema.columns "
+                             + "WHERE table_schema = ? AND table_name = ? AND column_name = ?")) {
+            statement.setString(1, schema);
+            statement.setString(2, table);
+            statement.setString(3, column);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() ? rs.getString(1).toLowerCase(Locale.ROOT) : "";
             }
         }
     }

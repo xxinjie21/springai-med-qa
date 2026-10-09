@@ -140,6 +140,48 @@ groups:
             which is not a failure.
           runbook: "docs/DEPLOYMENT.md#78-会话保留策略d47"
 
+      - alert: MedQaSessionArchiveExportFailed
+        # D48. The cold archive export copies the transcript of every archived consultation and
+        # certifies it with a checksum. When a run fails, consultations keep working and no data is at
+        # risk - the archive simply stops growing. That is exactly why it needs a rule: an archive that
+        # stopped growing looks identical to a hospital with nothing to archive.
+        expr: increase(med_qa_alert_total{code="session-archive-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-archive
+        annotations:
+          summary: "The cold transcript archive export is failing"
+          description: >-
+            MedSessionArchiveExportScheduler reported a failed run, so archived consultations are not
+            being copied to the cold store. Check MySQL reachability and Redis (the run takes the
+            cluster-wide mutex med:lock:session:archive:export before touching any row), then review
+            med.session.archive.* - a dry-run deployment reports what it would export and never copies,
+            which is not a failure.
+          runbook: "docs/DEPLOYMENT.md#79-冷归档导出d48"
+
+      - alert: MedQaSessionArchiveMismatch
+        # D48. The export refused to certify at least one transcript: either the source changed while it
+        # was being copied, or the cold copy read back with a different digest. Nothing has been lost
+        # (the export never deletes and never overwrites a certified session), so this is a warning -
+        # but it is the only signal that says "the cold store does not hold what it claims to hold", and
+        # it must not be averaged away by the sessions that exported cleanly in the same run.
+        expr: increase(med_qa_alert_total{code="session-archive-mismatch"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-archive
+        annotations:
+          summary: "A cold archive copy failed its checksum verification"
+          description: >-
+            MedSessionArchiveExportScheduler refused certification for {{ $value }} transcript(s). The
+            affected sessions keep no manifest and stay in the backlog, so the next run re-copies the
+            missing messages and retries; repeated mismatches for the same session mean either the
+            transcript is still being written (which ARCHIVED sessions must never be) or the archive
+            rows are being altered outside the application. Verify one session with
+            MedSessionArchiveExportService#verify before touching anything.
+          runbook: "docs/DEPLOYMENT.md#79-冷归档导出d48"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.

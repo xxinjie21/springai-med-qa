@@ -442,6 +442,24 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D48 cold archive and what it refuses to do")
+    void apiChapterDocumentsTheD48ColdArchive() {
+        // The README has to admit that D47's archiving only flipped a status column, that the cold copy
+        // is certified by a digest rather than by a row count, and - most importantly - that no hot row
+        // is deleted: an operator who reads "cold tier" as "purge" would stop worrying about the shards.
+        assertThat(readme).contains("（D48）");
+        assertThat(readme).contains("MedSessionArchiveExportService");
+        assertThat(readme).contains("med:lock:session:archive:export");
+        assertThat(readme).contains("med_message_archive");
+        assertThat(readme).contains("med_session_archive");
+        assertThat(readme).contains("SessionArchiveChecksum");
+        assertThat(readme).contains("MED_SESSION_ARCHIVE_ENABLED");
+        assertThat(readme).contains("session-archive-mismatch");
+        assertThat(readme).contains("SessionArchiveMapperShardingTest");
+        assertThat(readme).contains("MedSessionArchiveConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

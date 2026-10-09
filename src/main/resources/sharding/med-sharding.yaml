@@ -42,14 +42,21 @@ rules:
         props:
           sharding-count: 16
 
-  # Sessions and the audit trail live in non-sharded tables. The SINGLE rule lets ShardingSphere
-  # manage them on med_ds (routing and metadata) alongside the sharded med_message tables;
-  # defaultDataSource ensures any future unconfigured table still resolves instead of failing with
-  # "table not found".
+  # Sessions, the audit trail and the cold transcript archive live in non-sharded tables. The SINGLE
+  # rule lets ShardingSphere manage them on med_ds (routing and metadata) alongside the sharded
+  # med_message tables; defaultDataSource ensures any future unconfigured table still resolves instead
+  # of failing with "table not found".
+  #
+  # med_message_archive / med_session_archive (D48) are listed explicitly rather than left to the
+  # default: the archive is a deliberate design decision (one contiguous range read per session instead
+  # of a 16-way scatter-gather), and a rule that says so is what stops a later reader from "fixing" the
+  # missing sharding rule.
   - !SINGLE
     tables:
       - med_ds.med_session
       - med_ds.med_audit_log
+      - med_ds.med_message_archive
+      - med_ds.med_session_archive
     defaultDataSource: med_ds
 
 props:

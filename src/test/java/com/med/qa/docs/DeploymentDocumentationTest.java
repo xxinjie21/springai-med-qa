@@ -253,6 +253,28 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D48 cold archive, its verification and what it refuses to do")
+    void coldArchiveIsDocumented() {
+        // Three silent failures live behind this job: arming it without a dry run copies clinical
+        // records nobody reviewed, a run that refuses certification looks exactly like a run that is
+        // keeping up (the sessions simply stay in the backlog), and an operator who believes the cold
+        // store is a purge would stop worrying about the hot shards. The handbook has to answer all
+        // three, and name the digest and the mutex so the claims can be checked.
+        assertThat(handbook).contains("（D48）");
+        assertThat(handbook).contains("MED_SESSION_ARCHIVE_ENABLED");
+        assertThat(handbook).contains("MED_SESSION_ARCHIVE_DRY_RUN");
+        assertThat(handbook).contains("med:lock:session:archive:export");
+        assertThat(handbook).contains("med_message_archive");
+        assertThat(handbook).contains("med_session_archive");
+        assertThat(handbook).contains("payload_checksum");
+        assertThat(handbook).contains("SessionArchiveChecksum");
+        assertThat(handbook).contains("session-archive-mismatch");
+        assertThat(handbook).contains("MedSessionArchiveExportService");
+        assertThat(handbook).contains("SessionArchiveMapperShardingTest");
+        assertThat(handbook).contains("MedSessionArchiveConfigTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
@@ -303,11 +325,11 @@ class DeploymentDocumentationTest {
         assertThat(handbook).contains("docker/mysql/init/01-create-db.sql");
         assertThat(Path.of(System.getProperty("user.dir"), "docker/mysql/init/01-create-db.sql")).exists();
 
-        assertThat(handbook).contains("Flyway V1–V4");
+        assertThat(handbook).contains("Flyway V1–V5");
         Path migrationDir = Path.of(System.getProperty("user.dir"), "src/main/resources/db/migration");
         try (var stream = Files.list(migrationDir)) {
             List<String> migrations = stream.map(p -> p.getFileName().toString()).sorted().toList();
-            assertThat(migrations).hasSize(4);
+            assertThat(migrations).hasSize(5);
             assertThat(migrations.get(0)).startsWith("V1__");
             assertThat(migrations.get(1)).startsWith("V2__");
             assertThat(migrations.get(2)).startsWith("V3__");
@@ -315,7 +337,13 @@ class DeploymentDocumentationTest {
             // operator ends up debugging a missing index in production (V4 exists for the retention
             // sweep, whose cross-tenant query is a full table scan without it).
             assertThat(migrations.get(3)).startsWith("V4__");
+            // V5 creates the cold archive tables. They are new tables rather than a change to an
+            // existing one, which is exactly the kind of migration an operator only notices when the
+            // archive job reports "table not found" - so it is asserted here by name.
+            assertThat(migrations.get(4)).startsWith("V5__");
             assertThat(handbook).contains("idx_med_session_retention");
+            assertThat(handbook).contains("med_message_archive");
+            assertThat(handbook).contains("med_session_archive");
         }
         assertThat(handbook).contains("med_message_{0..15}");
         assertThat(sharding).contains("MED_CRC32_MOD");

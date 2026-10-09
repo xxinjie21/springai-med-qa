@@ -455,6 +455,50 @@ max-batches` 给单次运行封顶，`remaining` 报告积压量；**不删任�
 `AND updated_at <= :idleBefore` 后 `updateStatusIfStaleRefusesARefreshedSession` 立刻失败
 （`expected: <0> but was: <1>`），还原后重跑全绿。
 
+#### 已归档会话的冷归档导出（D48）
+
+D47 把状态翻成 `ARCHIVED` 并丢掉 Redis 窗口，但**轨迹一行没动**：它仍躺在 16 张 `med_message_*` 热分表里。
+也就是说「这个会话已归档」在存储层**没有任何可验证的凭据**——既没有冷副本，也没有一份能证明冷副本完整
+的摘要。D48 补上这一半：把已归档会话的完整轨迹按统一存储规范（Protobuf 二进制）复制到**非分片**冷表
+`med_message_archive`，并在 `med_session_archive` 写一行导出清单（`message_count` + `payload_checksum`）。
+存的是冻结的 Protobuf 字节，异构 Python 中间件用自己的 `med_session.proto` 就能解——这是路线图第四节
+「两套系统可互读互迁」承诺的第一个可执行落点。
+
+工程取舍：
+
+- **冷表刻意不分片**：一次会话的轨迹是一条连续范围读（`(session_id, message_id)` 主键 +
+  `idx_med_message_archive_session`），而不是散在 16 张分表里的散射查询。分片规则的意义是让在线问诊的
+  **写入路径**便宜，冷数据没有写入路径。
+- **认证需要证据，而不是「INSERT 返回 1」**：① 轨迹先读一遍用于建副本，写完冷表后**再读一遍**，两次
+  摘要必须一致；② 冷表读回来按同一规范**重算摘要**，必须等于源摘要。两条都过才写清单。第一条支撑于
+  「`ARCHIVED` 是终态且写入路径只接受 `ACTIVE`（`requireWritableSession`）」——但这条不变量属于另一个
+  组件，所以导出不靠「相信它」：将来若有人让归档会话重新可写，这里会以 `mismatched` 报警。
+- **摘要口径只有一处**（`SessionArchiveChecksum`）：逐条 `message_id \t created_at \t sha256hex(payload)`
+  组成规范行，再整体 SHA-256；空轨迹是 `sha256("")`，与「从未导出」区分得开。零自研哈希，Python 侧按同一
+  规范就能复算。
+- **拒绝认证不是死路**：先拷贝、后认证，拷贝幂等（主键 + `ON DUPLICATE KEY UPDATE`），被拒的会话没有
+  清单因而**下一轮仍是候选**，只补缺的消息再重新认证——重试收敛。
+- **候选查询用 `NOT EXISTS`**：若改成「按 `updated_at` 翻一页再逐行问有没有清单」，最旧的那批恰好就是
+  已导出的那批，作业会永远原地打转。
+- **两把钥匙**：`med.session.archive.enabled` 默认 `false`、`dry-run` 默认 `true`（与 D38/D47 同源），
+  集群互斥 `med:lock:session:archive:export`（抢不到报 `skipped-lock-held` 而不碰数据库），
+  `batch-size × max-batches` 封顶单次运行。V5 迁移建两张冷表并写进 `!SINGLE` 规则。
+- **不做删除**：导出只增不删，热分表一行不动，冷表也没有删除路径。D47 承诺过「误归档可以改回来」，
+  删热行会让这句话失效；冷热分层的「清」需要自己的守卫与自己的迭代。
+
+告警码 `session-archive-completed`（INFO）、`session-archive-mismatch`（WARNING，有副本被拒绝认证）、
+`session-archive-failed`（WARNING）。三者都不 page（导出只增不删，临床数据完好），但也都不静默——
+**「作业停了」和「医院没有可归档的会话」外观完全一样**。运维可点名复核单个会话：
+`MedSessionArchiveExportService#verify` 返回 `VERIFIED` / `MANIFEST_MISSING` / `TRANSCRIPT_CHANGED` /
+`COLD_COPY_DIFFERS`，其中**只有第四个指向冷表本身**；它刻意不挂控制器（按 sessionId 读轨迹、不带租户
+维度，不能交给请求态调用者）。
+
+守护测试：`MedSessionArchiveExportServiceTest`（锁被占时不碰 MySQL、dry-run 零写入、源在拷贝中途变化或
+冷副本摘要不符时**拒绝写清单**、单会话失败不中断整轮）、`SessionArchiveMapperShardingTest`（真实 DDL 下
+V5 建表、`NOT EXISTS` 候选查询排除已导出会话、`insertIfAbsent` 幂等、BLOB 逐字节往返、清单 CAS）、
+`MedSessionArchiveConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在 `application.yml` 里真实
+存在）。
+
 ---
 
 ## 错误码
@@ -501,6 +545,7 @@ max-batches` 给单次运行封顶，`remaining` 报告积压量；**不删任�
 | `MED_CHAT_STREAM_HEARTBEAT` / `MED_CHAT_STREAM_TIMEOUT` | `15` / `120` | SSE 心跳与超时（秒） |
 | `MED_LOCK_WAIT_TIME` / `MED_LOCK_LEASE_TIME` / `MED_LOCK_WATCHDOG_TIMEOUT` | `3s` / `0s` / `30s` | 会话锁（lease 0 = 看门狗续期） |
 | `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | 陈旧会话自动归档（默认关闭且只报告，见 D47） |
+| `MED_SESSION_ARCHIVE_ENABLED` / `MED_SESSION_ARCHIVE_DRY_RUN` | `false` / `true` | 已归档会话轨迹冷归档导出（默认关闭且只报告，见 D48） |
 | `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | 陈旧阈值与单次运行的批量上限 |
 | `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | 保留策略轮询间隔与启动宽限期 |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
@@ -574,7 +619,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下验证归档语句自身携带陈旧谓词，D47）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下验证归档语句自身携带陈旧谓词，D47）、`SessionArchiveMapperShardingTest`（真实 DDL 下验证冷归档的候选查询、幂等拷贝与 BLOB 逐字节往返，D48）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -754,7 +799,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 7 RAG 索引运维与检索可观测 | D37–D39 | 已完成（D37 索引健康与漂移检测、D38 受控索引重建、D39 检索质量回归基线） |
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
 | 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
-| 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 进行中（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run，配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest`；D48 待定） |
+| 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 已完成（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run；D48：给「归档」补上可验证的凭据——已归档会话的完整轨迹按 Protobuf 规范复制到非分片冷表 `med_message_archive`，并在 `med_session_archive` 写清单（条数 + SHA-256 摘要），清单只在源轨迹稳定且冷副本能复现摘要之后才写，**只增不删**。配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`） |
 
 ---
 
