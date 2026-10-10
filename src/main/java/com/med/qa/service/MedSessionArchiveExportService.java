@@ -212,9 +212,11 @@ public class MedSessionArchiveExportService {
      *
      * <p>Exists so that the certification the export wrote can be audited independently of the run that
      * wrote it: by an operator investigating the cold store, by a future purge job that must not delete
-     * rows it cannot account for, and by the contract tests. It shares
-     * {@link SessionArchiveChecksum} with the export, so "what the export certified" and "what a
-     * verification recomputes" cannot drift into two different notions of equality.</p>
+     * rows it cannot account for, and by the contract tests. The digest it compares is built by
+     * {@link TranscriptDigests} and defined by {@link SessionArchiveChecksum} — the same two pieces
+     * the export certifies with and the D49 read path selects a tier with — so "what the export
+     * certified", "what a verification recomputes" and "what a read trusts" cannot drift into three
+     * different notions of equality.</p>
      *
      * <p>System-side operation: it is deliberately not reachable from any controller, because it reads
      * a transcript by session id without a tenant/department scope and therefore must never be handed
@@ -232,8 +234,8 @@ public class MedSessionArchiveExportService {
         }
         List<ChatMessageDO> transcript = readTranscript(sessionId);
         List<ArchivedMessageDO> archived = readArchived(sessionId);
-        String hotChecksum = digestOfTranscript(transcript);
-        String archivedChecksum = digestOfArchived(archived);
+        String hotChecksum = TranscriptDigests.ofTranscript(transcript, codec);
+        String archivedChecksum = TranscriptDigests.ofArchived(archived);
         SessionArchiveManifestDO manifest = readManifest(sessionId);
 
         SessionArchiveVerification.Status status;
@@ -333,13 +335,13 @@ public class MedSessionArchiveExportService {
         }
 
         // The copy is written; now prove it is worth certifying.
-        String rereadChecksum = digestOfTranscript(readTranscript(sessionId));
+        String rereadChecksum = TranscriptDigests.ofTranscript(readTranscript(sessionId), codec);
         if (!rereadChecksum.equals(encoded.checksum())) {
             log.warn("archived session {} changed while its transcript was being copied, "
                     + "refusing to certify it", sessionId);
             return CandidateResult.mismatch("the source transcript changed while it was being copied");
         }
-        String archivedChecksum = digestOfArchived(readArchived(sessionId));
+        String archivedChecksum = TranscriptDigests.ofArchived(readArchived(sessionId));
         if (!archivedChecksum.equals(encoded.checksum())) {
             log.warn("cold copy of archived session {} does not reproduce the source digest, "
                     + "refusing to certify it", sessionId);
@@ -383,36 +385,6 @@ public class MedSessionArchiveExportService {
                     payload));
         }
         return new EncodedTranscript(SessionArchiveChecksum.of(entries), rows);
-    }
-
-    /**
-     * Computes the canonical digest of a live transcript by encoding it exactly as the export does.
-     *
-     * @param transcript the transcript in storage order
-     * @return the 64-character hex digest, never {@code null}
-     */
-    private String digestOfTranscript(List<ChatMessageDO> transcript) {
-        List<SessionArchiveChecksum.Entry> entries = new ArrayList<>(transcript.size());
-        for (ChatMessageDO message : transcript) {
-            entries.add(new SessionArchiveChecksum.Entry(message.getMessageId(),
-                    message.getCreatedAt(), codec.encodeMessage(message)));
-        }
-        return SessionArchiveChecksum.of(entries);
-    }
-
-    /**
-     * Computes the canonical digest of a cold copy from the payloads it actually stores.
-     *
-     * @param archived the archive rows in storage order
-     * @return the 64-character hex digest, never {@code null}
-     */
-    private static String digestOfArchived(List<ArchivedMessageDO> archived) {
-        List<SessionArchiveChecksum.Entry> entries = new ArrayList<>(archived.size());
-        for (ArchivedMessageDO row : archived) {
-            entries.add(new SessionArchiveChecksum.Entry(row.getMessageId(), row.getCreatedAt(),
-                    row.getPayload()));
-        }
-        return SessionArchiveChecksum.of(entries);
     }
 
     /**

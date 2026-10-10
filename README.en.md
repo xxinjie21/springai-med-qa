@@ -200,6 +200,7 @@ Swagger UI: `http://localhost:8080/swagger-ui.html`. OpenAPI document: `/v3/api-
 | `GET` | `/api/sessions/{sessionId}` | Read one session | Patients may only read their own |
 | `POST` | `/api/sessions/{sessionId}/close` | Close a session (idempotent) | |
 | `POST` | `/api/sessions/{sessionId}/archive` | Archive a session (idempotent) | An archived session can no longer be closed |
+| `GET` | `/api/sessions/{sessionId}/transcript` | Read a session's transcript (hot shard or cold copy) | The response names the `source` (`HOT` / `COLD`) and the canonical digest (D49) |
 | `GET` | `/api/sessions` | Paged session listing | `tenantId`, `deptId`, `patientId`, `page`, `size` |
 | `POST` | `/api/rag/documents/ingest` | Batch ingestion of medical documents | `@RateLimit`, staff only, identity taken from the API key (D42) |
 | `POST` | `/api/rag/documents/delete` | Delete by isolation scope | Staff only; a department-wide delete needs `confirmDepartmentWide=true` (D42) |
@@ -554,6 +555,66 @@ tables, the `NOT EXISTS` candidate query excluding exported sessions, the idempo
 BLOB round trip and the manifest compare-and-set, all against the real DDL) and
 `MedSessionArchiveConfigTest` (the switch really adds and removes the beans, and the `@Scheduled`
 placeholder keys really exist in `application.yml`).
+
+#### Reading an archived transcript (D49)
+
+D47 made `ARCHIVED` reachable by a **job**, and D48 gave it a **verifiable credential** in storage — but
+across both iterations **the transcript itself became unreadable from the application**. Archiving
+evicts the Redis window, and no code path in the service returns a session's messages:
+`ChatController` only appends a turn, `SessionController` only creates / gets / closes / archives /
+lists, and `MedSessionArchiveExportService#verify` reads the cold store solely to recompute a digest and
+is deliberately not reachable from the request path. So "archived" meant "gone": a clinician could see
+the `med_session` row (`status=ARCHIVED`) and none of what was said in it — the cold copy was the only
+thing that could prove what had been archived, and the service could not read it. D49 adds that **read**
+path, and it adds the read *before* anything is allowed to delete: **without a read path no hot row may
+ever be removed**, which is why D50 will stand on a read path already proven to work.
+
+`MedTranscriptService#read(tenantId, deptId, sessionId)` returns a `SessionTranscript` (`sessionId`,
+`status`, `source`, `checksum`, `messages`). **Which copy answers is decided by a digest, never by an
+ordering or a flag**:
+
+- Not `ARCHIVED`, or archived with **no export manifest** → the shard is the only copy and is returned
+  (`source=HOT`). "Archived but never exported" is the normal state of a deployment that has not armed
+  `med.session.archive.enabled`, and refusing it would turn an optional background job into a
+  prerequisite for reading clinical records.
+- With a manifest, the live transcript is re-hashed through `TranscriptDigests`: if it reproduces the
+  manifest's `payload_checksum`, the shard still holds the certified transcript and is returned (`HOT`).
+- Otherwise the cold copy is read and hashed the same way: if it reproduces the manifest, it is returned
+  (`COLD`), each payload decoded back into the storage-spec entity by `ProtoMessageCodec#decodeMessage`.
+  That covers both the state D50 will create deliberately (hot rows gone) and the state a half-finished
+  purge leaves behind (hot rows partially gone), so D50 needs no extra branch.
+- **If neither copy reproduces the certification the read is refused** with `STORAGE_ERROR`: returning
+  the shard would serve bytes the archive says are not the transcript, and returning an empty transcript
+  would report data loss as "this consultation was empty".
+
+Engineering choices:
+
+- **Authorization is delegated, never re-implemented**: `read` resolves the session through
+  `MedChatSessionService#getSession`, so a session of another tenant/department is reported as
+  `NOT_FOUND` and a patient reading somebody else's consultation is refused by `PatientAccessGuard`
+  (`FORBIDDEN`). The read path adds no "read by session id" primitive to the request surface — the hole
+  class D41/D42 closed.
+- **One definition of the digest**: the new `TranscriptDigests` gathers "live transcript → canonical
+  digest" and "cold copy → canonical digest", and `MedSessionArchiveExportService`'s two private
+  implementations now delegate to it, so "what the export certified", "what a verification recomputes"
+  and "what a read trusts" cannot become three different notions of equality.
+- **No lock and no switch**: the append path re-sends the whole window on every turn and writes each
+  message idempotently (D44), so a read can only ever see complete rows, and the cold copy is a frozen
+  snapshot. Reading is a core capability — a switch would only give an operator a way to make clinical
+  records silently unreadable.
+- **The response exposes `source` and `checksum`**: an operator compares the digest against
+  `med_session_archive.payload_checksum`, and a client can notice that a transcript changed between two
+  reads. The message DTO is **not** text-masked: the privacy layer covers phone numbers, id cards and
+  medical-record numbers, while the clinical text *is* the record and the caller has already been
+  authorized for it.
+
+Guards: `MedTranscriptServiceTest` (a hot read never touches the archive, an archived-but-unexported
+session still reads its shard, a partially purged shard loses to the cold copy, an unaccountable
+transcript is **refused**, a malformed payload is refused rather than skipped, storage failures map to
+`STORAGE_ERROR`), `SessionTranscriptTest`, `TranscriptDigestsTest`, `TranscriptResponseTest` /
+`MessageResponseTest`, `SessionControllerTest`, and `MedStorageAndLockIntegrationTest`, which proves
+against real MySQL that a transcript can still be read back through `med_session.proto` after the hot
+rows are deleted.
 
 ---
 
@@ -1046,6 +1107,7 @@ the loop of code, unit tests, commit and push:
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
 | Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | Complete (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46: window-semantics comments aligned, deployment prerequisites (utf8mb4, H2 console) corrected, and the privacy-layer comments fixed, guarded by `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`) |
 | Phase 10, session lifecycle governance and retention | D47 to D48 | Complete (D47: the "retention job sweeping stale sessions" that `archiveSession`'s javadoc has promised since D20 now exists — stale `ACTIVE` sessions move to `ARCHIVED`, the staleness predicate travels inside the archiving statement itself, the archive runs under the session lock, cluster-wide mutual exclusion uses an `RLock`, and the capability is off and report-only by default. D48: "archived" finally has a verifiable counterpart in storage — the full transcript of every archived session is copied in the Protobuf encoding into the non-sharded `med_message_archive` table, and a manifest row (count + SHA-256 digest) is written into `med_session_archive` only after the source has been shown to be stable and the cold copy has been shown to reproduce the digest; **insert-only, nothing is deleted**. Guarded by `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`) |
+| Phase 11, archived-transcript readability and hot-data close-out | D49 to D50 | D49 done (the single read path that ends "archived means gone": `MedTranscriptService` resolves scope and ownership through the lifecycle service first, then decides between the hot shard and the cold copy by recomputing the canonical digest, and refuses when neither reproduces the certification; `SessionController` gained `GET /api/sessions/{sessionId}/transcript`, and the response names the `source` and the digest. Guarded by `MedTranscriptServiceTest` / `SessionTranscriptTest` / `TranscriptDigestsTest` / `TranscriptResponseTest` / `MessageResponseTest`, with cold reads proven against real MySQL); D50 not started (purging hot shards is only allowed on top of D49's read path) |
 
 ---
 

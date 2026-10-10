@@ -191,6 +191,7 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `GET` | `/api/sessions/{sessionId}` | 查询单个会话 | 患者仅可查本人 |
 | `POST` | `/api/sessions/{sessionId}/close` | 关闭会话（幂等） | |
 | `POST` | `/api/sessions/{sessionId}/archive` | 归档会话（幂等） | 归档后不可再关闭 |
+| `GET` | `/api/sessions/{sessionId}/transcript` | 读取会话轨迹（热表 / 冷副本） | 响应给出 `source`（`HOT` / `COLD`）与规范摘要（D49） |
 | `GET` | `/api/sessions` | 会话分页列表 | `tenantId` / `deptId` / `patientId` / `page` / `size` |
 | `POST` | `/api/rag/documents/ingest` | 医疗文档批量入库 | `@RateLimit`，仅 STAFF；身份取自 API Key（D42） |
 | `POST` | `/api/rag/documents/delete` | 按隔离 scope 删除 | 仅 STAFF；部门级删除需 `confirmDepartmentWide=true`（D42） |
@@ -499,6 +500,49 @@ V5 建表、`NOT EXISTS` 候选查询排除已导出会话、`insertIfAbsent` �
 `MedSessionArchiveConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在 `application.yml` 里真实
 存在）。
 
+#### 归档会话轨迹的读取（D49）
+
+D47 让 `ARCHIVED` 第一次能被**作业**到达，D48 让它在存储层第一次有了**可验证的凭据**——但两轮下来，
+**轨迹本身从应用侧读不到了**：归档会 evict Redis 窗口，而服务里没有任何代码路径能把一个会话的消息读回来。
+`ChatController` 只负责追加新的一轮，`SessionController` 只有 create / get / close / archive / list，
+`MedSessionArchiveExportService#verify` 读冷表只是为了算摘要、且它刻意不对请求态开放。于是「归档」在应用
+语义上等于「消失」：医生看得到 `med_session` 那一行（`status=ARCHIVED`），却看不到这次会诊说过什么——
+冷副本是唯一能证明「归档了什么」的东西，而本服务自己解不了它。D49 补的正是这条**读**路径，并且先补读、
+再谈清：**没有读路径就绝不能删热行**（D50 因此站在一条已被证明可用的读路径之上）。
+
+`MedTranscriptService#read(tenantId, deptId, sessionId)` 返回 `SessionTranscript`（`sessionId` /
+`status` / `source` / `checksum` / `messages`）。**读哪一份靠摘要判定，不靠时序**：
+
+- `status != ARCHIVED`，或该会话**没有**导出清单 → 热分表就是唯一副本，直接返回（`source=HOT`）。
+  「归档了但从未导出」是没开 `med.session.archive.enabled` 的部署的常态，拒读它等于把可选的后台作业
+  变成读病历的前置条件。
+- 有清单时，按 `TranscriptDigests` 重算热轨迹摘要：等于清单里的 `payload_checksum` → 热行仍是那份被认证
+  的轨迹，返回 `HOT`。
+- 否则读冷副本并按同一规范重算：等于清单摘要 → 返回 `COLD`（`ProtoMessageCodec#decodeMessage` 逐条解回
+  统一存储实体）。这同时覆盖了 D50 之后「热行已删」与「删到一半、热行残缺」两种形态，D50 不需要再加分支。
+- **两份都对不上 → 抛 `STORAGE_ERROR` 拒绝返回**：返回热行等于交付档案说「不是这份」的字节，返回空轨迹
+  等于把数据丢失报成「这次会诊是空的」。拒绝是唯一诚实的答案，而且很响。
+
+工程取舍：
+
+- **授权完全复用生命周期服务**：`read` 先经 `MedChatSessionService#getSession`——租户/科室不匹配按
+  `NOT_FOUND` 上报、患者越权由 `PatientAccessGuard` 拒绝（`FORBIDDEN`）。读路径不自建 scope 判断，也**不
+  新增任何「按 sessionId 直读」的无守卫原语**（D41/D42 收敛掉的那类缺口）。
+- **摘要口径只有一处**：新增 `TranscriptDigests` 收拢「热轨迹 → 规范摘要」与「冷副本 → 规范摘要」两个
+  构造，`MedSessionArchiveExportService` 的两处私有实现改为委托它，使「导出认证的摘要」「复核重算的摘要」
+  「读取校验的摘要」在代码上不可能是三套口径。
+- **不加锁、不加开关**：写入路径每轮重发整窗且逐条幂等（D44），读到的永远是完整行；冷副本是冻结快照。
+  读是常驻能力——能被开关关掉的读路径等于给运维发一把「静默 404」的钥匙。
+- **响应暴露 `source` 与 `checksum`**：运维要拿它和 `med_session_archive.payload_checksum` 比对，
+  客户端要能察觉两次读之间轨迹变了。消息 DTO **不做文本脱敏**：脱敏层针对手机号/身份证/病历号，而临床
+  正文本身就是这条记录的内容，调用方已被 `PatientAccessGuard` 限定为本人/本科室。
+
+守护测试：`MedTranscriptServiceTest`（热读不碰归档表、归档但未导出仍读热表、热行残缺时回落冷副本、
+两份都对不上时**拒绝**、坏 Protobuf 载荷拒绝而非跳过、存储故障映射为 `STORAGE_ERROR`、越权由生命周期
+服务抛出）、`SessionTranscriptTest`、`TranscriptDigestsTest`、`TranscriptResponseTest` /
+`MessageResponseTest`、`SessionControllerTest`，以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL 上
+验证「把热行删干净后仍能按 `med_session.proto` 读回同一段轨迹」。
+
 ---
 
 ## 错误码
@@ -800,6 +844,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
 | 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
 | 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 已完成（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run；D48：给「归档」补上可验证的凭据——已归档会话的完整轨迹按 Protobuf 规范复制到非分片冷表 `med_message_archive`，并在 `med_session_archive` 写清单（条数 + SHA-256 摘要），清单只在源轨迹稳定且冷副本能复现摘要之后才写，**只增不删**。配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`） |
+| 阶段 11 归档轨迹的可读性与热数据收口 | D49–D50 | D49 已完成（把「归档 = 消失」补回一条**唯一**的读路径：`MedTranscriptService` 先经生命周期服务完成 scope 与归属校验，再按 `TranscriptDigests` 重算摘要决定「热分表还是冷副本」作答，两份都对不上则拒绝返回；`SessionController` 新增 `GET /api/sessions/{sessionId}/transcript`，响应给出 `source` 与规范摘要。配 `MedTranscriptServiceTest` / `SessionTranscriptTest` / `TranscriptDigestsTest` / `TranscriptResponseTest` / `MessageResponseTest`，并在真实 MySQL 上验证冷读）；D50 未开始（在 D49 的读路径之上才允许清理热分表） |
 
 ---
 

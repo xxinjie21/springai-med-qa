@@ -460,6 +460,27 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D49 transcript read path and why a refusal is the honest answer")
+    void apiChapterDocumentsTheD49TranscriptRead() {
+        // The README has to admit that D47/D48 left the transcript unreadable from the application,
+        // name the tier the response came from, and - most importantly - state that an unaccountable
+        // transcript is refused instead of guessed: a reader who thinks the endpoint falls back to
+        // "whatever is there" would not recognise the refusal as a data-integrity signal.
+        assertThat(readme).contains("（D49）");
+        assertThat(readme).contains("MedTranscriptService");
+        assertThat(readme).contains("TranscriptDigests");
+        assertThat(readme).contains("SessionTranscript");
+        assertThat(readme).contains("HOT");
+        assertThat(readme).contains("COLD");
+        assertThat(readme).contains("payload_checksum");
+        assertThat(readme).contains("MedTranscriptServiceTest");
+        assertThat(readme).contains("MedStorageAndLockIntegrationTest");
+        // The digest is shared with the export, so "what was certified" and "what a read trusts"
+        // cannot become two different notions of equality.
+        assertThat(readme).contains("SessionArchiveChecksum");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

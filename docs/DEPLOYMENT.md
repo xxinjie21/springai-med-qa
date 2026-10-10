@@ -914,6 +914,58 @@ D48 补上这一半：把已归档会话的**完整轨迹**按统一存储规范
   清单 CAS）、`MedSessionArchiveConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在
   `application.yml` 里真实存在）。
 
+### 7.10 归档轨迹的读取（D49）
+
+**先记住一句话**：D49 之前，「归档」在应用侧等于「消失」。归档会 evict Redis 窗口，而服务里没有任何
+代码路径能把一个会话的消息读回来——`ChatController` 只追加新的一轮，`SessionController` 只有
+create / get / close / archive / list，`verify` 读冷表只为算摘要且刻意不对请求态开放。运维看到的现象是
+「`med_session` 有这一行、`status=ARCHIVED`，但接口拿不到会诊内容」。
+
+**读路径只有一个入口**：`GET /api/sessions/{sessionId}/transcript?tenantId=&deptId=`，内部是
+`MedTranscriptService#read`。响应体同时给出两个运维要用的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `source` | `HOT` = 来自 16 张 `med_message_*` 热分表；`COLD` = 来自 `med_message_archive` 冷副本 |
+| `checksum` | 返回这段轨迹的**规范摘要**，与 `med_session_archive.payload_checksum` 同一口径 |
+
+**读哪一份不是「先热后冷」的经验规则，而是一次可重算的摘要比较**：
+
+1. 会话不是 `ARCHIVED`，或它**没有**导出清单 → 热分表是唯一副本，返回 `HOT`。这就是没开
+   `MED_SESSION_ARCHIVE_ENABLED` 的部署的常态，读路径不会因为「没开归档」而拒读。
+2. 有清单时，重算热轨迹摘要；等于清单里的 `payload_checksum` → 热行仍是那份被认证的轨迹，返回 `HOT`。
+3. 否则读冷副本并按同一规范重算；等于清单摘要 → 返回 `COLD`。这覆盖两种形态：热行已被清空，以及
+   **删到一半、热行残缺**——D50 的清理不需要在读路径里再加分支。
+4. 两份都对不上 → HTTP `200` + 业务码 `50301`（`STORAGE_ERROR`）**拒绝返回**。这是刻意的：返回热行等于
+   交付档案说「不是这份」的字节，返回空轨迹等于把数据丢失报成「这次会诊是空的」。
+
+**排障动作**（都直连物理 MySQL，绕开 ShardingSphere）：
+
+```sql
+-- 1) 这个会话有没有被认证过（status: ACTIVE=0 / CLOSED=1 / ARCHIVED=2）
+SELECT session_id, status, updated_at FROM med_session WHERE session_id = '<id>';
+SELECT message_count, payload_checksum, exported_at FROM med_session_archive WHERE session_id = '<id>';
+
+-- 2) 热分表里还剩几条（分片号 = crc32(session_id) % 16，与统一存储规范一致）
+SELECT COUNT(*) FROM med_message_<shard> WHERE session_id = '<id>';
+
+-- 3) 冷副本里几条
+SELECT COUNT(*) FROM med_message_archive WHERE session_id = '<id>';
+```
+
+- 接口返回 `50301` 且第 1 步有清单、第 3 步条数与 `message_count` 不一致 → **冷副本被改动或丢失**，
+  这是数据完整性问题：不要手工补写冷表，先按 §9 从备份恢复，再重新入库该会话的轨迹。
+- 接口返回 `source=COLD` 而第 2 步还有行 → 热行与清单对不上（残缺或被改），读路径已自动改走冷副本；
+  该信号说明有东西在绕过写入路径动热表，先查审计日志（`med_audit_log`）。
+- 接口 `404`（业务码 `40400`）→ 会话不存在，或 `tenantId`/`deptId` 与行不匹配（**跨科室一律按不存在上报**，
+  这是 D21 的隔离语义，不是故障）；`403`（`40300`）→ 患者读的不是自己的会话。
+- **读路径没有开关**，也不该有：能被关掉的读路径等于给运维发一把「静默 404」的钥匙。它同样**不加锁**——
+  写入路径每轮重发整窗且逐条幂等（D44），读到的永远是完整行。
+- 跨组件契约：`MedTranscriptServiceTest`（热读不碰归档表、归档但未导出仍读热表、热行残缺时回落冷副本、
+  两份都对不上时拒绝、坏 Protobuf 载荷拒绝而非跳过）、`SessionTranscriptTest`、`TranscriptDigestsTest`、
+  `TranscriptResponseTest` / `MessageResponseTest`，以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL 上
+  验证「把热行删干净后仍能按 `med_session.proto` 读回同一段轨迹」。
+
 ---
 
 ## 8. 日志与故障排查

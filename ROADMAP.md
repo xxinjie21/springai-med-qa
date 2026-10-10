@@ -301,6 +301,36 @@ springai-med-qa/
 > D48 **刻意没有**实现冷表的清理（把热分表里的行删掉）：那是不可逆操作，需要自己的守卫、
 > 自己的开关和自己的迭代，而路线图里没有给它编号。
 
+### 阶段 11：归档轨迹的可读性与热数据收口（D49–D50）
+
+> 阶段 11 的出发点：D47 让 `ARCHIVED` 第一次能被**作业**到达，D48 让它在存储层第一次有了
+> **可验证的凭据**（冷副本 + 摘要 + 清单）——但两轮下来，**轨迹本身从应用侧读不到了**。
+> 归档会 evict Redis 窗口，而整个服务里没有任何代码路径能把一个会话的消息**读回来**：
+> `ChatController` 只负责追加新的一轮，`SessionController` 只有 create / get / close / archive / list，
+> 没有「读轨迹」的端点，`MedSessionArchiveExportService#verify` 读冷表只是为了**算摘要**、
+> 且它自己的 javadoc 写明「刻意不对请求态开放」。于是「归档」在应用语义上等于「消失」：
+> 医生看得到 `med_session` 这一行（`status=ARCHIVED`），却看不到这次会诊说过什么。
+> 这仍然是阶段 8/9/10 那一类偏差——**注释承诺了代码没有的行为**（D48 说冷副本「Python 中间件
+> 用自己的 `med_session.proto` 就能解」，而本服务自己解不了）——只是这次缺的是一个**读**能力，
+> 而且它的缺失同样不会让任何测试变红。
+>
+> 阶段 11 先补读、再谈清：**没有读路径就绝不能删热行**——D48 之后冷副本是唯一能证明「归档了
+> 什么」的东西，如果应用自己读不出它，那么任何清理都等于把会诊记录变成只能靠人工 `SELECT` 才能
+> 看懂的字节。因此 D49 只做读，把 D48 反复点名的「清」留到 D50，并让 D50 站在一条已被证明可用的
+> 读路径之上。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D49 | 归档会话轨迹的读取（热表 / 冷副本统一读路径） | 给「一个会话说过什么」补一条**唯一**的读路径：`MedTranscriptService`（`com.med.qa.service`，`@Service`，**常驻**——热读能力与 `med.session.archive.enabled` 无关，归档关闭的部署同样必须能读）暴露 `SessionTranscript read(tenantId, deptId, sessionId)`，返回 `SessionTranscript`（`sessionId` / `status` / `source` / `messages` / `checksum`，`Source` 只有 `HOT` 与 `COLD` 两个值）。**授权完全复用 `MedChatSessionService#getSession`**：租户/科室不匹配按「不存在」上报（`NOT_FOUND`）、患者越权由 `PatientAccessGuard` 拒绝（`FORBIDDEN`）——读路径不自建 scope 判断，也不新增任何「按 sessionId 直读」的无守卫原语（D41/D42 的教训）。**取哪一份靠摘要判定，不靠时序**：`status != ARCHIVED` 或该会话**没有**导出清单时，热分表就是唯一副本，直接返回（`HOT`）；有清单时按 `TranscriptDigests` 分别重算两份摘要，**谁能复现清单里的 `payload_checksum` 就返回谁**（热行仍在且未变 → `HOT`；热行已被清空或被改得对不上而冷副本完好 → `COLD`），两份都对不上则抛 `STORAGE_ERROR` **拒绝返回**——不返回未经认证的字节，也不把「读不出来」伪装成「会话是空的」。这条判定同时覆盖了 D50 之后的现场（热行已删）与「删到一半」（热行残缺）两种形态，不需要 D50 再加分支。**摘要是同一个口径**：新增 `TranscriptDigests`（`com.med.qa.service`）把「热轨迹 → 规范摘要」与「冷副本 → 规范摘要」两个构造收进一处，`MedSessionArchiveExportService` 的两处私有实现改为委托它，使「导出认证的摘要」与「读取校验的摘要」在代码上不可能是两套口径（与 D48 复用 `SessionArchiveChecksum` 同源）。**冷副本要解码回统一存储实体**：`ProtoMessageCodec#decodeMessage` 逐条解 Protobuf，坏字节按 `STORAGE_ERROR` 上报（D7 已有的语义），不静默跳过。**不加锁**：读不加 `RLock`——写入路径每轮重发整窗且逐条幂等，读到的永远是完整行；冷副本是冻结快照。**暴露面**：`SessionController` 新增 `GET /api/sessions/{sessionId}/transcript`（`@RequireDept(source = QUERY)`，与 `get`/`list` 同一条 scope 规则），响应 `TranscriptResponse`（含 `source` 与 `checksum`，便于运维比对冷热两份是否同源），消息 DTO `MessageResponse` 逐字段镜像存储规范、**不做文本脱敏**（脱敏层针对手机号/身份证/病历号，而临床正文本身就是这条记录的内容，且调用方已被 `PatientAccessGuard` 限定为本人/本科室）。守护测试：`MedTranscriptServiceTest`（热读、冷读、热行残缺时回落冷副本、两份都对不上时**拒绝**、无清单时读热、越权由生命周期服务抛出）、`SessionTranscriptTest`、`TranscriptResponseTest`、`SessionControllerTest` 新增用例、`MedTranscriptReadIntegrationTest` 在真实 MySQL 上验证「删掉热行后仍能按 `med_session.proto` 读回同一段轨迹」 | `feat(session): read archived transcripts from the certified cold copy` |
+| D50 | 已认证冷副本的热分表清理（**本阶段未实现，下一轮才做**） | 在 D49 的读路径之上才允许谈「清」：只有**清单存在且冷副本复现清单摘要**的会话，才可以把 16 张热分表里属于它的行删掉（`ChatMessageMapper#deleteBySessionId` 走分片键，单分片删除）。硬约束：① 删除前必须重算并比对摘要（读路径同一套 `TranscriptDigests`），对不上即**拒绝**；② 必须有一个**冷静期**（`min-archived-age`，D47 承诺过「误归档可以改回来」，清理不能把这句话变成空话）；③ `med.session.purge.*` 默认 `enabled=false` **且** `dry-run=true`；④ 集群互斥 `RLock`（键 `med:lock:session:purge`）；⑤ 删除**只针对 `med_message`**，冷表 `med_message_archive` / `med_session_archive` 一行不动（删了就没有凭据了）；⑥ 报告与告警（`session-purge-completed` / `-failed` / `-refused`）与 D47/D48 同形 | `feat(session): purge hot shards of certified archived transcripts` |
+
+> 阶段 11 进度：**D49 已完成，D50 未开始**。D49 让「归档」在应用侧不再等于「消失」，
+> 并且把「读哪一份」变成一次可重算的摘要比较，而不是一句信任。
+>
+> **阶段 11 之后没有 D51**：下次运行必须先扩写本路线图（新增阶段 12）再实现，不得自造迭代编号。
+> D49 **刻意没有**加任何删除能力，也没有给读路径加开关：读是常驻能力，能被开关关掉的读路径
+> 等于给运维发一把「静默 404」的钥匙。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

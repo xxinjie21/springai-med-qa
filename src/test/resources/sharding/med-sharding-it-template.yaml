@@ -1,11 +1,13 @@
 # Integration-test mirror of src/main/resources/sharding/med-sharding.yaml.
 #
 # The sharding rules (16 actual data nodes, session_id sharding column, MED_CRC32_MOD algorithm) and
-# the SINGLE rule for med_session / med_audit_log are byte-for-byte identical to production. Only the
-# underlying data source is swapped: MedStorageAndLockIntegrationTest reads this file, substitutes the
-# $${MED_MYSQL_*} placeholders with the connection details of a Testcontainers MySQL instance, and
-# points ShardingSphere at the resolved copy (placeholder-type=none), so the storage chain runs against
-# genuine MySQL without any change to the routing logic.
+# the SINGLE rule for med_session / med_audit_log / med_message_archive / med_session_archive are
+# byte-for-byte identical to production. Only the underlying data source is swapped:
+# MedStorageAndLockIntegrationTest reads this file, substitutes the $${MED_MYSQL_*} placeholders with the
+# connection details of a Testcontainers MySQL instance, and points ShardingSphere at the resolved copy
+# (placeholder-type=none), so the storage chain runs against genuine MySQL without any change to the
+# routing logic. The cold archive tables joined the SINGLE rule in D49, when the transcript read path
+# started resolving them through the same ShardingSphere data source as everything else.
 
 databaseName: med_qa
 
@@ -43,6 +45,8 @@ rules:
     tables:
       - med_ds.med_session
       - med_ds.med_audit_log
+      - med_ds.med_message_archive
+      - med_ds.med_session_archive
     defaultDataSource: med_ds
 
 props:

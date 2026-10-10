@@ -275,6 +275,26 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D49 transcript read path and how to triage a refusal")
+    void transcriptReadPathIsDocumented() {
+        // The operator-facing half of D49: which tier answered, how to compare the returned digest
+        // against the manifest, and what a 50301 refusal means. Without the triage table an operator
+        // would "fix" a data-integrity signal by hand-writing cold rows.
+        assertThat(handbook).contains("7.10");
+        assertThat(handbook).contains("（D49）");
+        assertThat(handbook).contains("MedTranscriptService");
+        assertThat(handbook).contains("TranscriptDigests");
+        assertThat(handbook).contains("/api/sessions/{sessionId}/transcript");
+        assertThat(handbook).contains("payload_checksum");
+        assertThat(handbook).contains("50301");
+        // The tier names have to be spelled out: an operator reads `source` out of the response.
+        assertThat(handbook).contains("HOT");
+        assertThat(handbook).contains("COLD");
+        assertThat(handbook).contains("MedTranscriptServiceTest");
+        assertThat(handbook).contains("MedStorageAndLockIntegrationTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

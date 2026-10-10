@@ -7,13 +7,16 @@ import com.med.qa.common.result.PageResult;
 import com.med.qa.config.MedSessionProperties;
 import com.med.qa.controller.dto.CreateSessionRequest;
 import com.med.qa.controller.dto.SessionResponse;
+import com.med.qa.controller.dto.TranscriptResponse;
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.DeptIdSource;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionPageQuery;
+import com.med.qa.service.SessionTranscript;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -32,8 +35,8 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.List;
 
 /**
- * REST surface for the consultation session lifecycle: creation, lookup, closing, archiving and paged
- * listing.
+ * REST surface for the consultation session lifecycle: creation, lookup, closing, archiving, paged
+ * listing, and reading a session's transcript.
  *
  * <h2>Scope handling</h2>
  * <p>Every operation takes the {@code tenantId} / {@code deptId} scope from the request. The scope is
@@ -64,15 +67,20 @@ public class SessionController {
 
     private final MedChatSessionService sessionService;
 
+    private final MedTranscriptService transcriptService;
+
     /**
      * Creates the controller.
      *
-     * @param sessionService session lifecycle service, must not be {@code null}
-     * @throws NullPointerException if {@code sessionService} is {@code null}
+     * @param sessionService    session lifecycle service, must not be {@code null}
+     * @param transcriptService transcript read service, must not be {@code null}
+     * @throws NullPointerException if an argument is {@code null}
      */
     @Autowired
-    public SessionController(MedChatSessionService sessionService) {
+    public SessionController(MedChatSessionService sessionService,
+                            MedTranscriptService transcriptService) {
         this.sessionService = sessionService;
+        this.transcriptService = transcriptService;
     }
 
     /**
@@ -123,6 +131,38 @@ public class SessionController {
         requireScope(tenantId, deptId);
         ChatSessionDO session = sessionService.getSession(tenantId, deptId, sessionId);
         return ApiResult.ok(SessionResponse.from(session));
+    }
+
+    /**
+     * Reads the transcript of one session.
+     *
+     * <p>Serves the live shard while it holds the transcript and the certified cold copy once it does
+     * not (D49); the response says which tier answered, so an operator can tell "the shards still hold
+     * it" from "the archive is carrying this consultation".</p>
+     *
+     * @param sessionId consultation session id, must not be blank
+     * @param tenantId  hospital/tenant id, must not be blank
+     * @param deptId    department id, must not be blank
+     * @return the transcript, or a {@code 404}-mapped {@link ErrorCode#NOT_FOUND} when absent
+     * @throws BizException {@link ErrorCode#BAD_REQUEST} when the scope is blank,
+     *                      {@link ErrorCode#NOT_FOUND} when unknown,
+     *                      {@link ErrorCode#FORBIDDEN} when the caller may not read it,
+     *                      {@link ErrorCode#STORAGE_ERROR} when no copy reproduces the certification
+     */
+    @GetMapping("/{sessionId}/transcript")
+    @RequireDept(source = DeptIdSource.QUERY)
+    @Operation(summary = "Read the transcript of a session",
+            description = "Returns every stored message of one session in order. The live shard answers "
+                    + "while it holds the transcript; an archived session falls back to the certified "
+                    + "cold copy. The response names the tier it was read from and carries the canonical "
+                    + "digest of the returned sequence.")
+    public ApiResult<TranscriptResponse> transcript(
+            @Parameter(description = "consultation session id") @PathVariable String sessionId,
+            @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+            @Parameter(description = "department id") @RequestParam String deptId) {
+        requireScope(tenantId, deptId);
+        SessionTranscript transcript = transcriptService.read(tenantId, deptId, sessionId);
+        return ApiResult.ok(TranscriptResponse.from(transcript));
     }
 
     /**

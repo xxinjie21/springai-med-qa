@@ -3,16 +3,22 @@ package com.med.qa.integration;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.med.qa.common.exception.BizException;
+import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedSessionProperties;
 import com.med.qa.config.RedissonConfig;
+import com.med.qa.domain.entity.ArchivedMessageDO;
 import com.med.qa.domain.entity.ChatMessageDO;
 import com.med.qa.domain.entity.ChatSessionDO;
+import com.med.qa.domain.entity.SessionArchiveManifestDO;
 import com.med.qa.domain.enums.RoleType;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
+import com.med.qa.mapper.SessionArchiveMapper;
 import com.med.qa.mapper.typehandler.MetadataTypeHandler;
 import com.med.qa.mapper.typehandler.RoleTypeTypeHandler;
 import com.med.qa.mapper.typehandler.SessionStatusTypeHandler;
@@ -25,6 +31,10 @@ import com.med.qa.memory.repository.MedChatMemoryRepository;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.memory.sharding.Crc32ShardingAlgorithm;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedTranscriptService;
+import com.med.qa.service.SessionArchiveChecksum;
+import com.med.qa.service.SessionTranscript;
+import com.med.qa.service.TranscriptDigests;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -119,8 +129,12 @@ class MedStorageAndLockIntegrationTest {
     private static RedisMessageCache cache;
     private static MedChatMemoryRepository repository;
     private static ChatSessionMapper sessionMapper;
+    private static ChatMessageMapper messageMapper;
+    private static SessionArchiveMapper archiveMapper;
+    private static ProtoMessageCodec codec;
     private static SessionLockService lockService;
     private static MedChatSessionService sessionService;
+    private static MedTranscriptService transcriptService;
 
     @BeforeAll
     static void startInfrastructure() throws Exception {
@@ -168,20 +182,24 @@ class MedStorageAndLockIntegrationTest {
         configuration.getTypeHandlerRegistry().register(SessionStatusTypeHandler.class);
         parseMapper(configuration, "/mapper/ChatMessageMapper.xml");
         parseMapper(configuration, "/mapper/ChatSessionMapper.xml");
+        parseMapper(configuration, "/mapper/SessionArchiveMapper.xml");
         SqlSessionFactory sqlSessionFactory = new SqlSessionFactoryBuilder().build(configuration);
         sqlSession = new SqlSessionTemplate(sqlSessionFactory);
 
-        ChatMessageMapper messageMapper = sqlSession.getMapper(ChatMessageMapper.class);
+        messageMapper = sqlSession.getMapper(ChatMessageMapper.class);
         sessionMapper = sqlSession.getMapper(ChatSessionMapper.class);
+        archiveMapper = sqlSession.getMapper(SessionArchiveMapper.class);
 
         redissonClient = buildRedissonClient();
 
         RedisTemplate<String, byte[]> redisTemplate = buildRedisTemplate();
-        cache = new RedisMessageCache(redisTemplate, new ProtoMessageCodec(), new MedCacheProperties());
+        codec = new ProtoMessageCodec();
+        cache = new RedisMessageCache(redisTemplate, codec, new MedCacheProperties());
         repository = new MedChatMemoryRepository(messageMapper, cache);
         lockService = new SessionLockService(redissonClient, new MedLockProperties());
         sessionService = new MedChatSessionService(
                 sessionMapper, lockService, cache, new MedSessionProperties(), Clock.systemUTC());
+        transcriptService = new MedTranscriptService(sessionService, messageMapper, archiveMapper, codec);
     }
 
     @AfterAll
@@ -377,6 +395,124 @@ class MedStorageAndLockIntegrationTest {
         });
         assertEquals("ok", result);
         assertFalse(lockService.isLocked(TENANT, DEPT, sessionId), "lock must be released afterwards");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Transcript read path against real MySQL (D49)
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("D49: a live session reads its transcript from the crc32-selected shard")
+    void readsALiveTranscriptFromTheShard() {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "读路径").getSessionId();
+        for (int turn = 1; turn <= 3; turn++) {
+            repository.append(turnMessage(sessionId, patientId, "第 " + turn + " 轮提问"));
+        }
+
+        SessionTranscript transcript = transcriptService.read(TENANT, DEPT, sessionId);
+
+        assertEquals(SessionTranscript.Source.HOT, transcript.source());
+        assertEquals(SessionStatus.ACTIVE, transcript.status());
+        assertEquals(3, transcript.messageCount());
+        // The digest the read returns is the same canonical form the archive certifies with.
+        assertEquals(TranscriptDigests.ofTranscript(transcript.messages(), codec), transcript.checksum());
+    }
+
+    @Test
+    @DisplayName("D49: once the shard is emptied, the certified cold copy carries the transcript")
+    void readsTheColdCopyOnceTheShardIsGone() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "冷读路径").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 4; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        // What D50 will do deliberately, and what the read path has to survive: the session is
+        // archived, the transcript is certified into the cold store, and then the hot rows go away.
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), TranscriptDigests.ofArchived(coldRows), 1_735_000_000_000L));
+        assertEquals(4, messageMapper.deleteBySessionId(sessionId), "the hot rows must really be gone");
+        assertEquals(0, countSessionRows(sessionId));
+
+        SessionTranscript read = transcriptService.read(TENANT, DEPT, sessionId);
+
+        assertEquals(SessionTranscript.Source.COLD, read.source());
+        assertEquals(SessionStatus.ARCHIVED, read.status());
+        assertEquals(4, read.messageCount());
+        assertEquals(transcript.stream().map(ChatMessageDO::getContent).toList(),
+                read.messages().stream().map(ChatMessageDO::getContent).toList());
+        // The bytes came back through med_session.proto: same digest as the certification.
+        assertEquals(TranscriptDigests.ofArchived(coldRows), read.checksum());
+        assertEquals(RoleType.PATIENT, read.messages().get(0).getRole());
+    }
+
+    @Test
+    @DisplayName("D49: an archived session whose cold copy no longer matches the manifest is refused")
+    void refusesAnUnaccountableArchivedTranscript() {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "拒绝").getSessionId();
+        ChatMessageDO message = turnMessage(sessionId, patientId, "原始内容");
+        repository.append(message);
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        // The manifest certifies a transcript the cold store does not hold - i.e. the archive is
+        // unaccountable. The read must refuse rather than answer with the hot row or an empty list.
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, 2, SessionArchiveChecksum.sha256Hex("unrelated".getBytes(
+                        java.nio.charset.StandardCharsets.UTF_8)), 1_735_000_000_000L));
+
+        BizException failure = assertThrows(BizException.class,
+                () -> transcriptService.read(TENANT, DEPT, sessionId));
+
+        assertEquals(ErrorCode.STORAGE_ERROR, failure.getErrorCode());
+    }
+
+    private static ChatMessageDO turnMessage(String sessionId, String patientId, String content) {
+        return turnMessage(sessionId, patientId, content, 1_735_000_000_000L);
+    }
+
+    /**
+     * Builds one stored turn.
+     *
+     * <p>{@code createdAt} is explicit rather than derived from a clock on purpose: the canonical
+     * digest covers the <em>sequence</em> of a transcript, and both the archive read and the manifest
+     * are ordered by {@code (created_at, message_id)}. A fixture that handed out arbitrary timestamps
+     * would be certified in one order and read back in another, and the test would report a mismatch
+     * that says nothing about the production path.</p>
+     */
+    private static ChatMessageDO turnMessage(String sessionId, String patientId, String content,
+                                             long createdAt) {
+        return ChatMessageDO.builder()
+                .messageId(UUID.randomUUID().toString())
+                .sessionId(sessionId)
+                .tenantId(TENANT)
+                .deptId(DEPT)
+                .patientId(patientId)
+                .role(RoleType.PATIENT)
+                .content(content)
+                .tokenCount(8)
+                .masked(false)
+                .createdAt(createdAt)
+                .metadata(new LinkedHashMap<>(Map.of("source", "web")))
+                .build();
+    }
+
+    private static List<ArchivedMessageDO> coldCopy(String sessionId, String patientId,
+                                                    List<ChatMessageDO> transcript) {
+        List<ArchivedMessageDO> rows = new java.util.ArrayList<>(transcript.size());
+        for (ChatMessageDO message : transcript) {
+            rows.add(new ArchivedMessageDO(sessionId, message.getMessageId(), TENANT, DEPT, patientId,
+                    message.getCreatedAt(), 1_735_000_000_000L, codec.encodeMessage(message)));
+        }
+        return rows;
     }
 
     // ---------------------------------------------------------------------------------------------

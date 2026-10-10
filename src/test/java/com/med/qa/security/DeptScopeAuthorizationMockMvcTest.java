@@ -17,6 +17,7 @@ import com.med.qa.controller.SessionController;
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedTranscriptService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -44,6 +45,8 @@ class DeptScopeAuthorizationMockMvcTest {
 
     private MedChatSessionService sessionService;
 
+    private MedTranscriptService transcriptService;
+
     private MedSecurityProperties properties;
 
     private MockMvc mockMvc;
@@ -51,10 +54,11 @@ class DeptScopeAuthorizationMockMvcTest {
     @BeforeEach
     void setUp() {
         sessionService = mock(MedChatSessionService.class);
+        transcriptService = mock(MedTranscriptService.class);
         properties = new MedSecurityProperties();
         DeptScopeInterceptor interceptor = new DeptScopeInterceptor(
                 properties, new DeptScopeGuard(), new DeptIdResolver());
-        mockMvc = MockMvcBuilders.standaloneSetup(new SessionController(sessionService))
+        mockMvc = MockMvcBuilders.standaloneSetup(new SessionController(sessionService, transcriptService))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .addInterceptors(interceptor)
                 .build();
@@ -157,6 +161,21 @@ class DeptScopeAuthorizationMockMvcTest {
                             .param("tenantId", "hosp-1")
                             .param("deptId", OWN_DEPT))
                     .andExpect(status().isOk());
+        }
+
+        @Test
+        @DisplayName("D49: reading the transcript of another department gets 403 and never reaches the reader")
+        void transcriptOfOtherDepartmentIsForbidden() throws Exception {
+            authenticateStaff();
+
+            MvcResult result = mockMvc.perform(get("/api/sessions/{sessionId}/transcript", "s-1")
+                            .param("tenantId", "hosp-1")
+                            .param("deptId", OTHER_DEPT))
+                    .andExpect(status().isForbidden())
+                    .andReturn();
+
+            assertThat(result.getResponse().getContentAsString()).contains("\"code\":40300");
+            verifyNoInteractions(sessionService, transcriptService);
         }
     }
 

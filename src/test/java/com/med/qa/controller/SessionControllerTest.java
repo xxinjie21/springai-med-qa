@@ -6,6 +6,7 @@ import static org.mockito.ArgumentCaptor.forClass;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.med.qa.common.exception.BizException;
@@ -14,10 +15,16 @@ import com.med.qa.common.result.ApiResult;
 import com.med.qa.common.result.PageResult;
 import com.med.qa.controller.dto.CreateSessionRequest;
 import com.med.qa.controller.dto.SessionResponse;
+import com.med.qa.controller.dto.TranscriptResponse;
+import com.med.qa.domain.entity.ChatMessageDO;
 import com.med.qa.domain.entity.ChatSessionDO;
+import com.med.qa.domain.enums.RoleType;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedTranscriptService;
+import com.med.qa.service.SessionArchiveChecksum;
 import com.med.qa.service.SessionPageQuery;
+import com.med.qa.service.SessionTranscript;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -35,12 +42,15 @@ class SessionControllerTest {
 
     private MedChatSessionService sessionService;
 
+    private MedTranscriptService transcriptService;
+
     private SessionController controller;
 
     @BeforeEach
     void setUp() {
         sessionService = mock(MedChatSessionService.class);
-        controller = new SessionController(sessionService);
+        transcriptService = mock(MedTranscriptService.class);
+        controller = new SessionController(sessionService, transcriptService);
     }
 
     private static ChatSessionDO session(String id, SessionStatus status) {
@@ -118,6 +128,50 @@ class SessionControllerTest {
                     .isInstanceOf(BizException.class)
                     .extracting(ex -> ((BizException) ex).getErrorCode())
                     .isEqualTo(ErrorCode.BAD_REQUEST);
+        }
+    }
+
+    @Nested
+    @DisplayName("transcript reading")
+    class Transcript {
+
+        @Test
+        @DisplayName("returns the transcript with the tier it was read from")
+        void readsTranscript() {
+            ChatMessageDO stored = ChatMessageDO.builder()
+                    .messageId("m-1")
+                    .sessionId("sess-1")
+                    .tenantId("hosp-1")
+                    .deptId("cardiology")
+                    .patientId("pat-77")
+                    .role(RoleType.PATIENT)
+                    .content("chest pain")
+                    .createdAt(1_700_000_000_000L)
+                    .build();
+            when(transcriptService.read("hosp-1", "cardiology", "sess-1"))
+                    .thenReturn(new SessionTranscript("sess-1", SessionStatus.ARCHIVED,
+                            SessionTranscript.Source.COLD,
+                            SessionArchiveChecksum.EMPTY_TRANSCRIPT, List.of(stored)));
+
+            ApiResult<TranscriptResponse> result =
+                    controller.transcript("sess-1", "hosp-1", "cardiology");
+
+            assertThat(result.isSuccess()).isTrue();
+            assertThat(result.getData().sessionId()).isEqualTo("sess-1");
+            assertThat(result.getData().source()).isEqualTo(SessionTranscript.Source.COLD);
+            assertThat(result.getData().messageCount()).isEqualTo(1);
+            assertThat(result.getData().messages().get(0).content()).isEqualTo("chest pain");
+            verify(transcriptService).read("hosp-1", "cardiology", "sess-1");
+        }
+
+        @Test
+        @DisplayName("rejects a blank department scope before reading anything")
+        void rejectsBlankScope() {
+            assertThatThrownBy(() -> controller.transcript("sess-1", "hosp-1", "  "))
+                    .isInstanceOf(BizException.class)
+                    .extracting(ex -> ((BizException) ex).getErrorCode())
+                    .isEqualTo(ErrorCode.BAD_REQUEST);
+            verifyNoInteractions(transcriptService);
         }
     }
 

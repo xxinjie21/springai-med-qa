@@ -422,6 +422,23 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D49 transcript read path and its refusal")
+    void apiChapterDocumentsTheD49TranscriptRead() {
+        // The English README is a translation of the same handbook: it must carry the tier the
+        // response came from, the shared digest, and the fact that an unaccountable transcript is
+        // refused rather than guessed.
+        assertThat(english).contains("D49");
+        assertThat(english).contains("MedTranscriptService");
+        assertThat(english).contains("TranscriptDigests");
+        assertThat(english).contains("SessionTranscript");
+        assertThat(english).contains("HOT");
+        assertThat(english).contains("COLD");
+        assertThat(english).contains("payload_checksum");
+        assertThat(english).contains("MedTranscriptServiceTest");
+        assertThat(english).contains("MedStorageAndLockIntegrationTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));
