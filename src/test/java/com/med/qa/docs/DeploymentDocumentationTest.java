@@ -295,6 +295,38 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D50 hot-shard purge, its three switches and what it refuses")
+    void hotShardPurgeIsDocumented() {
+        // Three silent failures live behind this job, and they are the reason the chapter exists.
+        // First: an operator who believes D48's cold archive is already a purge stops worrying about
+        // the hot shards, which grow without bound. Second: arming the job without a dry run deletes
+        // hot rows an operator never reviewed - and unlike an archive, a delete cannot be undone by
+        // re-running. Third: a refused candidate looks exactly like a session that is simply still in
+        // the backlog, so the refusal warning is the only signal that a copy no longer reproduces its
+        // certified digest. The handbook has to answer all three, and name the marker, the mutex, the
+        // cooling-off window and the three alert codes so the claims can be checked.
+        assertThat(handbook).contains("7.11");
+        assertThat(handbook).contains("（D50）");
+        assertThat(handbook).contains("MED_SESSION_PURGE_ENABLED");
+        assertThat(handbook).contains("MED_SESSION_PURGE_DRY_RUN");
+        assertThat(handbook).contains("MED_SESSION_PURGE_MIN_ARCHIVED_AGE");
+        assertThat(handbook).contains("med:lock:session:purge");
+        // The marker column is owned by V6 and the candidate query keys on it; an operator reading
+        // `purged_at` out of the row has to find it documented.
+        assertThat(handbook).contains("purged_at");
+        // The verification is a digest comparison, not a status check - the handbook must say so.
+        assertThat(handbook).contains("payload_checksum");
+        assertThat(handbook).contains("refused");
+        assertThat(handbook).contains("session-purge-completed");
+        assertThat(handbook).contains("session-purge-refused");
+        assertThat(handbook).contains("session-purge-failed");
+        assertThat(handbook).contains("MedSessionPurgeService");
+        assertThat(handbook).contains("MedSessionPurgeServiceTest");
+        assertThat(handbook).contains("SessionPurgeMapperShardingTest");
+        assertThat(handbook).contains("MedSessionPurgeConfigTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
@@ -345,11 +377,11 @@ class DeploymentDocumentationTest {
         assertThat(handbook).contains("docker/mysql/init/01-create-db.sql");
         assertThat(Path.of(System.getProperty("user.dir"), "docker/mysql/init/01-create-db.sql")).exists();
 
-        assertThat(handbook).contains("Flyway V1–V5");
+        assertThat(handbook).contains("Flyway V1–V6");
         Path migrationDir = Path.of(System.getProperty("user.dir"), "src/main/resources/db/migration");
         try (var stream = Files.list(migrationDir)) {
             List<String> migrations = stream.map(p -> p.getFileName().toString()).sorted().toList();
-            assertThat(migrations).hasSize(5);
+            assertThat(migrations).hasSize(6);
             assertThat(migrations.get(0)).startsWith("V1__");
             assertThat(migrations.get(1)).startsWith("V2__");
             assertThat(migrations.get(2)).startsWith("V3__");
@@ -361,9 +393,14 @@ class DeploymentDocumentationTest {
             // existing one, which is exactly the kind of migration an operator only notices when the
             // archive job reports "table not found" - so it is asserted here by name.
             assertThat(migrations.get(4)).startsWith("V5__");
+            // V6 adds the purge marker to med_session. A column added to an existing table is the
+            // quietest migration there is: nothing fails if it is missing, the candidate query just
+            // re-selects the same sessions forever, so the handbook must name it.
+            assertThat(migrations.get(5)).startsWith("V6__");
             assertThat(handbook).contains("idx_med_session_retention");
             assertThat(handbook).contains("med_message_archive");
             assertThat(handbook).contains("med_session_archive");
+            assertThat(handbook).contains("purged_at");
         }
         assertThat(handbook).contains("med_message_{0..15}");
         assertThat(sharding).contains("MED_CRC32_MOD");

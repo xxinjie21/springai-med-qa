@@ -543,6 +543,56 @@ D47 让 `ARCHIVED` 第一次能被**作业**到达，D48 让它在存储层第�
 `MessageResponseTest`、`SessionControllerTest`，以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL 上
 验证「把热行删干净后仍能按 `med_session.proto` 读回同一段轨迹」。
 
+#### 已认证冷副本的热分表清理（D50）
+
+D47 归档、D48 认证冷副本、D49 把冷副本读回来——但三轮下来，16 张 `med_message_*` 热分表里的行**一行都没少**：
+「已归档」从来没有让热层变小，冷热分层只做了一半。D50 补上另一半，它是**全项目唯一会删除临床数据**的代码
+路径，因此守卫也最多。
+
+**凭什么可以删**：只有存在第二份、且被认证过的副本时，删除才是可交代的。所以一个候选要通过**两重独立
+证明**，顺序不是实现细节：
+
+- **先验冷副本**。清单（`med_session_archive.payload_checksum`）认证了一份摘要，冷副本按同一规范
+  （`TranscriptDigests.ofArchived`）重算必须复现它。**在它成立之前，热行是这段轨迹的唯一副本**，删掉就是
+  数据丢失——所以冷副本不成立时连热分表都不读。
+- **再验热分表**。热轨迹按 `TranscriptDigests.ofTranscript` 重算也必须复现同一摘要。热行若已漂移，说明
+  分表里躺着**没人认证过的消息**，删掉就毁了它们的唯一记录——因此漂移同样**拒绝**，认证副本安然留在冷表。
+
+一个候选只有三种归宿：**认证通过且热行仍在** → 删热行 + 打退役标记；**认证通过但热行已空** → 没得删，但仍要
+打标记（否则最旧的那批已清理会话会在每轮被反复取出，作业永远够不到后面的）；**对不上账** → 拒绝，既不删也
+不标记，计入 `refused` 并带原因上报。
+
+工程取舍：
+
+- **退役标记放在 `med_session.purged_at`，不放在冷表**（V6 迁移加列，可空）。冷行是「归档了什么」的**证据**、
+  清单是**认证**，本项目在导出之后再没有写过这两张表，D50 也不破例——删除只针对 `med_message`。候选查询
+  `purged_at IS NULL` 因此必须留在 SQL 里：若改成「读一遍热分表看还有没有行」，最旧的那批已清理会话恰好就是
+  上一轮清掉的那批，作业会永远原地打转（与 D48 的 `NOT EXISTS` 同源）。
+- **先删后标记**，不合并成一条语句（它们分属分片表与会话登记表两个域，且顺序有意义）：中断只会留下「行没了但
+  还是候选」的会话，下一轮发现无行可删、打上标记即收敛；反过来则可能留下**再也没人看的行**。
+- **冷静期 `min-archived-age` 默认 7d**：D47 承诺过「误归档可以改回来」，而改回来需要轨迹还在。这个窗口就是
+  让那句承诺不落空的机制，而不是靠「作业跑得慢」。
+- **三道保守开关**：`enabled=false`、`dry-run=true`，再加冷静期。dry-run **仍然跑完整验证**（读清单、两份副本
+  与摘要），所以报告不只是「有多少候选」，而是「有多少会被清理、有多少会被拒绝」——这才是一份能用来决定要不要
+  真正启用的报告。
+- 集群互斥 `med:lock:session:purge`（抢不到报 `skipped-lock-held` 而不碰数据库）；`batch-size × max-batches`
+  给单次运行封顶，`remaining` 报告积压量；**不加会话锁**——候选都是 `ARCHIVED`，`SessionStatus#isWritable()`
+  把它们排除在写入路径之外，而真正能发现「读到一半」的是摘要比对（锁只能预防，校验能发现）。
+- 告警码 `session-purge-completed`（INFO，只在真的删了东西且非 dry-run 时发）、`session-purge-refused`
+  （WARNING，**一份没删**，但它是唯一能说「这份会诊的两份副本对不上」的信号，且不会自愈）、
+  `session-purge-failed`（WARNING）。**「作业停了」和「医院没有可清理的会话」外观完全一样。**
+
+守护测试：`MedSessionPurgeServiceTest`（锁被占时不碰 MySQL、dry-run 零写入却跑完整验证、**冷副本不成立时
+连热分表都不读**、热行漂移时拒绝而非删除、热行已空时打标记、删除失败不留标记、单个候选失败不中断整轮）、
+`SessionPurgeMapperShardingTest`（真实 DDL 下 V6 加列、候选查询四条谓词缺一不可、`markPurged` 是 CAS、
+`deleteBySessionId` 只删一个会话的一个分片且不碰冷表）、`MedSessionPurgeConfigTest`（开关真的增删 Bean，且
+`@Scheduled` 的占位符键在 `application.yml` 里真实存在）、`MedSessionPurgeSchedulerTest`（完成/拒绝/失败三种
+告警与 dry-run 静默），以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + Redis 上跑完整条链路：**用
+`MedSessionPurgeService` 真删热行，再用 D49 的读路径读回冷副本**。
+按项目惯例，两条关键守卫**先被亲眼看过它变红**：把「冷副本对不上就拒绝」改成「照删」，只有
+`MedSessionPurgeServiceTest$Refusals.refusesWhenTheColdCopyDiffers` 变红；把候选查询里的
+`purged_at IS NULL` 去掉，只有 `purgedSessionsLeaveTheCandidateSet` 变红；还原后重跑全绿。
+
 ---
 
 ## 错误码
@@ -590,6 +640,7 @@ D47 让 `ARCHIVED` 第一次能被**作业**到达，D48 让它在存储层第�
 | `MED_LOCK_WAIT_TIME` / `MED_LOCK_LEASE_TIME` / `MED_LOCK_WATCHDOG_TIMEOUT` | `3s` / `0s` / `30s` | 会话锁（lease 0 = 看门狗续期） |
 | `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | 陈旧会话自动归档（默认关闭且只报告，见 D47） |
 | `MED_SESSION_ARCHIVE_ENABLED` / `MED_SESSION_ARCHIVE_DRY_RUN` | `false` / `true` | 已归档会话轨迹冷归档导出（默认关闭且只报告，见 D48） |
+| `MED_SESSION_PURGE_ENABLED` / `MED_SESSION_PURGE_DRY_RUN` | `false` / `true` | 已认证冷副本的热分表清理（默认关闭、只报告、且有 7 天冷静期，见 D50） |
 | `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | 陈旧阈值与单次运行的批量上限 |
 | `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | 保留策略轮询间隔与启动宽限期 |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
@@ -663,7 +714,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | 单测 | JUnit 5 + Mockito，外部依赖全部 mock 或 H2 替身，`mvn test` 离线全绿 |
 | 构建类守护测试 | 解析 `pom.xml` / `Dockerfile` / `docker-compose.yml` / `.github/workflows/*.yml` 断言关键契约 |
-| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下验证归档语句自身携带陈旧谓词，D47）、`SessionArchiveMapperShardingTest`（真实 DDL 下验证冷归档的候选查询、幂等拷贝与 BLOB 逐字节往返，D48）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
+| 跨组件契约测试 | 断言**组件之间**真的接上了，而不是只测单个组件：`ApplicationProfileContractTest`（按 profile 优先级绑定实际生效的配置值，D40）、`StreamingIdentityContractTest`（真实 API Key → principal → 控制器 → 服务 → 守卫整条链，D41）、`RagAdminAuthorizationContractTest`（同一套链路在 `/api/rag/**` 上重跑一遍，D42）、`AlertDeliveryContractTest`（真实探针 → 健康组件 → 告警监控 → 通知器 → sink，D43）、`EmbeddingMetadataContractTest`（绑定生效的 `metadata-mode` 并用真实 Spring AI formatter 演示标签是否进向量，D45）、`ChatSessionMapperRetentionShardingTest`（真实 DDL 下验证归档语句自身携带陈旧谓词，D47）、`SessionArchiveMapperShardingTest`（真实 DDL 下验证冷归档的候选查询、幂等拷贝与 BLOB 逐字节往返，D48）、`SessionPurgeMapperShardingTest`（真实 DDL 下验证候选查询四条谓词缺一不可、`markPurged` 的 CAS 语义与「只删一个会话的一个分片、不碰冷表」，D50）。2026-09-25 的审查发现「1389 个全绿测试漏掉 3 个 P0」的根因就是缺这一层 |
 | 集成测试 | `src/test/java/com/med/qa/integration`：Testcontainers 拉起真实 MySQL + Redis Stack，跑通存储/锁链路（D30）、RAG 标签检索链路（D36）、向量索引健康探针（D37）与受控索引重建（D38） |
 | 集成测试跳过开关 | 无 Docker 时默认整类禁用（本地便利）；一旦声明 Docker 必需则改为**硬失败**，见下表 |
 | 覆盖率 | JaCoCo 绑定 `verify`，报告位于 `target/site/jacoco/index.html` |
@@ -844,7 +895,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 8 安全边界与生产配置契约 | D40–D43 | 已完成（D40：prod profile 暴露契约 + `ApplicationProfileContractTest` 跨文件契约测试；D41：流式问诊身份取自 principal + `RequestIdentityGuard` + `StreamingIdentityContractTest`；D42：RAG 管理端 scope 取自 principal、删除只保留 scope 模式 + `RagAdminAuthorizationContractTest`；D43：告警投递成功后才写冷却指纹、探测失败成为显式 `CRITICAL` 信号 + `AlertDeliveryContractTest`） |
 | 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
 | 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 已完成（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run；D48：给「归档」补上可验证的凭据——已归档会话的完整轨迹按 Protobuf 规范复制到非分片冷表 `med_message_archive`，并在 `med_session_archive` 写清单（条数 + SHA-256 摘要），清单只在源轨迹稳定且冷副本能复现摘要之后才写，**只增不删**。配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`） |
-| 阶段 11 归档轨迹的可读性与热数据收口 | D49–D50 | D49 已完成（把「归档 = 消失」补回一条**唯一**的读路径：`MedTranscriptService` 先经生命周期服务完成 scope 与归属校验，再按 `TranscriptDigests` 重算摘要决定「热分表还是冷副本」作答，两份都对不上则拒绝返回；`SessionController` 新增 `GET /api/sessions/{sessionId}/transcript`，响应给出 `source` 与规范摘要。配 `MedTranscriptServiceTest` / `SessionTranscriptTest` / `TranscriptDigestsTest` / `TranscriptResponseTest` / `MessageResponseTest`，并在真实 MySQL 上验证冷读）；D50 未开始（在 D49 的读路径之上才允许清理热分表） |
+| 阶段 11 归档轨迹的可读性与热数据收口 | D49–D50 | 已完成（D49：把「归档 = 消失」补回一条**唯一**的读路径——`MedTranscriptService` 先经生命周期服务完成 scope 与归属校验，再按 `TranscriptDigests` 重算摘要决定「热分表还是冷副本」作答，两份都对不上则拒绝返回；`SessionController` 新增 `GET /api/sessions/{sessionId}/transcript`，响应给出 `source` 与规范摘要。D50：补上冷热分层的另一半——`MedSessionPurgeService` 在**冷副本与热分表都复现清单摘要**之后才删除热行（冷副本先验，因为在那之前热行是唯一副本），退役标记写在 `med_session.purged_at`（V6），**只删 `med_message`、冷表一行不动**，默认关闭 + 只报告 + 7 天冷静期，集群互斥 `med:lock:session:purge`。配 `MedSessionPurgeServiceTest` / `SessionPurgeMapperShardingTest` / `MedSessionPurgeConfigTest` / `MedSessionPurgePropertiesTest` / `SessionPurgeReportTest` / `MedSessionPurgeSchedulerTest`，并在真实 MySQL + Redis 上验证「真删热行后 D49 读路径读回冷副本」） |
 
 ---
 

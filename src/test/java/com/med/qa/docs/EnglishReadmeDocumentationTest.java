@@ -439,6 +439,26 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D50 hot-shard purge and the two proofs it demands")
+    void apiChapterDocumentsTheD50HotShardPurge() {
+        // The English README is a translation of the same handbook: it must carry the two proofs, the
+        // ordering that puts the cold copy first, the marker column, the mutex key, the switches and the
+        // fact that only med_message is ever deleted.
+        assertThat(english).contains("D50");
+        assertThat(english).contains("MedSessionPurgeService");
+        assertThat(english).contains("med:lock:session:purge");
+        assertThat(english).contains("purged_at");
+        assertThat(english).contains("MED_SESSION_PURGE_ENABLED");
+        assertThat(english).contains("MED_SESSION_PURGE_DRY_RUN");
+        assertThat(english).contains("session-purge-refused");
+        assertThat(english).contains("session-purge-failed");
+        assertThat(english).contains("min-archived-age");
+        assertThat(english).contains("MedSessionPurgeServiceTest");
+        assertThat(english).contains("SessionPurgeMapperShardingTest");
+        assertThat(english).contains("MedSessionPurgeConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

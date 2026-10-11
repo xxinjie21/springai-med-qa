@@ -481,6 +481,28 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D50 hot-shard purge and the two proofs it demands")
+    void apiChapterDocumentsTheD50HotShardPurge() {
+        // The README has to admit that D47/D48/D49 left every hot row in place, name the two proofs that
+        // have to hold before anything is deleted (and that the cold copy is verified first, because
+        // until it holds the hot rows are the only copy), and record that only med_message is ever
+        // deleted - a reader who thinks "purge" means "clean up the archive too" would be wrong about the
+        // one thing that makes a deletion accountable.
+        assertThat(readme).contains("（D50）");
+        assertThat(readme).contains("MedSessionPurgeService");
+        assertThat(readme).contains("med:lock:session:purge");
+        assertThat(readme).contains("purged_at");
+        assertThat(readme).contains("MED_SESSION_PURGE_ENABLED");
+        assertThat(readme).contains("MED_SESSION_PURGE_DRY_RUN");
+        assertThat(readme).contains("session-purge-refused");
+        assertThat(readme).contains("session-purge-failed");
+        assertThat(readme).contains("min-archived-age");
+        assertThat(readme).contains("MedSessionPurgeServiceTest");
+        assertThat(readme).contains("SessionPurgeMapperShardingTest");
+        assertThat(readme).contains("MedSessionPurgeConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

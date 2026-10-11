@@ -194,6 +194,39 @@ med:
       initial-delay: ${MED_SESSION_ARCHIVE_INITIAL_DELAY:10m}
       lock-wait-time: ${MED_SESSION_ARCHIVE_LOCK_WAIT:5s}
       lock-lease-time: ${MED_SESSION_ARCHIVE_LOCK_LEASE:5m}
+    # Hot-shard purge of certified archived transcripts (D50). D47 archives, D48 certifies a cold copy,
+    # D49 reads it back - but until D50 the 16 sharded med_message tables kept every row forever, so the
+    # cold/hot split was only half done. This job completes it, and it is the only job in the project that
+    # deletes clinical data, which is why it carries the most guards.
+    #
+    # What makes a deletion accountable: the manifest in med_session_archive certifies a digest, the cold
+    # copy must reproduce it, AND the live shard must reproduce it too. The cold copy is verified FIRST -
+    # until it holds, the live rows are the only copy of the transcript there is. A session that fails
+    # either comparison is refused (reported, alerted, left untouched) rather than deleted.
+    #
+    # Three conservative defaults, not two: enabled=false (a deployment decision), dry-run=true (arming
+    # the capability still deletes nothing until an operator has read a report - and a dry run performs
+    # the full verification, so the report says how many sessions would be refused, not just how many
+    # candidates exist), and min-archived-age=7d, the cooling-off window that keeps D47's promise -
+    # "a wrongly archived session can be moved back" - from becoming an empty one, since moving it back
+    # needs the transcript to still be there.
+    #
+    # Only med_message is ever deleted. The cold tables are read-only for this job: the archived rows are
+    # the evidence and the manifest is the certification, and deleting either would destroy the only thing
+    # that makes a deletion accountable.
+    #
+    # batch-size * max-batches bounds how many sessions one run may retire; a run that hits that bound
+    # reports the remaining backlog and the next run continues (oldest archived first).
+    purge:
+      enabled: ${MED_SESSION_PURGE_ENABLED:false}
+      dry-run: ${MED_SESSION_PURGE_DRY_RUN:true}
+      min-archived-age: ${MED_SESSION_PURGE_MIN_ARCHIVED_AGE:7d}
+      batch-size: ${MED_SESSION_PURGE_BATCH_SIZE:50}
+      max-batches: ${MED_SESSION_PURGE_MAX_BATCHES:5}
+      check-interval: ${MED_SESSION_PURGE_CHECK_INTERVAL:12h}
+      initial-delay: ${MED_SESSION_PURGE_INITIAL_DELAY:15m}
+      lock-wait-time: ${MED_SESSION_PURGE_LOCK_WAIT:5s}
+      lock-lease-time: ${MED_SESSION_PURGE_LOCK_LEASE:5m}
   # Schema migration target (D34). Flyway must talk to the physical MySQL server, never to the
   # ShardingSphere data source declared under spring.datasource: the migrations create the physical
   # shard tables med_message_0..15, which are precisely the tables the sharding proxy treats as

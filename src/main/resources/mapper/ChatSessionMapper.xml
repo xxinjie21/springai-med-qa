@@ -13,10 +13,11 @@
                 typeHandler="com.med.qa.mapper.typehandler.SessionStatusTypeHandler"/>
         <result column="created_at" property="createdAt"/>
         <result column="updated_at" property="updatedAt"/>
+        <result column="purged_at" property="purgedAt"/>
     </resultMap>
 
     <sql id="allColumns">
-        session_id, tenant_id, dept_id, patient_id, title, status, created_at, updated_at
+        session_id, tenant_id, dept_id, patient_id, title, status, created_at, updated_at, purged_at
     </sql>
 
     <sql id="filterConditions">
@@ -103,6 +104,21 @@
         WHERE session_id = #{sessionId}
           AND status = #{expectedStatus, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
           AND updated_at &lt;= #{idleBefore}
+    </update>
+
+    <!--
+      Retires a session from the candidate set of the purge job (D50). The predicate repeats the two
+      invariants the purge relies on - the row must still be ARCHIVED, and it must not already have been
+      retired - so two replicas that somehow escaped the cluster mutex cannot both claim the same
+      session. `purged_at IS NULL` is also what makes this idempotent: re-marking an already retired
+      session changes nothing and returns 0.
+    -->
+    <update id="markPurged">
+        UPDATE med_session
+        SET purged_at = #{purgedAt}
+        WHERE session_id = #{sessionId}
+          AND status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+          AND purged_at IS NULL
     </update>
 
 </mapper>

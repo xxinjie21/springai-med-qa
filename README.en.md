@@ -616,6 +616,79 @@ transcript is **refused**, a malformed payload is refused rather than skipped, s
 against real MySQL that a transcript can still be read back through `med_session.proto` after the hot
 rows are deleted.
 
+#### Purging the hot shards of a certified cold copy (D50)
+
+D47 archives, D48 certifies a cold copy, D49 reads that copy back — and yet after all three the 16
+sharded `med_message` tables had **not lost a single row**: "archived" never made the hot tier smaller,
+so the cold/hot split was only half done. D50 finishes it, and it is the **only code path in the project
+that deletes clinical data**, which is why it carries the most guards.
+
+**Why it may delete anything**: a deletion is only accountable when a second, certified copy of exactly
+those bytes exists. So a candidate has to pass **two independent proofs**, and their order is not an
+implementation detail:
+
+- **The cold copy is verified first.** The manifest (`med_session_archive.payload_checksum`) certifies a
+  digest, and the cold copy must reproduce it under the same canonical form
+  (`TranscriptDigests.ofArchived`). **Until it does, the hot rows are the only copy of the transcript**,
+  and deleting them would be data loss — so when the cold copy fails, the shard is not even read.
+- **Then the live shard.** The live transcript must reproduce the same digest under
+  `TranscriptDigests.ofTranscript`. A drifted shard holds messages **nobody certified**, and deleting
+  them would destroy the only record of them — so a drift is **refused** too, and the certified copy
+  stays safe in the cold store.
+
+A candidate has exactly three outcomes: **certified and still hot** → delete the rows and mark the
+session retired; **certified but no hot rows left** → nothing to delete, but the session is still marked
+(otherwise the oldest retired sessions would be fetched on every run and the job would never reach the
+ones behind them); **not accountable** → refused, neither deleted nor marked, counted in `refused` and
+reported with its reason.
+
+Engineering choices:
+
+- **The retirement marker lives on `med_session.purged_at`, not on the cold tables** (V6 adds the
+  nullable column). The archived rows are the **evidence** of what was archived and the manifest is the
+  **certification**; nothing in this project writes to either after the export and D50 does not break
+  that — it only ever deletes from `med_message`. The `purged_at IS NULL` predicate therefore has to stay
+  in the SQL: inferring "already purged" by reading the shards would re-fetch exactly the sessions a
+  previous run retired, and the job would never make progress (the same trap D48 called out).
+- **Delete first, mark second**, rather than one statement (they live in different domains — a sharded
+  table and the session registry — and the order matters): an interruption leaves a session whose rows
+  are gone but which is still a candidate, and the next run finds nothing to delete, marks it and
+  converges. The reverse order could leave rows nobody ever looks at again.
+- **A cooling-off window, `min-archived-age`, defaults to 7d**: D47 promised that "a wrongly archived
+  session can be moved back", and moving it back needs the transcript to still be there. The window is
+  the mechanism that keeps that promise from becoming an empty one — not the hope that the job runs
+  slowly.
+- **Three conservative knobs**: `enabled=false`, `dry-run=true`, plus the cooling-off window. A dry run
+  still performs the **full verification** (manifest, both copies, both digests), so its report is not
+  "how many candidates exist" but "how many would be retired and how many would be refused" — which is
+  the report an operator needs to decide whether to arm the job.
+- Cluster-wide mutual exclusion uses `med:lock:session:purge` (losing the race reports
+  `skipped-lock-held` without touching the database); `batch-size × max-batches` bounds one run and
+  `remaining` reports the backlog; there is **no session lock** — the candidates are all `ARCHIVED`,
+  which `SessionStatus#isWritable()` excludes from the write path, and what actually detects a torn read
+  is the digest comparison (a lock prevents one, a checksum notices one).
+- Alert codes: `session-purge-completed` (INFO, only when something was really deleted and it was not a
+  dry run), `session-purge-refused` (WARNING — **nothing was deleted**, but it is the only signal that
+  says the two copies of a consultation disagree, and it will not clear on its own), and
+  `session-purge-failed` (WARNING). **"The job stopped" and "the hospital has nothing to purge" look
+  exactly alike.**
+
+Guards: `MedSessionPurgeServiceTest` (a replica without the mutex touches no row, a dry run writes
+nothing yet verifies everything, **the shard is not even read while the cold copy fails**, a drifted
+shard is refused rather than deleted, an emptied shard is still retired, a failed delete leaves no mark,
+one failing candidate never aborts the run), `SessionPurgeMapperShardingTest` (V6 adds the column, the
+candidate query needs all four predicates, `markPurged` is a compare-and-set, and `deleteBySessionId`
+removes one session's rows from one shard without touching the cold tables), `MedSessionPurgeConfigTest`
+(the switch really adds and removes beans, and the `@Scheduled` placeholder keys exist in
+`application.yml`), `MedSessionPurgeSchedulerTest` (the completion / refusal / failure alerts, and
+silence on a dry run), and `MedStorageAndLockIntegrationTest`, which runs the whole chain against real
+MySQL and Redis: **`MedSessionPurgeService` really deletes the hot rows, and D49's read path then serves
+the cold copy**. As the project's convention requires, both load-bearing guards were **watched to go
+red**: replacing "refuse when the cold copy does not reproduce the certification" with "delete anyway"
+turned exactly `MedSessionPurgeServiceTest$Refusals.refusesWhenTheColdCopyDiffers` red, and dropping
+`purged_at IS NULL` from the candidate query turned exactly `purgedSessionsLeaveTheCandidateSet` red;
+both were reverted and re-verified green.
+
 ---
 
 ## Error codes
@@ -664,6 +737,7 @@ rows are deleted.
 | `MED_LOCK_WAIT_TIME` / `MED_LOCK_LEASE_TIME` / `MED_LOCK_WATCHDOG_TIMEOUT` | `3s` / `0s` / `30s` | Session lock (a lease of `0` hands renewal to the watchdog) |
 | `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | Stale-session retention sweep (off and report-only by default, see D47) |
 | `MED_SESSION_ARCHIVE_ENABLED` / `MED_SESSION_ARCHIVE_DRY_RUN` | `false` / `true` | Cold archive export of archived transcripts (off and report-only by default, see D48) |
+| `MED_SESSION_PURGE_ENABLED` / `MED_SESSION_PURGE_DRY_RUN` | `false` / `true` | Hot-shard purge of certified cold copies (off, report-only and with a 7-day cooling-off window by default, see D50) |
 | `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | Staleness window and per-run batch bounds |
 | `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | Retention sweep period and startup grace period |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
@@ -739,7 +813,7 @@ curl -N -X POST http://localhost:8080/api/chat/stream \
 |---|---|
 | Unit tests | JUnit 5 and Mockito; every external dependency is mocked or replaced by H2, so `mvn test` is offline and green |
 | Build contract tests | Parse `pom.xml`, `Dockerfile`, `docker-compose.yml` and `.github/workflows/*.yml` and assert the key contracts |
-| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43), and `EmbeddingMetadataContractTest` binds the effective `metadata-mode` and demonstrates with the real Spring AI formatter whether the tags enter the vector (D45), and `ChatSessionMapperRetentionShardingTest` verifies against the real DDL that the archiving statement carries the staleness predicate itself (D47), and `SessionArchiveMapperShardingTest` verifies the cold archive's candidate query, its idempotent copy and a byte-exact BLOB round trip against the real DDL (D48). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
+| Cross-component contract tests | Assert that the components are really wired to each other, not merely that each works alone: `ApplicationProfileContractTest` binds the effective configuration value across profiles (D40), `StreamingIdentityContractTest` runs the real API key to principal to controller to service to guards chain (D41), `RagAdminAuthorizationContractTest` runs that same chain again over `/api/rag/**` (D42), `AlertDeliveryContractTest` runs the real probe to health indicator to alert monitor to notifier to sink chain (D43), and `EmbeddingMetadataContractTest` binds the effective `metadata-mode` and demonstrates with the real Spring AI formatter whether the tags enter the vector (D45), and `ChatSessionMapperRetentionShardingTest` verifies against the real DDL that the archiving statement carries the staleness predicate itself (D47), and `SessionArchiveMapperShardingTest` verifies the cold archive's candidate query, its idempotent copy and a byte-exact BLOB round trip against the real DDL (D48), and `SessionPurgeMapperShardingTest` verifies that all four purge predicates are load-bearing, that `markPurged` is a compare-and-set, and that the delete removes one session's rows from one shard without touching the cold tables (D50). The 2026-09-25 review traced "1389 green tests missed three P0 defects" to the absence of exactly this layer |
 | Integration tests | `src/test/java/com/med/qa/integration`: Testcontainers boots a real MySQL and Redis Stack to exercise the storage and lock chain (D30) and the RAG tag-filtered retrieval chain (D36) |
 | Integration skip switch | Without Docker the class is disabled by default (a local convenience); once Docker is declared mandatory the same condition becomes a hard failure, see below |
 | Coverage | JaCoCo is bound to `verify`; the report lands in `target/site/jacoco/index.html` |
@@ -1107,7 +1181,7 @@ the loop of code, unit tests, commit and push:
 | Phase 8, security boundaries and production configuration contracts | D40 to D43 | Complete (D40: prod-profile exposure contract plus the `ApplicationProfileContractTest` cross-file contract test; D41: streaming identity taken from the principal, `RequestIdentityGuard` and the `StreamingIdentityContractTest`; D42: RAG admin scope taken from the principal, scope-only deletion and the `RagAdminAuthorizationContractTest`; D43: the cooldown fingerprint is written only after a delivery, the probe failure became an explicit `CRITICAL` signal, and the `AlertDeliveryContractTest`) |
 | Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | Complete (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46: window-semantics comments aligned, deployment prerequisites (utf8mb4, H2 console) corrected, and the privacy-layer comments fixed, guarded by `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`) |
 | Phase 10, session lifecycle governance and retention | D47 to D48 | Complete (D47: the "retention job sweeping stale sessions" that `archiveSession`'s javadoc has promised since D20 now exists — stale `ACTIVE` sessions move to `ARCHIVED`, the staleness predicate travels inside the archiving statement itself, the archive runs under the session lock, cluster-wide mutual exclusion uses an `RLock`, and the capability is off and report-only by default. D48: "archived" finally has a verifiable counterpart in storage — the full transcript of every archived session is copied in the Protobuf encoding into the non-sharded `med_message_archive` table, and a manifest row (count + SHA-256 digest) is written into `med_session_archive` only after the source has been shown to be stable and the cold copy has been shown to reproduce the digest; **insert-only, nothing is deleted**. Guarded by `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`) |
-| Phase 11, archived-transcript readability and hot-data close-out | D49 to D50 | D49 done (the single read path that ends "archived means gone": `MedTranscriptService` resolves scope and ownership through the lifecycle service first, then decides between the hot shard and the cold copy by recomputing the canonical digest, and refuses when neither reproduces the certification; `SessionController` gained `GET /api/sessions/{sessionId}/transcript`, and the response names the `source` and the digest. Guarded by `MedTranscriptServiceTest` / `SessionTranscriptTest` / `TranscriptDigestsTest` / `TranscriptResponseTest` / `MessageResponseTest`, with cold reads proven against real MySQL); D50 not started (purging hot shards is only allowed on top of D49's read path) |
+| Phase 11, archived-transcript readability and hot-data close-out | D49 to D50 | Complete (D49: the single read path that ends "archived means gone" — `MedTranscriptService` resolves scope and ownership through the lifecycle service first, then decides between the hot shard and the cold copy by recomputing the canonical digest, and refuses when neither reproduces the certification; `SessionController` gained `GET /api/sessions/{sessionId}/transcript`, and the response names the `source` and the digest. D50: the other half of the cold/hot split — `MedSessionPurgeService` deletes the hot rows only after **both the cold copy and the live shard reproduce the manifest digest** (the cold copy is verified first, because until it holds the hot rows are the only copy), retires the session through the new `med_session.purged_at` column (V6), **deletes only from `med_message` and never touches a cold row**, defaults to off, report-only and a 7-day cooling-off window, and excludes replicas through `med:lock:session:purge`. Guarded by `MedSessionPurgeServiceTest` / `SessionPurgeMapperShardingTest` / `MedSessionPurgeConfigTest` / `MedSessionPurgePropertiesTest` / `SessionPurgeReportTest` / `MedSessionPurgeSchedulerTest`, with real MySQL + Redis proving that after a real purge D49's read path serves the cold copy) |
 
 ---
 

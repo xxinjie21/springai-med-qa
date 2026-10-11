@@ -123,7 +123,7 @@ class MedProductionStartupIntegrationTest {
                         .contains("med_message_" + shard);
             }
             assertThat(tables).contains("flyway_schema_history");
-            assertThat(appliedMigrationCount()).as("V1 to V5 must all be applied").isEqualTo(5);
+            assertThat(appliedMigrationCount()).as("V1 to V6 must all be applied").isEqualTo(6);
             // V4 exists for the D47 retention sweep, whose query is the only one in the repository
             // without a tenant dimension. Asserted against the real server because the index is what
             // keeps that sweep off a full table scan: H2 accepting the DDL does not prove MySQL does.
@@ -143,6 +143,16 @@ class MedProductionStartupIntegrationTest {
                     "idx_med_message_archive_session"))
                     .as("a session's transcript must be one contiguous range read")
                     .containsExactly("session_id", "created_at", "message_id");
+            // V6 adds the D50 purge marker. Asserted against the real server because the purge job's
+            // candidate query filters on `purged_at IS NULL`: a column H2 accepted but MySQL does not
+            // have would turn the job into an error on a timer, hours after a green build - and a column
+            // that is NOT NULL would make every session look retired.
+            assertThat(columnType(MIGRATED_SCHEMA, "med_session", "purged_at"))
+                    .as("migration V6 must add the purge marker to the real server")
+                    .isEqualTo("bigint");
+            assertThat(nullableColumns(MIGRATED_SCHEMA, "med_session"))
+                    .as("a session that was never purged must be able to hold NULL")
+                    .contains("purged_at");
         }
     }
 
@@ -244,6 +254,34 @@ class MedProductionStartupIntegrationTest {
             statement.setString(3, column);
             try (ResultSet rs = statement.executeQuery()) {
                 return rs.next() ? rs.getString(1).toLowerCase(Locale.ROOT) : "";
+            }
+        }
+    }
+
+    /**
+     * Returns the columns of one table that MySQL reports as nullable.
+     *
+     * <p>Nullability is the contract for the D50 purge marker: the candidate query is
+     * {@code purged_at IS NULL}, so a column declared {@code NOT NULL} would either reject every insert
+     * or, worse, make every session look retired.</p>
+     *
+     * @param schema the schema holding the table
+     * @param table  the table to inspect
+     * @return the nullable column names, possibly empty, never {@code null}
+     */
+    private static List<String> nullableColumns(String schema, String table) throws Exception {
+        try (Connection connection = rawConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT column_name FROM information_schema.columns "
+                             + "WHERE table_schema = ? AND table_name = ? AND is_nullable = 'YES'")) {
+            statement.setString(1, schema);
+            statement.setString(2, table);
+            try (ResultSet rs = statement.executeQuery()) {
+                List<String> columns = new ArrayList<>();
+                while (rs.next()) {
+                    columns.add(rs.getString(1));
+                }
+                return columns;
             }
         }
     }

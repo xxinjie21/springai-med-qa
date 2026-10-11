@@ -411,6 +411,15 @@ livenessProbe:
 | `MED_SESSION_ARCHIVE_INITIAL_DELAY` | `10m` | 启动后首次运行的延迟 |
 | `MED_SESSION_ARCHIVE_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
 | `MED_SESSION_ARCHIVE_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
+| `MED_SESSION_PURGE_ENABLED` | `false` | 已认证冷副本的热分表清理总开关（见 7.11） |
+| `MED_SESSION_PURGE_DRY_RUN` | `true` | 开启后仍只报告不删除（但走完整校验） |
+| `MED_SESSION_PURGE_MIN_ARCHIVED_AGE` | `7d` | 冷却窗口：多久没更新才允许清理，必须 > 0 |
+| `MED_SESSION_PURGE_BATCH_SIZE` | `50` | 每批取多少会话 |
+| `MED_SESSION_PURGE_MAX_BATCHES` | `5` | 单次运行最多几批 |
+| `MED_SESSION_PURGE_CHECK_INTERVAL` | `12h` | 两次运行之间的固定延迟 |
+| `MED_SESSION_PURGE_INITIAL_DELAY` | `15m` | 启动后首次运行的延迟 |
+| `MED_SESSION_PURGE_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
+| `MED_SESSION_PURGE_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
 
 ### 5.5 RAG
 
@@ -442,7 +451,7 @@ livenessProbe:
 | 层次 | 归属 | 内容 |
 |---|---|---|
 | 数据库 + 账号 | `docker/mysql/init/01-create-db.sql`（Compose 首次启动执行一次，幂等） | 建 `med_qa` 库（utf8mb4）、建 `med_qa@%` / `med_qa@localhost` 账号并授权 |
-| 表结构 | Flyway V1–V5（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8）；V5：冷归档表 `med_message_archive` + `med_session_archive`（D48，见 7.9） |
+| 表结构 | Flyway V1–V6（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8）；V5：冷归档表 `med_message_archive` + `med_session_archive`（D48，见 7.9）；V6：`med_session` 的清理标记 `purged_at`（D50，见 7.11） |
 | 向量索引 | Spring AI `RedisVectorStore`（`initialize-schema=true`） | RediSearch 索引 `med-doc-index`，TAG 字段 `tenant_id` / `dept_id` / `patient_id` |
 
 分片规则见 `src/main/resources/sharding/med-sharding.yaml`：
@@ -965,6 +974,107 @@ SELECT COUNT(*) FROM med_message_archive WHERE session_id = '<id>';
   两份都对不上时拒绝、坏 Protobuf 载荷拒绝而非跳过）、`SessionTranscriptTest`、`TranscriptDigestsTest`、
   `TranscriptResponseTest` / `MessageResponseTest`，以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL 上
   验证「把热行删干净后仍能按 `med_session.proto` 读回同一段轨迹」。
+
+### 7.11 热分表清理（D50）
+
+**先记住一句话**：D48 的冷归档**只增不删**。会话一旦被导出并认证，它的轨迹就同时存在于两处——16 张
+`med_message_*` 热分表和 `med_message_archive` 冷副本——而**热分表那一份永远不会自己消失**。D44 之后
+热表只增不删是刻意的（写入路径每轮重发整窗、逐条幂等，靠的就是「重发即自愈」），代价是热分表随会诊量
+单调增长。D50 补上这最后一步：**只删被认证冷副本覆盖的那部分热行**。
+
+**这不是「按状态删」而是「按摘要删」**。一个会话要被清理，必须依次通过三道校验，**顺序不可交换**：
+
+| 顺序 | 校验 | 不过时 |
+|---|---|---|
+| 1 | `med_session_archive` 里有导出清单，取出 `payload_checksum` | 判 `refused`：没人认证过这个会话，热行是唯一副本 |
+| 2 | 重算**冷副本**摘要，必须等于清单摘要 | 判 `refused`：冷副本被改动过，先按 §9 恢复再谈清理 |
+| 3 | 重算**热轨迹**摘要，必须等于同一份清单摘要 | 判 `refused`：热行与清单对不上（残缺或被改），它承载着没人认证过的字节 |
+
+**为什么冷副本必须先于热轨迹被验证**：在第 2 步通过之前，热行仍然是这个会话**唯一**被认证的副本。
+如果先读热行、发现它「等于清单」就删掉，那么一旦冷副本其实已经损坏，删除动作就把唯一的好副本也毁了。
+先证明「冷的那份是好的」，再证明「热的那份和冷的那份一样」，最后才允许删。
+
+**为什么热轨迹摘要不符也要拒绝、而不是「反正要删了」**：热行比清单多出来的那些消息，是清单**认证
+不到**的字节。删掉它们等于承认「认证范围之外的数据可以静默丢弃」——而这正是 D48 存在的理由。宁可
+`refused` 让运维来看，也不要删掉一段没人认证过的轨迹。
+
+**`purged_at` 落在 `med_session` 上，不落在冷表上**（`V6__add_med_session_purged_at.sql`）。三个理由：
+
+- **候选查询要能收敛**。清理的候选谓词是 `status = ARCHIVED AND purged_at IS NULL AND EXISTS(清单)
+  AND updated_at <= <冷却线>`。若不落标记，每次运行都会重新捞到同一批「热行已删空」的会话——D48 已经
+  在 `NOT EXISTS` 上吃过一次这个亏（分页后再过滤会永远翻不到下一页），这里用标记把「已退休」写死。
+- **冷表是证据，不是状态**。冷行是档案，往档案里写「我已经被删了」这种运行态字段，会让「重新导出以
+  修复」这条路径多一个要清理的脏状态。
+- **标记是 CAS**。`ChatSessionMapper#markPurged` 把 `status = ?` 与 `purged_at IS NULL` 放进同一条
+  UPDATE 的 `WHERE` 里，与 D47 的 `updateStatusIfStale` 同形：并发运行（或人工归档）与本次清理撞车时，
+  只有一方能写成功。
+
+**先删热行、后写标记**，顺序同样不可交换。中断只会留下「热行已空、`purged_at` 仍为 NULL」——下次运行
+把它当候选再捞一次，重算热轨迹得 0 条，直接补上标记即可收敛（`purgeOne` 里 `hot.isEmpty()` 那条分支
+就是为这个形态写的）。反过来「先标记后删」一旦中断，这个会话就永远不再被任何一次运行看见，热行留在
+那里没人清——**状态机必须是「可重复的删除」而不是「一次性的标记」**。
+
+**冷却窗口 `min-archived-age`（默认 `7d`）**：只有 `updated_at` 早于「现在 − 冷却窗口」的会话才会被
+清理。D47 承诺过「误归档的会话可以搬回来」，而搬回来的前提是**它还在热分表里**。没有冷却窗口的话，
+一个刚被误归档、又刚被导出认证的会话，可能在运维发现之前就被清空了热行。窗口只按
+`med_session.updated_at` 判断，不看导出时间——导出时间只证明「拷过了」，不证明「没人还在意它」。
+
+**三个保守旋钮，缺一不可**：
+
+| 旋钮 | 默认 | 含义 |
+|---|---|---|
+| `MED_SESSION_PURGE_ENABLED` | `false` | 总开关。关闭时 `MedSessionPurgeService` / `MedSessionPurgeScheduler` **不存在**，定时器不碰数据库 |
+| `MED_SESSION_PURGE_DRY_RUN` | `true` | 开启后仍只报告不删除；**dry-run 只扫一批**，但**走完整的三道校验** |
+| `MED_SESSION_PURGE_MIN_ARCHIVED_AGE` | `7d` | 冷却窗口，必须严格大于 0 |
+
+`dry-run` 走完整校验是有意的：它要回答的不是「有多少候选」，而是「**有多少候选会被拒绝**」。运维正是
+靠这个数字决定要不要真的打开删除——若 dry-run 报告里 `refused > 0`，说明有副本对不上，先别 arm。
+
+**集群互斥**：`RLock` 键 `med:lock:session:purge`（不可配置）。抢不到锁的运行记
+`SKIPPED_LOCK_HELD` 并立刻返回，**不是失败**（同一轮里另一个实例已经在扫）。**它不抢会话锁**：清理删
+的是「已被认证为冻结快照」的那批行，而写入路径每轮重发整窗——若一个会话仍在被写，它的 `updated_at`
+就会被推后、掉出冷却窗口，本身就不会被选中。Redis 不可达时**向上抛**（`STORAGE_ERROR`），不静默跳过。
+
+**只删 `med_message` 热分表**。`med_message_archive` / `med_session_archive` 在 D50 里**一个字节都不动**
+（本迭代没有任何删除冷数据的路径）。这也是为什么清理作业**不复用** D49 的读路径：读路径会在两份都对
+不上时拒绝返回，而清理需要的是一份**可判定的拒绝理由**，两者对「不确定」的处理方式不同。
+
+**排障动作**（都直连物理 MySQL，绕开 ShardingSphere）：
+
+```sql
+-- 1) 还有多少会话待清理（status: ACTIVE=0 / CLOSED=1 / ARCHIVED=2）
+SELECT COUNT(*) FROM med_session s
+WHERE s.status = 2
+  AND s.purged_at IS NULL
+  AND s.updated_at <= <now - 冷却窗口>
+  AND EXISTS (SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id);
+
+-- 2) 某个会话到底是「已退休」还是「漏了」
+SELECT session_id, status, updated_at, purged_at FROM med_session WHERE session_id = '<id>';
+
+-- 3) 它还剩几条热行（分片号 = crc32(session_id) % 16）
+SELECT COUNT(*) FROM med_message_<shard> WHERE session_id = '<id>';
+-- 4) 冷副本条数（应等于 med_session_archive.message_count，且恒不因清理而变）
+SELECT COUNT(*) FROM med_message_archive WHERE session_id = '<id>';
+```
+
+- 第 2 步 `purged_at` 有值、第 3 步却还有行 → **有东西绕过了清理路径往热表写**（或写回在删之后发生）。
+  先查审计日志（`med_audit_log`）；读路径此时仍会返回 `source=HOT`，临床数据完好。
+- 第 2 步 `purged_at` 为空、第 3 步已为 0 → 上一次运行删完热行后在写标记前中断，下次运行会自动收敛，
+  无需人工干预。
+- 作业报 `refused > 0` → 见上文三道校验；先跑一遍 D49 的读路径（`GET .../transcript`）看 `source` 与
+  `checksum`，再决定是恢复冷副本还是重新导出。
+- **告警**：`session-purge-completed`（INFO，只在真的删了东西时发）、`session-purge-refused`（WARNING，
+  有候选被拒绝认证，**在完成通知之前独立发出**）、`session-purge-failed`（WARNING，整轮失败）。
+  三者都不 page：清理只删「已有认证冷副本」的热行，任何一条触发时临床数据都还在冷表里。但
+  **`-refused` 绝不能静默**：被拒绝的会话外观与「还没轮到清理」完全一样，而它实际意味着有副本已经对
+  不上号了。
+- 跨组件契约：`MedSessionPurgeServiceTest`（锁被占时不碰 MySQL、dry-run 零删除、清单缺失/冷副本不符/
+  热轨迹不符三种拒绝、删完热行后补标记、单会话失败不中断整轮）、`SessionPurgeMapperShardingTest`
+  （真实 DDL 下 V6 加列、候选查询排除 `purged_at` 非空的会话、`markPurged` 的 CAS 语义、按会话删除
+  只命中一张分片）、`MedSessionPurgeConfigTest`（开关真的增删 Bean，且 `@Scheduled` 的占位符键在
+  `application.yml` 里真实存在），以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + Redis 上验证
+  「认证过的会话被清空热行后，D49 的读路径改答 `COLD`，且冷表逐字节未变」。
 
 ---
 

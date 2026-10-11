@@ -107,4 +107,52 @@ public interface SessionArchiveMapper {
      * @return the manifest, or {@code null} when the session was never exported
      */
     SessionArchiveManifestDO selectManifest(@Param("sessionId") String sessionId);
+
+    /**
+     * Lists one page of archived sessions whose certified hot rows are old enough to be retired (D50),
+     * oldest first.
+     *
+     * <p>Three predicates, all of them in the SQL for the same reason D48's candidate query keeps its
+     * filter there:</p>
+     * <ol>
+     *   <li>{@code status = ARCHIVED} - only a terminal session may lose its hot rows. A session that
+     *       is still {@code ACTIVE} (or was moved back) is never a candidate.</li>
+     *   <li>{@code EXISTS (med_session_archive)} - only a session with an export manifest has a
+     *       certified cold copy, and only a certified copy makes a deletion accountable. This is also
+     *       why the query lives on this mapper rather than on {@link ChatSessionMapper}: the session
+     *       mapper must not learn that an archive exists.</li>
+     *   <li>{@code purged_at IS NULL} - a session a previous run already retired must leave the
+     *       candidate set, or the oldest certified sessions would be fetched on every run and the job
+     *       would never reach the ones behind them.</li>
+     * </ol>
+     *
+     * <p>The cooling-off window is expressed as {@code updated_at <= :archivedBefore}: {@code med_session}
+     * is stamped with the archiving instant by D47's compare-and-set, so this reads as "archived at
+     * least {@code med.session.purge.min-archived-age} ago" and is answered from
+     * {@code idx_med_session_retention (status, updated_at)}.</p>
+     *
+     * @param status         the lifecycle status to select, normally {@link SessionStatus#ARCHIVED}
+     * @param archivedBefore cutoff as epoch milliseconds; a session is eligible when its
+     *                       {@code updated_at} is less than or equal to this instant
+     * @param limit          maximum number of rows, must be strictly positive
+     * @return the purgeable sessions ordered by {@code updated_at} ascending, possibly empty, never
+     *         {@code null}
+     */
+    List<ChatSessionDO> selectPurgeableArchivedSessions(@Param("status") SessionStatus status,
+                                                        @Param("archivedBefore") long archivedBefore,
+                                                        @Param("limit") int limit);
+
+    /**
+     * Counts the sessions {@link #selectPurgeableArchivedSessions(SessionStatus, long, int)} would
+     * return, without fetching them.
+     *
+     * <p>Reported as the backlog of a purge run, which is what tells an operator whether
+     * {@code med.session.purge.max-batches} is set high enough to drain it.</p>
+     *
+     * @param status         the lifecycle status to count, normally {@link SessionStatus#ARCHIVED}
+     * @param archivedBefore cutoff as epoch milliseconds, same predicate as the selection
+     * @return the number of certified sessions still holding hot rows, never negative
+     */
+    long countPurgeableArchivedSessions(@Param("status") SessionStatus status,
+                                        @Param("archivedBefore") long archivedBefore);
 }

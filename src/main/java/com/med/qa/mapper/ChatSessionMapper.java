@@ -164,4 +164,29 @@ public interface ChatSessionMapper {
                             @Param("expectedStatus") SessionStatus expectedStatus,
                             @Param("idleBefore") long idleBeforeEpochMillis,
                             @Param("updatedAt") long updatedAt);
+
+    /**
+     * Records that the hot shard rows of an archived session have been retired, which is what takes it
+     * out of the candidate set of the purge job (D50).
+     *
+     * <p>The purge deletes rows from {@code med_message} and then calls this; the two steps are
+     * deliberately not one statement, because they live in different domains (a sharded table and the
+     * session registry) and because the order matters. Deleting first means an interruption leaves a
+     * session whose hot rows are gone but which is still a candidate: the next run finds nothing to
+     * delete, marks it, and the job converges. Marking first would mean an interruption leaves a
+     * session the job will never look at again while its rows linger forever.</p>
+     *
+     * <p>The predicate carries both invariants the purge relies on - the session must still be
+     * {@code ARCHIVED}, and it must not have been retired already - so this doubles as the
+     * compare-and-set that makes a second replica a no-op even if it escaped the cluster mutex.</p>
+     *
+     * @param sessionId the session primary key
+     * @param status    the status the row must still hold, normally {@link SessionStatus#ARCHIVED}
+     * @param purgedAt  epoch milliseconds of the retirement
+     * @return number of affected rows: {@code 1} when the session was retired by this call,
+     *         {@code 0} when it was not archived or had already been retired
+     */
+    int markPurged(@Param("sessionId") String sessionId,
+                   @Param("status") SessionStatus status,
+                   @Param("purgedAt") long purgedAt);
 }

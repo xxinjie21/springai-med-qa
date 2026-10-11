@@ -222,6 +222,10 @@ class AlertingStackConfigTest {
                 "MedQaRagIndexProbeFailed",
                 "MedQaRagIndexRebuildFailed",
                 "MedQaSessionRetentionFailed",
+                "MedQaSessionArchiveExportFailed",
+                "MedQaSessionArchiveMismatch",
+                "MedQaSessionPurgeFailed",
+                "MedQaSessionPurgeRefused",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -393,6 +397,48 @@ class AlertingStackConfigTest {
         // must still require a second decision.
         assertThat(applicationYml).contains("MED_SESSION_ARCHIVE_ENABLED:false");
         assertThat(applicationYml).contains("MED_SESSION_ARCHIVE_DRY_RUN:true");
+    }
+
+    @Test
+    @DisplayName("the D50 purge rules select the codes the scheduler actually exports")
+    void purgeRulesMatchTheExportedCodes() throws IOException {
+        // The refusal rule matters most: "the cold copy and the live shard disagree about a consultation"
+        // is the only signal that says a certified transcript could not be accounted for, and a rule that
+        // silently stopped selecting it would leave that visible only in a log line nobody reads - while
+        // the backlog it blocks simply stops draining.
+        String scheduler = read("src/main/java/com/med/qa/service/MedSessionPurgeScheduler.java");
+        assertThat(scheduler).contains("session-purge-failed");
+        assertThat(scheduler).contains("session-purge-refused");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-purge-failed\"");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-purge-refused\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionPurgeFailed");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionPurgeRefused");
+        // Nothing is lost when either fires - every deletion is preceded by a verification of both
+        // copies, and a refusal deletes nothing at all - so both warn rather than page.
+        assertThat(read(ALERT_RULES)).contains("component: session-purge");
+        assertThat(read(ALERT_RULES)).contains("severity: warning");
+    }
+
+    @Test
+    @DisplayName("the purge switches are declared in application.yml and default to off, dry and cooling off")
+    void purgePropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_SESSION_PURGE_ENABLED",
+                "MED_SESSION_PURGE_DRY_RUN",
+                "MED_SESSION_PURGE_MIN_ARCHIVED_AGE",
+                "MED_SESSION_PURGE_BATCH_SIZE",
+                "MED_SESSION_PURGE_MAX_BATCHES");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // This is the only capability in the project that deletes clinical records, so all three
+        // conservative knobs are part of the safety story: not armed by the repository, still not
+        // deleting after being armed, and never touching a session that was archived recently enough to
+        // be moved back.
+        assertThat(applicationYml).contains("MED_SESSION_PURGE_ENABLED:false");
+        assertThat(applicationYml).contains("MED_SESSION_PURGE_DRY_RUN:true");
+        assertThat(applicationYml).contains("MED_SESSION_PURGE_MIN_ARCHIVED_AGE:7d");
     }
 
     @Test

@@ -1,0 +1,29 @@
+-- Flyway migration: retire the hot rows of a certified archived transcript (D50).
+--
+-- D47 archives a stale session and D48 copies its transcript into the cold store, certifying the copy
+-- with a SHA-256 in med_session_archive. D49 made that copy readable. D50 is the only iteration that
+-- *deletes* anything: once a session is certified, the 16 sharded med_message tables no longer have to
+-- carry its rows.
+--
+-- Why the purge marker lives on med_session and not on the cold tables:
+--   * the cold rows are the *evidence* of what was archived. The moment they stop being exactly what
+--     the export wrote, "the cold copy reproduces the certification" stops being a fact. Nothing in
+--     this project writes to med_message_archive / med_session_archive after the export, and D50 keeps
+--     it that way: the purge only ever deletes from med_message.
+--   * med_session is already the live session registry whose status D47 owns, so "this session's hot
+--     rows have been retired at T" belongs to the same lifecycle record.
+--
+-- Why a dedicated column rather than "the hot rows are gone" as the marker: the candidate query of the
+-- purge must be able to *exclude* what it has already purged. If "already purged" were inferred by
+-- reading the shards, the oldest certified sessions - exactly the ones a previous run retired - would
+-- be fetched on every run and the job would never reach the sessions behind them. This is the same
+-- trap D48 called out for its own candidate query, and it is solved the same way: push the filter into
+-- the SQL.
+--
+-- NULL means "the hot rows are still there (or were never certified)". A non-NULL value is the epoch
+-- millisecond instant at which this session's shard rows were removed.
+--
+-- Backend-agnostic on purpose: the statement runs unchanged against MySQL (production) and against the
+-- in-memory H2 schema in MySQL compatibility mode (tests).
+
+ALTER TABLE med_session ADD COLUMN purged_at BIGINT NULL;

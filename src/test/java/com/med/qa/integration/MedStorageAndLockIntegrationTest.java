@@ -3,12 +3,14 @@ package com.med.qa.integration;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedSessionProperties;
+import com.med.qa.config.MedSessionPurgeProperties;
 import com.med.qa.config.RedissonConfig;
 import com.med.qa.domain.entity.ArchivedMessageDO;
 import com.med.qa.domain.entity.ChatMessageDO;
@@ -31,8 +33,10 @@ import com.med.qa.memory.repository.MedChatMemoryRepository;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.memory.sharding.Crc32ShardingAlgorithm;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedSessionPurgeService;
 import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionArchiveChecksum;
+import com.med.qa.service.SessionPurgeReport;
 import com.med.qa.service.SessionTranscript;
 import com.med.qa.service.TranscriptDigests;
 import java.io.IOException;
@@ -45,6 +49,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -107,6 +112,12 @@ import org.testcontainers.utility.DockerImageName;
 class MedStorageAndLockIntegrationTest {
 
     private static final int SHARD_COUNT = 16;
+
+    /**
+     * Cooling-off window of the D50 purge cases. Far longer than any other session in this class has
+     * existed, so only a row explicitly backdated by {@link #backdateSession} is ever a candidate.
+     */
+    private static final Duration PURGE_COOLING_OFF = Duration.ofDays(30);
 
     /**
      * ShardingSphere's URL-argument placeholder syntax, mirrored from
@@ -473,6 +484,200 @@ class MedStorageAndLockIntegrationTest {
                 () -> transcriptService.read(TENANT, DEPT, sessionId));
 
         assertEquals(ErrorCode.STORAGE_ERROR, failure.getErrorCode());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Hot-shard purge against real MySQL (D50)
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("D50: a certified transcript's hot shard is retired and the cold copy takes over")
+    void purgesACertifiedTranscriptsHotShard() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "清理").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 4; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        String certified = TranscriptDigests.ofArchived(coldRows);
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), certified, 1_735_000_000_000L));
+        // The cooling-off window is what makes a session eligible at all: a session archived "just
+        // now" is deliberately not a candidate, so the row has to be old before the run may touch it.
+        backdateSession(sessionId, candidateUpdatedAt());
+
+        SessionPurgeReport report = purgeService(false).purgeOnce();
+
+        assertEquals(SessionPurgeReport.Outcome.COMPLETED, report.outcome());
+        assertFalse(report.dryRun());
+        assertEquals(1, report.purged(), "the certified session's hot rows must be retired");
+        assertEquals(0, report.failed(), report.failures().toString());
+        // The counters describe exactly one run over one candidate set, whatever else the shared
+        // database holds: nothing may be counted twice and nothing may be dropped.
+        assertEquals(report.candidates(),
+                report.purged() + report.skipped() + report.refused() + report.failed());
+
+        // The hot rows really are gone...
+        assertEquals(0L, countSessionRows(sessionId));
+        // ...and the session is retired, so the next run does not fetch it again.
+        assertNotNull(purgedAtOf(sessionId), "the purge marker must be written on med_session");
+        // The cold tables are read-only for the purge: the same rows, the same certification.
+        assertEquals(4L, countArchivedRows(sessionId));
+        assertEquals(certified, archiveMapper.selectManifest(sessionId).getPayloadChecksum());
+
+        // And D49's read path now answers from the cold copy, with the digest the purge verified.
+        SessionTranscript read = transcriptService.read(TENANT, DEPT, sessionId);
+        assertEquals(SessionTranscript.Source.COLD, read.source());
+        assertEquals(4, read.messageCount());
+        assertEquals(certified, read.checksum());
+        assertEquals(transcript.stream().map(ChatMessageDO::getContent).toList(),
+                read.messages().stream().map(ChatMessageDO::getContent).toList());
+    }
+
+    @Test
+    @DisplayName("D50: a candidate whose copies do not reproduce the certification is refused, not deleted")
+    void refusesToPurgeAnUnaccountableTranscript() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "拒绝清理").getSessionId();
+        for (int turn = 1; turn <= 2; turn++) {
+            repository.append(turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L));
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        // A manifest certifying bytes the cold store does not hold. Nothing proves what the transcript
+        // was, so nothing a deletion could be measured against - and the hot rows are the only copy of
+        // whatever they do hold, which is why a refusal must never delete.
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, 2, SessionArchiveChecksum.sha256Hex(
+                        "unrelated".getBytes(StandardCharsets.UTF_8)), 1_735_000_000_000L));
+        backdateSession(sessionId, candidateUpdatedAt());
+
+        SessionPurgeReport report = purgeService(false).purgeOnce();
+
+        assertEquals(SessionPurgeReport.Outcome.COMPLETED, report.outcome());
+        assertTrue(report.sawRefusal(), "the unaccountable candidate must be reported as refused");
+        assertEquals(0, report.failed(), report.failures().toString());
+        assertEquals(2L, countSessionRows(sessionId), "a refusal must not delete a single row");
+        assertNull(purgedAtOf(sessionId), "a refused session must stay a candidate for a human to see");
+        assertTrue(report.failures().stream()
+                        .anyMatch(line -> line.contains(sessionId) && line.contains("REFUSED")),
+                "the refusal has to name the session: " + report.failures());
+    }
+
+    @Test
+    @DisplayName("D50: a dry run verifies every copy and deletes nothing")
+    void dryRunVerifiesWithoutDeletingAnything() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "演练").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 3; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), TranscriptDigests.ofArchived(coldRows),
+                1_735_000_000_000L));
+        backdateSession(sessionId, candidateUpdatedAt());
+
+        SessionPurgeReport report = purgeService(true).purgeOnce();
+
+        assertTrue(report.dryRun());
+        assertEquals(SessionPurgeReport.Outcome.COMPLETED, report.outcome());
+        // A dry run performs the full verification, so it reports what it *would* retire - the number
+        // an operator uses to decide whether to arm the job.
+        assertTrue(report.purgedAnything(), "a dry run must still report what it would delete");
+        assertEquals(3L, countSessionRows(sessionId), "a dry run must not delete a single row");
+        assertNull(purgedAtOf(sessionId), "a dry run must not retire anything");
+    }
+
+    /**
+     * Builds the purge service the D50 cases drive, wired exactly like {@code MedSessionPurgeConfig}
+     * wires it in production (same mappers, same codec, same Redisson client) but with a policy that
+     * fits a test: a 30-day cooling-off window, one pass, and a small batch.
+     *
+     * <p>The 30-day window is also what isolates these cases from every other session in the shared
+     * database. Only a session whose {@code updated_at} was explicitly backdated by
+     * {@link #backdateSession} is old enough to be a candidate, so the suites in this class cannot
+     * become candidates of each other's purge runs.</p>
+     *
+     * @param dryRun {@code true} to verify and report without deleting
+     * @return a ready-to-run service, never {@code null}
+     */
+    private static MedSessionPurgeService purgeService(boolean dryRun) {
+        MedSessionPurgeProperties properties = new MedSessionPurgeProperties();
+        properties.setDryRun(dryRun);
+        properties.setMinArchivedAge(PURGE_COOLING_OFF);
+        properties.setBatchSize(10);
+        properties.setMaxBatches(1);
+        properties.setLockWaitTime(Duration.ofSeconds(5));
+        properties.setLockLeaseTime(Duration.ofSeconds(30));
+        return new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper, codec,
+                redissonClient, properties, Clock.systemUTC());
+    }
+
+    /**
+     * {@code updated_at} of a session old enough for the {@link #PURGE_COOLING_OFF} window.
+     *
+     * <p>Strictly older than the window, not merely close to it: the candidate predicate is
+     * {@code updated_at <= now - window}, so a row backdated by less than the window is still newer
+     * than the cutoff and is not a candidate at all.</p>
+     */
+    private static long candidateUpdatedAt() {
+        return System.currentTimeMillis() - PURGE_COOLING_OFF.plus(Duration.ofDays(1)).toMillis();
+    }
+
+    /**
+     * Moves a session's {@code updated_at} into the past, which is what the cooling-off predicate of
+     * {@code SessionArchiveMapper#selectPurgeableArchivedSessions} reads. Done through the raw MySQL
+     * connection because the production write paths deliberately never backdate a row.
+     */
+    private static void backdateSession(String sessionId, long updatedAt) throws Exception {
+        try (PreparedStatement ps = rawMysql.prepareStatement(
+                "UPDATE med_session SET updated_at = ? WHERE session_id = ?")) {
+            ps.setLong(1, updatedAt);
+            ps.setString(2, sessionId);
+            assertEquals(1, ps.executeUpdate(), "the session row must exist to be backdated");
+        }
+    }
+
+    /** Reads {@code med_session.purged_at} directly, returning {@code null} for "never purged". */
+    private static Long purgedAtOf(String sessionId) throws Exception {
+        try (PreparedStatement ps = rawMysql.prepareStatement(
+                "SELECT purged_at FROM med_session WHERE session_id = ?")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next(), "the session row must exist");
+                long value = rs.getLong(1);
+                return rs.wasNull() ? null : value;
+            }
+        }
+    }
+
+    /** Counts the cold rows of a session, to prove the purge never touches the archive tables. */
+    private static long countArchivedRows(String sessionId) throws Exception {
+        try (PreparedStatement ps = rawMysql.prepareStatement(
+                "SELECT COUNT(*) FROM med_message_archive WHERE session_id = ?")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                return rs.getLong(1);
+            }
+        }
     }
 
     private static ChatMessageDO turnMessage(String sessionId, String patientId, String content) {

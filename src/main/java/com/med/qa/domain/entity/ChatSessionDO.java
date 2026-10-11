@@ -37,6 +37,16 @@ public class ChatSessionDO {
     /** Last update time as epoch milliseconds. */
     private long updatedAt;
 
+    /**
+     * Epoch milliseconds at which the hot shard rows of this archived session were retired (D50), or
+     * {@code null} while they are still stored.
+     *
+     * <p>Boxed rather than primitive on purpose: {@code NULL} is a meaningful value here - it is the
+     * candidate predicate of the purge job ({@code purged_at IS NULL}) and the way an already-purged
+     * session leaves the candidate set instead of being re-examined on every run.</p>
+     */
+    private Long purgedAt;
+
     public String getSessionId() {
         return sessionId;
     }
@@ -102,6 +112,26 @@ public class ChatSessionDO {
     }
 
     /**
+     * Returns when the hot rows of this session were retired, if they were.
+     *
+     * @return epoch milliseconds of the purge, or {@code null} while the shards still hold the
+     *         transcript
+     */
+    public Long getPurgedAt() {
+        return purgedAt;
+    }
+
+    /**
+     * Records that the hot rows of this session were retired.
+     *
+     * @param purgedAt epoch milliseconds of the purge, or {@code null} to leave the session in the
+     *                 candidate set of the purge job
+     */
+    public void setPurgedAt(Long purgedAt) {
+        this.purgedAt = purgedAt;
+    }
+
+    /**
      * Builds the spec-compliant Redis cache key
      * {@code med:chat:{tenant_id}:{dept_id}:{session_id}} for this session.
      *
@@ -145,6 +175,7 @@ public class ChatSessionDO {
         return "ChatSessionDO{sessionId='" + sessionId + "', tenantId='" + tenantId
                 + "', deptId='" + deptId + "', patientId='" + patientId
                 + "', title='" + title + "', status=" + status
-                + ", createdAt=" + createdAt + ", updatedAt=" + updatedAt + '}';
+                + ", createdAt=" + createdAt + ", updatedAt=" + updatedAt
+                + ", purgedAt=" + purgedAt + '}';
     }
 }

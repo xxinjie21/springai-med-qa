@@ -117,4 +117,38 @@
         WHERE session_id = #{sessionId}
     </select>
 
+    <!--
+      Candidate query of the hot-shard purge (D50). Same shape as the D48 export query, and for the same
+      reason: the three predicates have to travel inside the SQL. EXISTS rather than a JOIN keeps the
+      statement identical in form to selectUnexportedArchivedSessions, which is already proven to route
+      correctly through ShardingSphere's SINGLE rule for med_session_archive. purged_at IS NULL is what
+      stops the job from re-fetching the sessions a previous run retired - the exact trap D48 called out
+      - and updated_at <= :archivedBefore is the cooling-off window, answered from
+      idx_med_session_retention (status, updated_at).
+    -->
+    <select id="selectPurgeableArchivedSessions" resultMap="ArchivedSessionResultMap">
+        SELECT s.session_id, s.tenant_id, s.dept_id, s.patient_id, s.title,
+               s.status, s.created_at, s.updated_at
+        FROM med_session s
+        WHERE s.status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+          AND s.purged_at IS NULL
+          AND s.updated_at &lt;= #{archivedBefore}
+          AND EXISTS (
+              SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id
+          )
+        ORDER BY s.updated_at ASC, s.session_id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countPurgeableArchivedSessions" resultType="long">
+        SELECT COUNT(*)
+        FROM med_session s
+        WHERE s.status = #{status, typeHandler=com.med.qa.mapper.typehandler.SessionStatusTypeHandler}
+          AND s.purged_at IS NULL
+          AND s.updated_at &lt;= #{archivedBefore}
+          AND EXISTS (
+              SELECT 1 FROM med_session_archive a WHERE a.session_id = s.session_id
+          )
+    </select>
+
 </mapper>

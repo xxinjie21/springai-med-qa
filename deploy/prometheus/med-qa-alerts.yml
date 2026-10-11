@@ -182,6 +182,48 @@ groups:
             MedSessionArchiveExportService#verify before touching anything.
           runbook: "docs/DEPLOYMENT.md#79-冷归档导出d48"
 
+      - alert: MedQaSessionPurgeFailed
+        # D50. The hot-shard purge retires the sharded med_message rows of a certified archived session.
+        # When a run fails, nothing has been lost - every deletion is preceded by a verification of both
+        # copies - but the hot tier stops shrinking, and a purge that stopped running looks identical to a
+        # hospital with nothing to purge.
+        expr: increase(med_qa_alert_total{code="session-purge-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-purge
+        annotations:
+          summary: "The archived-transcript hot-shard purge is failing"
+          description: >-
+            MedSessionPurgeScheduler reported a failed run, so certified archived sessions are keeping
+            their hot shard rows. Check MySQL reachability and Redis (the run takes the cluster-wide mutex
+            med:lock:session:purge before touching any row), then review med.session.purge.* - a dry-run
+            deployment verifies and reports without deleting anything, which is not a failure.
+          runbook: "docs/DEPLOYMENT.md#711-热分表清理d50"
+
+      - alert: MedQaSessionPurgeRefused
+        # D50. The purge declined to delete at least one session because it could not account for it: the
+        # cold copy or the live shard no longer reproduces the manifest digest. Nothing was deleted - this
+        # is the job refusing to act, not an incident on its own - but it is the only signal that says "the
+        # two copies of this consultation disagree", and it will not clear by itself. A log line would hide
+        # it, because a refused session keeps its hot rows and the backlog simply stops draining.
+        expr: increase(med_qa_alert_total{code="session-purge-refused"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-purge
+        annotations:
+          summary: "A certified transcript could not be accounted for before purging"
+          description: >-
+            MedSessionPurgeService refused {{ $value }} session(s): either the cold copy in
+            med_message_archive does not reproduce the payload_checksum recorded in med_session_archive, or
+            the live shard does. Both copies were left untouched, so no data was lost. Verify one session
+            with MedSessionArchiveExportService#verify and read it with
+            GET /api/sessions/{sessionId}/transcript (which reports whether the hot shard or the cold copy
+            answered) before changing anything; a repeated refusal for the same session means a copy is
+            being altered outside the application.
+          runbook: "docs/DEPLOYMENT.md#711-热分表清理d50"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.
