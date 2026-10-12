@@ -191,6 +191,7 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `GET` | `/api/sessions/{sessionId}` | 查询单个会话 | 患者仅可查本人 |
 | `POST` | `/api/sessions/{sessionId}/close` | 关闭会话（幂等） | |
 | `POST` | `/api/sessions/{sessionId}/archive` | 归档会话（幂等） | 归档后不可再关闭 |
+| `POST` | `/api/sessions/{sessionId}/restore` | 搬回误归档的会话 | 需要活副本仍在（热行未被回收），会撤销导出认证（D51） |
 | `GET` | `/api/sessions/{sessionId}/transcript` | 读取会话轨迹（热表 / 冷副本） | 响应给出 `source`（`HOT` / `COLD`）与规范摘要（D49） |
 | `GET` | `/api/sessions` | 会话分页列表 | `tenantId` / `deptId` / `patientId` / `page` / `size` |
 | `POST` | `/api/rag/documents/ingest` | 医疗文档批量入库 | `@RateLimit`，仅 STAFF；身份取自 API Key（D42） |
@@ -571,13 +572,20 @@ D47 归档、D48 认证冷副本、D49 把冷副本读回来——但三轮下�
 - **先删后标记**，不合并成一条语句（它们分属分片表与会话登记表两个域，且顺序有意义）：中断只会留下「行没了但
   还是候选」的会话，下一轮发现无行可删、打上标记即收敛；反过来则可能留下**再也没人看的行**。
 - **冷静期 `min-archived-age` 默认 7d**：D47 承诺过「误归档可以改回来」，而改回来需要轨迹还在。这个窗口就是
-  让那句承诺不落空的机制，而不是靠「作业跑得慢」。
+  让那句承诺不落空的机制，而不是靠「作业跑得慢」——**自 D51 起这句话不再只是一句承诺**：这个窗口恰好就是
+  `MedSessionRestoreService` 能搬回一个会话的区间（见下一节）。
 - **三道保守开关**：`enabled=false`、`dry-run=true`，再加冷静期。dry-run **仍然跑完整验证**（读清单、两份副本
   与摘要），所以报告不只是「有多少候选」，而是「有多少会被清理、有多少会被拒绝」——这才是一份能用来决定要不要
   真正启用的报告。
 - 集群互斥 `med:lock:session:purge`（抢不到报 `skipped-lock-held` 而不碰数据库）；`batch-size × max-batches`
-  给单次运行封顶，`remaining` 报告积压量；**不加会话锁**——候选都是 `ARCHIVED`，`SessionStatus#isWritable()`
-  把它们排除在写入路径之外，而真正能发现「读到一半」的是摘要比对（锁只能预防，校验能发现）。
+  给单次运行封顶，`remaining` 报告积压量。
+- **D51 起每个候选还要拿会话锁，并在锁内重读状态**。原实现刻意不拿锁，理由写得很清楚：候选都是 `ARCHIVED`，
+  `SessionStatus#isWritable()` 把它们排除在写入路径之外，而真正能发现「读到一半」的是摘要比对（锁只能预防，
+  校验能发现）。**D51 加了第一个能离开 `ARCHIVED` 的写者（搬回），而这个前提当场失效**——而且摘要比对
+  **看不见**它：搬回不改轨迹的任何一个字节，只改状态与认证。于是候选在选取时是 `ARCHIVED`、在删除时可能已经是
+  `ACTIVE`，删掉的就是医生刚搬回来的会话的热行，读路径会把它报成「这段会诊是空的」。现在每个候选都在
+  `SessionLockService` 的会话锁内处理、并在锁内 `selectById` 重新确认状态；非 `ARCHIVED` 记 `skipped` 零改动，
+  锁忙也记 `skipped` 而不是失败（与 D47 同源）。摘要校验一条不减。
 - 告警码 `session-purge-completed`（INFO，只在真的删了东西且非 dry-run 时发）、`session-purge-refused`
   （WARNING，**一份没删**，但它是唯一能说「这份会诊的两份副本对不上」的信号，且不会自愈）、
   `session-purge-failed`（WARNING）。**「作业停了」和「医院没有可清理的会话」外观完全一样。**
@@ -592,6 +600,55 @@ D47 归档、D48 认证冷副本、D49 把冷副本读回来——但三轮下�
 按项目惯例，两条关键守卫**先被亲眼看过它变红**：把「冷副本对不上就拒绝」改成「照删」，只有
 `MedSessionPurgeServiceTest$Refusals.refusesWhenTheColdCopyDiffers` 变红；把候选查询里的
 `purged_at IS NULL` 去掉，只有 `purgedSessionsLeaveTheCandidateSet` 变红；还原后重跑全绿。
+
+#### 误归档会话的搬回（D51）
+
+**补上的是那句被引用了六次、却从来没有代码兑现的话。** `MedSessionRetentionService` 的类注释、`MedSessionArchiveProperties`、
+`MedSessionPurgeProperties#minArchivedAge`、`application.yml` 与两份 README 都在说「误归档的会话可以搬回来」，D50 甚至
+为它付出了 7 天冷静期——而在这之前，服务里**没有任何代码能把一个会话搬回来**：`MedChatSessionService` 只有
+create / get / close / archive / list，`closeSession` 的 javadoc 还把 `ARCHIVED` 写成「终态」。这是阶段 8–11 那类偏差
+（**注释承诺了代码没有的行为**）的第 6 次出现，而且这次承诺的代价已经被真实支付。
+
+`MedSessionRestoreService`（常驻 `@Service`，**没有开关**——它是 `archiveSession` 的逆操作，能关掉它等于让误归档不可挽回）
+暴露 `ChatSessionDO restore(tenantId, deptId, sessionId)`，端点是 `POST /api/sessions/{sessionId}/restore`。授权完全复用
+`MedChatSessionService#getSession`（越权 `FORBIDDEN`、跨租户/科室按不存在上报 `NOT_FOUND`），**不新增任何无守卫的
+「直接改状态」原语**（D41/D42 的教训），状态迁移在会话锁内完成。
+
+**搬回的前提是活副本仍然是那份被认证的轨迹**，三道检查按序：
+
+1. 状态必须是 `ARCHIVED`——只有归档会话需要搬回；
+2. `med_session.purged_at` 必须为 `NULL`——热行已被 D50 回收的会话，其活副本**不再存在**；
+3. 若存在导出清单，热轨迹的摘要必须复现清单的 `payload_checksum`（复用 `TranscriptDigests`，与导出 / 复核 / 读取 / 清理
+   同一口径）。
+
+②③ **不是冗余**：③ 抓「漂移」，② 抓「已被回收但轨迹恰好为空」这种 ③ 看不见的形态（空轨迹的摘要是 `sha256("")`，
+一份被回收的空轨迹仍能复现它自己的认证）。
+
+**搬回刻意不重建热行。** `med_message_archive` → `med_message` 的回灌会让「归档」变成可逆的物理操作，而 D50 的冷静期正是为
+「回收**之前**可以搬回」而设。回收之后会诊记录并没有丢——D49 的读路径仍然从认证冷副本把它读回来——只是活副本不再可重建。
+这条界线就是「为什么是 7 天」的答案：**冷静期不是延迟，它是搬回窗口**。
+
+**撤销认证的时机与顺序不可交换。** 先 `SessionArchiveMapper#deleteManifest`，再
+`ChatSessionMapper#updateStatus(sessionId, ACTIVE, ARCHIVED, now)`：
+
+- 清单是**状态行**（D48 的导出候选谓词与 D50 的清理候选谓词都读它），冷行才是**证据**，所以搬回时离开的是清单，
+  不是冷行；
+- 中断在两步之间留下「`ARCHIVED` 且无清单」，下一次导出会把同一份轨迹重新认证、自然收敛；反过来（先翻状态）会留下
+  「`ACTIVE` 却带着一份描述旧轨迹的清单」，而导出的候选谓词是 `NOT EXISTS (manifest)`——它**永远不会再被认证**，冷副本
+  会一直声称自己是一段已经不存在的轨迹，清理作业则每轮都拒绝它；
+- 撤销认证不删任何字节：删除前已经证明热行复现了它认证的内容，重新认证只需一次导出。
+
+**同时给两个冷热作业补上会话锁。** D48 与 D50 都论证过「候选是 `ARCHIVED`，写入路径拒绝写归档会话，所以不需要抢会话锁，
+摘要比较才是发现撕裂读的手段」——搬回让这个前提失效，而摘要比较看不见它。`MedSessionPurgeService` 与
+`MedSessionArchiveExportService` 的每个候选现在都在会话锁内处理，并在锁内重读会话状态；非 `ARCHIVED` 记 `skipped` 零改动。
+导出的那条尤其危险：给一个刚被搬回的会话写清单，会让它**永远无法再被认证**。
+
+守护测试：`MedSessionRestoreServiceTest`（搬回、非归档拒绝、`purged_at` 非空拒绝、热行漂移拒绝、无清单时直接搬回、
+**清单先删后翻的 `InOrder` 顺序断言**）、`SessionControllerTest`、`MedSessionPurgeServiceTest` /
+`MedSessionArchiveExportServiceTest`（**锁被占 → `skipped` 且一个 mapper 都没碰**、候选已被搬回 → `skipped` 零删除、
+**状态重读发生在会话锁内**），以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + Redis 上的完整闭环：
+**归档 → 导出 → 搬回（热行逐字节未变、状态 `ACTIVE`、清单已撤销）→ 追加新的一轮 → 再归档 → 重新导出（冷副本长到 4 条）
+→ 可清理**，外加「热行被回收后搬回被拒，但记录仍可从冷副本读出」与「会话锁被别的线程持有时清理跳过它、一行不删」。
 
 ---
 
@@ -896,6 +953,7 @@ D39 把这件事变成 CI 里会失败的断言：一份**冻结的金标问题�
 | 阶段 9 会话轨迹持久化与检索元数据隔离 | D44–D46 | 已完成（D44：MySQL 保存完整轨迹、窗口写路径改为幂等追加 + `RLock` 串行化 + `ChatMemoryWindowIntegrationTest` / `MedStorageAndLockIntegrationTest` 契约测试；D45：`metadata-mode` 由 `EMBED` 改为 `NONE`、代码回落值同步收敛为 `NONE` + `EmbeddingMetadataContractTest` 用真实 formatter 演示隔离标签是否进向量；D46：窗口语义注释对齐 + 部署前置条件（utf8mb4 / H2 Console）+ 脱敏层注释校正，配 `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`） |
 | 阶段 10 会话生命周期治理与保留策略 | D47–D48 | 已完成（D47：把 `archiveSession` 注释里承诺了 27 天的「保留策略作业」做成真的——陈旧 `ACTIVE` 会话自动转 `ARCHIVED`，陈旧判据写在归档语句自身 `WHERE` 里、归档在会话锁内执行、集群互斥用 `RLock`、默认关闭且默认 dry-run；D48：给「归档」补上可验证的凭据——已归档会话的完整轨迹按 Protobuf 规范复制到非分片冷表 `med_message_archive`，并在 `med_session_archive` 写清单（条数 + SHA-256 摘要），清单只在源轨迹稳定且冷副本能复现摘要之后才写，**只增不删**。配 `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`） |
 | 阶段 11 归档轨迹的可读性与热数据收口 | D49–D50 | 已完成（D49：把「归档 = 消失」补回一条**唯一**的读路径——`MedTranscriptService` 先经生命周期服务完成 scope 与归属校验，再按 `TranscriptDigests` 重算摘要决定「热分表还是冷副本」作答，两份都对不上则拒绝返回；`SessionController` 新增 `GET /api/sessions/{sessionId}/transcript`，响应给出 `source` 与规范摘要。D50：补上冷热分层的另一半——`MedSessionPurgeService` 在**冷副本与热分表都复现清单摘要**之后才删除热行（冷副本先验，因为在那之前热行是唯一副本），退役标记写在 `med_session.purged_at`（V6），**只删 `med_message`、冷表一行不动**，默认关闭 + 只报告 + 7 天冷静期，集群互斥 `med:lock:session:purge`。配 `MedSessionPurgeServiceTest` / `SessionPurgeMapperShardingTest` / `MedSessionPurgeConfigTest` / `MedSessionPurgePropertiesTest` / `SessionPurgeReportTest` / `MedSessionPurgeSchedulerTest`，并在真实 MySQL + Redis 上验证「真删热行后 D49 读路径读回冷副本」） |
+| 阶段 12 误归档的搬回与冷热链路的一致性 | D51–D52 | 进行中（D51：把「误归档的会话可以搬回来」从六处注释变成代码——`MedSessionRestoreService` 在会话锁内、经生命周期服务完成授权后搬回一个 `ARCHIVED` 会话，前提是 `purged_at IS NULL` 且热轨迹复现导出清单的摘要，**先撤销认证再翻状态**（顺序不可交换，反序会让该会话永远无法再被认证）；搬回**刻意不重建热行**，所以 D50 的冷静期第一次有了确切含义——它就是搬回窗口。同时给 `MedSessionPurgeService` 与 `MedSessionArchiveExportService` 补上会话锁与锁内状态重读，因为搬回是第一个能离开 `ARCHIVED` 的写者、而摘要比较看不见它。配 `MedSessionRestoreServiceTest` / `SessionControllerTest` / 两个作业的新用例，并在真实 MySQL + Redis 上跑通「归档 → 导出 → 搬回 → 再归档 → 重新导出 → 可清理」的收敛闭环。D52 未开始） |
 
 ---
 

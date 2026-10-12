@@ -207,9 +207,11 @@ med:
     # Three conservative defaults, not two: enabled=false (a deployment decision), dry-run=true (arming
     # the capability still deletes nothing until an operator has read a report - and a dry run performs
     # the full verification, so the report says how many sessions would be refused, not just how many
-    # candidates exist), and min-archived-age=7d, the cooling-off window that keeps D47's promise -
-    # "a wrongly archived session can be moved back" - from becoming an empty one, since moving it back
-    # needs the transcript to still be there.
+    # candidates exist), and min-archived-age=7d. Since D51 the window has a concrete meaning rather than
+    # being a delay: it is exactly the interval during which POST /api/sessions/{id}/restore can still
+    # move a mis-archived session back, because that requires its live rows to still exist. After the
+    # window the consultation stays readable through the certified cold copy - it just stops being
+    # reversible.
     #
     # Only med_message is ever deleted. The cold tables are read-only for this job: the archived rows are
     # the evidence and the manifest is the certification, and deleting either would destroy the only thing

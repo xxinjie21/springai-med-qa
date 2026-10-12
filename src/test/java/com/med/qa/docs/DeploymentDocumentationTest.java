@@ -327,6 +327,27 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D51 restore, its three refusals and the cooling-off window")
+    void sessionRestoreIsDocumented() {
+        // The operator-facing half of D51. Two failures live behind it: an operator who sees the 40000
+        // and hand-writes hot rows instead of reading the certified cold copy, and an operator who
+        // restores a session after its rows were reclaimed and then believes the record is gone. The
+        // chapter has to name the endpoint, the three checks, the window's real meaning and the fact
+        // that the export certification is retired - and that the two cold-tier jobs now take the
+        // session lock, which is the reason the window is what it is.
+        assertThat(handbook).contains("7.12");
+        assertThat(handbook).contains("（D51）");
+        assertThat(handbook).contains("/api/sessions/{sessionId}/restore");
+        assertThat(handbook).contains("MedSessionRestoreService");
+        assertThat(handbook).contains("purged_at");
+        assertThat(handbook).contains("payload_checksum");
+        assertThat(handbook).contains("deleteManifest");
+        assertThat(handbook).contains("min-archived-age");
+        assertThat(handbook).contains("MedSessionRestoreServiceTest");
+        assertThat(handbook).contains("MedSessionArchiveExportService");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

@@ -12,11 +12,13 @@ import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
@@ -30,6 +32,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -38,7 +41,9 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -88,6 +93,8 @@ class MedSessionPurgeServiceTest {
 
     private RLock lock;
 
+    private SessionLockService lockService;
+
     private MedSessionPurgeProperties properties;
 
     private ProtoMessageCodec codec;
@@ -101,6 +108,7 @@ class MedSessionPurgeServiceTest {
         messageMapper = mock(ChatMessageMapper.class);
         redissonClient = mock(RedissonClient.class);
         lock = mock(RLock.class);
+        lockService = mock(SessionLockService.class);
         properties = new MedSessionPurgeProperties();
         properties.setEnabled(true);
         properties.setDryRun(false);
@@ -112,8 +120,16 @@ class MedSessionPurgeServiceTest {
                 .thenReturn(true);
         when(lock.isHeldByCurrentThread()).thenReturn(true);
 
+        // The session lock runs its action inline, and the in-lock status re-read sees an archived row:
+        // the default candidate is one the restore has not touched. Both defaults are overridden by the
+        // tests that pin the lock and the re-read themselves.
+        doAnswer(invocation -> ((Supplier<?>) invocation.getArgument(1)).get())
+                .when(lockService).executeLocked(any(ChatSessionDO.class), any());
+        when(sessionMapper.selectById(anyString())).thenAnswer(invocation -> session(invocation.getArgument(0)));
+
         service = new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper, codec,
-                redissonClient, properties, Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
+                lockService, redissonClient, properties,
+                Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
     }
 
     // ------------------------------------------------------------------ read-only helpers
@@ -364,9 +380,11 @@ class MedSessionPurgeServiceTest {
         verify(archiveMapper).selectManifest(sessionId);
         verify(archiveMapper).selectBySessionId(sessionId);
         verify(messageMapper).selectTranscriptBySessionId(sessionId);
-        // ...and nothing was written.
+        // ...and nothing was written. Since D51 the session row is re-read inside the session lock, so
+        // the assertion is on the write rather than on "the mapper was never touched".
         verify(messageMapper, never()).deleteBySessionId(anyString());
-        verifyNoInteractions(sessionMapper);
+        verify(sessionMapper).selectById(sessionId);
+        verify(sessionMapper, never()).markPurged(anyString(), any(), anyLong());
     }
 
     @Test
@@ -381,7 +399,9 @@ class MedSessionPurgeServiceTest {
 
         assertThat(report.dryRun()).isTrue();
         assertThat(report.refused()).isEqualTo(1);
-        verifyNoInteractions(messageMapper, sessionMapper);
+        // Refused before the shard is even read, and no write happens on either mapper.
+        verifyNoInteractions(messageMapper);
+        verify(sessionMapper, never()).markPurged(anyString(), any(), anyLong());
     }
 
     @Test
@@ -594,26 +614,108 @@ class MedSessionPurgeServiceTest {
     void constructorRejectsNulls() {
         Clock clock = Clock.systemUTC();
         assertThatThrownBy(() -> new MedSessionPurgeService(null, archiveMapper, messageMapper, codec,
-                redissonClient, properties, clock))
+                lockService, redissonClient, properties, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("sessionMapper");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, null, messageMapper, codec,
-                redissonClient, properties, clock))
+                lockService, redissonClient, properties, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("archiveMapper");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, null, codec,
-                redissonClient, properties, clock))
+                lockService, redissonClient, properties, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("messageMapper");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper,
-                null, redissonClient, properties, clock))
+                null, lockService, redissonClient, properties, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("codec");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper,
-                codec, null, properties, clock))
+                codec, null, redissonClient, properties, clock))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("lockService");
+        assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper,
+                codec, lockService, null, properties, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("redissonClient");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper,
-                codec, redissonClient, null, clock))
+                codec, lockService, redissonClient, null, clock))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("properties");
         assertThatThrownBy(() -> new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper,
-                codec, redissonClient, properties, null))
+                codec, lockService, redissonClient, properties, null))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("clock");
+    }
+
+    // ------------------------------------------------------------------ the session lock (D51)
+
+    @Test
+    @DisplayName("a candidate the restore moved back is skipped, and not a row is deleted")
+    void skipsACandidateThatLeftArchived() {
+        String sessionId = "session-restored";
+        List<ChatMessageDO> transcript = transcript(sessionId, 2);
+        List<ArchivedMessageDO> cold = coldCopy(sessionId, transcript);
+        stubCandidate(sessionId);
+        when(archiveMapper.selectManifest(sessionId))
+                .thenReturn(manifest(sessionId, TranscriptDigests.ofArchived(cold)));
+        when(archiveMapper.selectBySessionId(sessionId)).thenReturn(cold);
+        when(messageMapper.selectTranscriptBySessionId(sessionId)).thenReturn(transcript);
+        ChatSessionDO restored = session(sessionId);
+        restored.setStatus(SessionStatus.ACTIVE);
+        when(sessionMapper.selectById(sessionId)).thenReturn(restored);
+
+        SessionPurgeReport report = service.purgeOnce();
+
+        assertThat(report.candidates()).isEqualTo(1);
+        assertThat(report.skipped()).isEqualTo(1);
+        assertThat(report.purged()).isZero();
+        assertThat(report.refused()).isZero();
+        assertThat(report.failed()).isZero();
+        assertThat(report.failures()).isEmpty();
+        // Asserted on the mappers rather than on the counters: a bug that deleted the rows and still
+        // reported "skipped" would satisfy the report alone.
+        verify(messageMapper, never()).deleteBySessionId(anyString());
+        verify(sessionMapper, never()).markPurged(anyString(), any(), anyLong());
+        verify(messageMapper, never()).selectTranscriptBySessionId(anyString());
+    }
+
+    @Test
+    @DisplayName("a candidate whose row disappeared is skipped too")
+    void skipsACandidateWhoseRowDisappeared() {
+        String sessionId = "session-vanished";
+        stubCandidate(sessionId);
+        when(sessionMapper.selectById(sessionId)).thenReturn(null);
+
+        SessionPurgeReport report = service.purgeOnce();
+
+        assertThat(report.skipped()).isEqualTo(1);
+        assertThat(report.failed()).isZero();
+        verify(messageMapper, never()).deleteBySessionId(anyString());
+    }
+
+    @Test
+    @DisplayName("a busy session lock is a skipped outcome, not a failure")
+    void skipsABusySession() {
+        String sessionId = "session-busy";
+        stubCandidate(sessionId);
+        doThrow(new BizException(ErrorCode.SESSION_LOCKED, "busy"))
+                .when(lockService).executeLocked(any(ChatSessionDO.class), any());
+
+        SessionPurgeReport report = service.purgeOnce();
+
+        assertThat(report.skipped()).isEqualTo(1);
+        assertThat(report.failed()).isZero();
+        assertThat(report.failures()).isEmpty();
+        verify(archiveMapper, never()).selectManifest(anyString());
+        verify(messageMapper, never()).deleteBySessionId(anyString());
+    }
+
+    @Test
+    @DisplayName("the status is re-read inside the session lock, after the candidate query")
+    void reReadsTheStatusInsideTheLock() {
+        String sessionId = "session-locked-then-read";
+        stubCandidate(sessionId);
+
+        service.purgeOnce();
+
+        // The batch is selected before any lock is taken (that is why the re-read is needed at all), and
+        // the re-read happens inside the lock, i.e. after executeLocked was entered.
+        InOrder inOrder = inOrder(archiveMapper, lockService, sessionMapper);
+        inOrder.verify(archiveMapper).selectPurgeableArchivedSessions(any(), anyLong(), anyInt());
+        inOrder.verify(lockService).executeLocked(any(ChatSessionDO.class), any());
+        inOrder.verify(sessionMapper).selectById(sessionId);
     }
 
     // ------------------------------------------------------------------ fixtures

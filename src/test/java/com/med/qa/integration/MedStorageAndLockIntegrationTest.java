@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedSessionProperties;
+import com.med.qa.config.MedSessionArchiveProperties;
 import com.med.qa.config.MedSessionPurgeProperties;
 import com.med.qa.config.RedissonConfig;
 import com.med.qa.domain.entity.ArchivedMessageDO;
@@ -33,7 +34,9 @@ import com.med.qa.memory.repository.MedChatMemoryRepository;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.memory.sharding.Crc32ShardingAlgorithm;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedSessionArchiveExportService;
 import com.med.qa.service.MedSessionPurgeService;
+import com.med.qa.service.MedSessionRestoreService;
 import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionArchiveChecksum;
 import com.med.qa.service.SessionPurgeReport;
@@ -146,6 +149,7 @@ class MedStorageAndLockIntegrationTest {
     private static SessionLockService lockService;
     private static MedChatSessionService sessionService;
     private static MedTranscriptService transcriptService;
+    private static MedSessionRestoreService restoreService;
 
     @BeforeAll
     static void startInfrastructure() throws Exception {
@@ -211,6 +215,8 @@ class MedStorageAndLockIntegrationTest {
         sessionService = new MedChatSessionService(
                 sessionMapper, lockService, cache, new MedSessionProperties(), Clock.systemUTC());
         transcriptService = new MedTranscriptService(sessionService, messageMapper, archiveMapper, codec);
+        restoreService = new MedSessionRestoreService(sessionService, lockService, sessionMapper,
+                messageMapper, archiveMapper, codec);
     }
 
     @AfterAll
@@ -605,11 +611,154 @@ class MedStorageAndLockIntegrationTest {
         assertNull(purgedAtOf(sessionId), "a dry run must not retire anything");
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Restoring a mis-archived session (D51)
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("D51: restoring retires the certification, keeps the rows, and the pipeline converges")
+    void restoresAMisArchivedSessionAndConverges() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "误归档搬回").getSessionId();
+        for (int turn = 1; turn <= 3; turn++) {
+            repository.append(turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L));
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+
+        // The certification is produced by the real export path, not written by hand: the convergence
+        // claim is about the pipeline, so the pipeline has to be the one that certifies.
+        exportService().exportOnce();
+        assertNotNull(archiveMapper.selectManifest(sessionId),
+                "the export must certify the archived session before it can be restored");
+        assertEquals(3L, countArchivedRows(sessionId));
+
+        long rowsBefore = countSessionRows(sessionId);
+        ChatSessionDO restored = restoreService.restore(TENANT, DEPT, sessionId);
+
+        assertEquals(SessionStatus.ACTIVE, restored.getStatus(), "the session must be writable again");
+        assertNull(archiveMapper.selectManifest(sessionId),
+                "the certification has to be retired, or the session could never be re-certified");
+        assertEquals(rowsBefore, countSessionRows(sessionId),
+                "restoring must not touch a single live row - the cooling-off window is what makes it possible");
+        // The transcript is intact and now served from the live shard again.
+        SessionTranscript afterRestore = transcriptService.read(TENANT, DEPT, sessionId);
+        assertEquals(SessionTranscript.Source.HOT, afterRestore.source());
+        assertEquals(3, afterRestore.messageCount());
+
+        // It really accepts new turns again, which is the whole point of moving it back.
+        repository.append(turnMessage(sessionId, patientId, "恢复后新增的一轮", 1_735_000_000_000L + 9_000L));
+        assertEquals(4L, countSessionRows(sessionId));
+
+        // Convergence: archive it again, re-certify it, and the purge can finally reclaim it. Without the
+        // retired manifest the export would skip it (NOT EXISTS (manifest)), the cold copy would keep
+        // describing a three-message transcript and the purge would refuse it forever.
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        exportService().exportOnce();
+        SessionArchiveManifestDO manifest = archiveMapper.selectManifest(sessionId);
+        assertNotNull(manifest, "a re-archived restored session must be re-certified");
+        assertEquals(4, manifest.getMessageCount(), "the certification must cover the new turn");
+        assertEquals(4L, countArchivedRows(sessionId), "the cold copy must have grown with it");
+
+        backdateSession(sessionId, candidateUpdatedAt());
+        purgeService(false).purgeOnce();
+
+        assertEquals(0L, countSessionRows(sessionId),
+                "a re-certified session must be reclaimable again, or the pipeline never converges");
+        assertNotNull(purgedAtOf(sessionId));
+    }
+
+    @Test
+    @DisplayName("D51: a session whose live rows were reclaimed can no longer be restored")
+    void refusesToRestoreASessionWhoseHotRowsAreGone() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "回收后不可搬回").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 2; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), TranscriptDigests.ofArchived(coldRows),
+                1_735_000_000_000L));
+        backdateSession(sessionId, candidateUpdatedAt());
+        purgeService(false).purgeOnce();
+        assertEquals(0L, countSessionRows(sessionId), "the purge must have reclaimed the live rows");
+
+        BizException refusal = assertThrows(BizException.class,
+                () -> restoreService.restore(TENANT, DEPT, sessionId));
+
+        assertEquals(ErrorCode.BAD_REQUEST, refusal.getErrorCode());
+        assertTrue(refusal.getMessage().contains("retired"),
+                "the refusal has to name the reason: " + refusal.getMessage());
+        assertEquals(SessionStatus.ARCHIVED, sessionMapper.selectById(sessionId).getStatus(),
+                "a refused restore must not move the session");
+        // The consultation is not lost: it is still readable from the certified cold copy.
+        SessionTranscript read = transcriptService.read(TENANT, DEPT, sessionId);
+        assertEquals(SessionTranscript.Source.COLD, read.source());
+        assertEquals(2, read.messageCount());
+    }
+
+    @Test
+    @DisplayName("D51: a session whose lock is held elsewhere keeps every row through a purge run")
+    void purgeSkipsASessionWhoseLockIsHeldElsewhere() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "锁被占用").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 3; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), TranscriptDigests.ofArchived(coldRows),
+                1_735_000_000_000L));
+        backdateSession(sessionId, candidateUpdatedAt());
+
+        // Held from another thread on purpose: a Redisson lock is reentrant per thread, so holding it on
+        // this one would let the purge acquire it and prove nothing.
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> lockService.runLocked(TENANT, DEPT, sessionId, () -> {
+            held.countDown();
+            try {
+                release.await(60, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }), "session-lock-holder");
+        holder.start();
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the helper thread must acquire the session lock");
+        try {
+            SessionPurgeReport report = purgeService(false).purgeOnce();
+
+            assertTrue(report.skipped() >= 1,
+                    "a session busy elsewhere is a skipped outcome, not a purge: " + report.summary());
+            assertEquals(3L, countSessionRows(sessionId), "a busy session must keep every row");
+            assertNull(purgedAtOf(sessionId), "a busy session must stay a candidate for the next run");
+        } finally {
+            release.countDown();
+            holder.join(30_000);
+        }
+    }
+
     /**
      * Builds the purge service the D50 cases drive, wired exactly like {@code MedSessionPurgeConfig}
      * wires it in production (same mappers, same codec, same Redisson client) but with a policy that
-     * fits a test: a 30-day cooling-off window, one pass, and a small batch.
-     *
+     * fits a test: a 30-day cooling-off window, one pass, and a small batch.     *
      * <p>The 30-day window is also what isolates these cases from every other session in the shared
      * database. Only a session whose {@code updated_at} was explicitly backdated by
      * {@link #backdateSession} is old enough to be a candidate, so the suites in this class cannot
@@ -627,7 +776,25 @@ class MedStorageAndLockIntegrationTest {
         properties.setLockWaitTime(Duration.ofSeconds(5));
         properties.setLockLeaseTime(Duration.ofSeconds(30));
         return new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper, codec,
-                redissonClient, properties, Clock.systemUTC());
+                lockService, redissonClient, properties, Clock.systemUTC());
+    }
+
+    /**
+     * Builds the export service the D51 convergence case drives, wired like
+     * {@code MedSessionArchiveConfig} wires it in production but with a policy that fits a test.
+     *
+     * @return a ready-to-run service, never {@code null}
+     */
+    private static MedSessionArchiveExportService exportService() {
+        MedSessionArchiveProperties properties = new MedSessionArchiveProperties();
+        properties.setEnabled(true);
+        properties.setDryRun(false);
+        properties.setBatchSize(50);
+        properties.setMaxBatches(5);
+        properties.setLockWaitTime(Duration.ofSeconds(5));
+        properties.setLockLeaseTime(Duration.ofSeconds(30));
+        return new MedSessionArchiveExportService(messageMapper, archiveMapper, codec, lockService,
+                sessionMapper, redissonClient, properties, Clock.systemUTC());
     }
 
     /**

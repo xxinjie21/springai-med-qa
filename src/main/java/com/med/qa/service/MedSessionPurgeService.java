@@ -11,6 +11,7 @@ import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -19,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataAccessException;
+import org.springframework.lang.Nullable;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -60,14 +62,23 @@ import java.util.concurrent.TimeUnit;
  * has certified. Deleting them would destroy the only record of them. So a mismatch refuses rather than
  * deletes; the certified copy is safe in the cold store either way.</p>
  *
- * <h2>Why there is no session lock</h2>
- * <p>D47's sweep takes the session lock because it races the message-append path for a session that is
- * still being written. This job does not: its candidates are {@code ARCHIVED}, which
- * {@code SessionStatus#isWritable()} excludes, and the write path checks that before every turn — a
- * consultation that became writable again is no longer a candidate. The digest comparison is what
- * actually detects a torn read (a lock prevents one, a checksum notices one), and it is done for both
- * copies. If a future iteration makes archived sessions writable again, that change must add the lock
- * here <em>and</em> keep the checks.</p>
+ * <h2>Why there is a session lock (added in D51)</h2>
+ * <p>This job was written without one, and the argument was explicit: its candidates are
+ * {@code ARCHIVED}, which {@code SessionStatus#isWritable()} excludes, the write path checks that before
+ * every turn, and the digest comparison is what actually detects a torn read (a lock prevents one, a
+ * checksum notices one) — so a checksum on both copies was enough. D51 made that premise false by
+ * adding {@link MedSessionRestoreService}, the first writer that may leave {@code ARCHIVED}, and a
+ * checksum <em>cannot</em> see it: restoring changes the status and retires the certification without
+ * touching a single transcript byte. Interleaved with a candidate already selected by this run, that
+ * would delete the hot rows of a session a clinician had just moved back, leaving an {@code ACTIVE}
+ * session whose read path serves an empty transcript.</p>
+ *
+ * <p>So every candidate is now processed inside {@link SessionLockService} — the same lock the append
+ * path, {@code archiveSession} and the restore take — and the session is re-read inside it, because a
+ * candidate selected before the restore is stale by construction. A candidate that is no longer
+ * {@code ARCHIVED} is counted as {@code skipped} with zero writes; a busy lock is {@code skipped} too,
+ * not a failure (the D47 convention). The digest checks stay exactly as they were: the lock prevents
+ * the interleaving, the checksums still notice a torn read.</p>
  *
  * <h2>Failure semantics</h2>
  * <ul>
@@ -99,6 +110,8 @@ public class MedSessionPurgeService {
 
     private final ProtoMessageCodec codec;
 
+    private final SessionLockService lockService;
+
     private final RedissonClient redissonClient;
 
     private final MedSessionPurgeProperties properties;
@@ -117,6 +130,8 @@ public class MedSessionPurgeService {
      *                       {@code null}
      * @param codec          Protobuf codec of the unified storage spec, used to hash the live transcript
      *                       exactly as the archive certified it, must not be {@code null}
+     * @param lockService    distributed session lock serializing one candidate against a restore, must
+     *                       not be {@code null}
      * @param redissonClient the shared client, used only for the cluster-wide purge mutex, must not be
      *                       {@code null}
      * @param properties     the {@code med.session.purge.*} policy, must not be {@code null}
@@ -126,9 +141,10 @@ public class MedSessionPurgeService {
                                  SessionArchiveMapper archiveMapper,
                                  ChatMessageMapper messageMapper,
                                  ProtoMessageCodec codec,
+                                 SessionLockService lockService,
                                  @Lazy RedissonClient redissonClient,
                                  MedSessionPurgeProperties properties) {
-        this(sessionMapper, archiveMapper, messageMapper, codec, redissonClient, properties,
+        this(sessionMapper, archiveMapper, messageMapper, codec, lockService, redissonClient, properties,
                 Clock.systemUTC());
     }
 
@@ -140,6 +156,7 @@ public class MedSessionPurgeService {
      * @param messageMapper  MyBatis mapper over the sharded {@code med_message} table, must not be
      *                       {@code null}
      * @param codec          Protobuf codec of the unified storage spec, must not be {@code null}
+     * @param lockService    distributed session lock serializing one candidate, must not be {@code null}
      * @param redissonClient the shared client, must not be {@code null}
      * @param properties     the {@code med.session.purge.*} policy, must not be {@code null}
      * @param clock          clock that stamps the cutoff and the retirement, must not be {@code null}
@@ -149,6 +166,7 @@ public class MedSessionPurgeService {
                                  SessionArchiveMapper archiveMapper,
                                  ChatMessageMapper messageMapper,
                                  ProtoMessageCodec codec,
+                                 SessionLockService lockService,
                                  @Lazy RedissonClient redissonClient,
                                  MedSessionPurgeProperties properties,
                                  Clock clock) {
@@ -164,6 +182,9 @@ public class MedSessionPurgeService {
         if (codec == null) {
             throw new IllegalArgumentException("codec must not be null");
         }
+        if (lockService == null) {
+            throw new IllegalArgumentException("lockService must not be null");
+        }
         if (redissonClient == null) {
             throw new IllegalArgumentException("redissonClient must not be null");
         }
@@ -177,6 +198,7 @@ public class MedSessionPurgeService {
         this.archiveMapper = archiveMapper;
         this.messageMapper = messageMapper;
         this.codec = codec;
+        this.lockService = lockService;
         this.redissonClient = redissonClient;
         this.properties = properties;
         this.clock = clock;
@@ -278,7 +300,7 @@ public class MedSessionPurgeService {
             candidates += batch.size();
             for (ChatSessionDO candidate : batch) {
                 try {
-                    CandidateResult result = purgeOne(candidate);
+                    CandidateResult result = purgeUnderSessionLock(candidate);
                     switch (result.outcome()) {
                         case PURGED -> purged++;
                         case SKIPPED -> skipped++;
@@ -305,6 +327,57 @@ public class MedSessionPurgeService {
                 batches, remaining, clock.millis() - started, failures);
         log.info("hot-shard purge finished: {}", report.summary());
         return report;
+    }
+
+    /**
+     * Processes one candidate inside its session lock, re-asserting the status the candidate query
+     * assumed.
+     *
+     * <p>The re-read is not paranoia about the lock: the batch was selected before the lock was taken,
+     * so a candidate the restore moved back in the meantime arrives here stale. Only a candidate that is
+     * still {@code ARCHIVED} may lose its hot rows. A busy session is a {@code skipped} outcome, not a
+     * failure — the next run picks it up (the D47 convention).</p>
+     *
+     * @param candidate the session the candidate query returned
+     * @return what happened to the candidate
+     * @throws BizException {@link ErrorCode#STORAGE_ERROR} when the re-read fails
+     */
+    private CandidateResult purgeUnderSessionLock(ChatSessionDO candidate) {
+        try {
+            return lockService.executeLocked(candidate, () -> {
+                ChatSessionDO current = readSession(candidate.getSessionId());
+                if (current == null || current.getStatus() != SessionStatus.ARCHIVED) {
+                    log.info("session {} is no longer archived ({}), skipping it",
+                            candidate.getSessionId(),
+                            current == null ? "row missing" : current.getStatus().name());
+                    return CandidateResult.skipped();
+                }
+                return purgeOne(current);
+            });
+        } catch (BizException ex) {
+            if (ex.getErrorCode() == ErrorCode.SESSION_LOCKED) {
+                log.info("session {} is busy, skipping it for this run", candidate.getSessionId());
+                return CandidateResult.skipped();
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Re-reads one session row.
+     *
+     * @param sessionId the session id
+     * @return the row, or {@code null} when it disappeared
+     * @throws BizException {@link ErrorCode#STORAGE_ERROR} when the query fails
+     */
+    @Nullable
+    private ChatSessionDO readSession(String sessionId) {
+        try {
+            return sessionMapper.selectById(sessionId);
+        } catch (DataAccessException ex) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "failed to re-read session " + sessionId + " before purging it", ex);
+        }
     }
 
     /**

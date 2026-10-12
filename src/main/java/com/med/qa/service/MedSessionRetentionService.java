@@ -65,7 +65,9 @@ import java.util.concurrent.TimeUnit;
  *       sweeping at once is what the lock exists to prevent, and the scheduler turns the exception
  *       into an alert.</li>
  *   <li><b>Nothing here deletes a message.</b> Archiving is a status transition plus a cache eviction;
- *       the transcript stays intact and a wrongly archived session can be moved back.</li>
+ *       the transcript stays intact, which is what makes the D51 restore
+ *       ({@link MedSessionRestoreService}) possible at all. That promise is no longer a comment: it is
+ *       an endpoint.</li>
  * </ul>
  *
  * <p>Not annotated with {@code @Service} on purpose: {@code config/MedSessionRetentionConfig} declares

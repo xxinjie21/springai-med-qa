@@ -14,6 +14,7 @@ import com.med.qa.common.ratelimit.annotation.RateLimit;
 import com.med.qa.security.annotation.DeptIdSource;
 import com.med.qa.security.annotation.RequireDept;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedSessionRestoreService;
 import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionPageQuery;
 import com.med.qa.service.SessionTranscript;
@@ -60,27 +61,33 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/sessions")
 @EnableConfigurationProperties(MedSessionProperties.class)
-@Tag(name = "Session Lifecycle", description = "Consultation session creation, lookup, close, archive "
-        + "and paged listing. Every operation is scoped to a tenant/department and authorized by the "
-        + "@RequireDept interceptor and the patient-ownership guard.")
+@Tag(name = "Session Lifecycle", description = "Consultation session creation, lookup, close, archive, "
+        + "restore and paged listing. Every operation is scoped to a tenant/department and authorized by "
+        + "the @RequireDept interceptor and the patient-ownership guard.")
 public class SessionController {
 
     private final MedChatSessionService sessionService;
 
     private final MedTranscriptService transcriptService;
 
+    private final MedSessionRestoreService restoreService;
+
     /**
      * Creates the controller.
      *
      * @param sessionService    session lifecycle service, must not be {@code null}
      * @param transcriptService transcript read service, must not be {@code null}
+     * @param restoreService    restore service moving a mis-archived session back, must not be
+     *                          {@code null}
      * @throws NullPointerException if an argument is {@code null}
      */
     @Autowired
     public SessionController(MedChatSessionService sessionService,
-                            MedTranscriptService transcriptService) {
+                            MedTranscriptService transcriptService,
+                            MedSessionRestoreService restoreService) {
         this.sessionService = sessionService;
         this.transcriptService = transcriptService;
+        this.restoreService = restoreService;
     }
 
     /**
@@ -210,6 +217,37 @@ public class SessionController {
                                              @Parameter(description = "department id") @RequestParam String deptId) {
         requireScope(tenantId, deptId);
         ChatSessionDO session = sessionService.archiveSession(tenantId, deptId, sessionId);
+        return ApiResult.ok(SessionResponse.from(session));
+    }
+
+    /**
+     * Moves a mis-archived session back to the live tier.
+     *
+     * <p>Archiving is not terminal any more: a consultation archived by mistake (by the retention sweep
+     * or by hand) can be moved back while its live copy still exists. Once the purge has reclaimed that
+     * copy the session stays readable through the transcript endpoint but can no longer be restored —
+     * the response of that refusal names the reason.</p>
+     *
+     * @param sessionId consultation session id, must not be blank
+     * @param tenantId hospital/tenant id, must not be blank
+     * @param deptId   department id, must not be blank
+     * @return the session in its {@link SessionStatus#ACTIVE} state
+     * @throws BizException {@link ErrorCode#BAD_REQUEST} on a blank scope, a session that is not
+     *                      archived, or a live copy that is no longer the certified transcript,
+     *                      {@link ErrorCode#NOT_FOUND} when unknown,
+     *                      {@link ErrorCode#SESSION_LOCKED} when busy
+     */
+    @PostMapping("/{sessionId}/restore")
+    @RequireDept(source = DeptIdSource.QUERY)
+    @Operation(summary = "Restore a mis-archived session",
+            description = "Moves an ARCHIVED session back to ACTIVE so it accepts messages again, and "
+                    + "retires the export certification that governed it. Refused once the purge has "
+                    + "reclaimed the session's live rows, because the cold copy is then read-only.")
+    public ApiResult<SessionResponse> restore(@Parameter(description = "consultation session id") @PathVariable String sessionId,
+                                             @Parameter(description = "hospital / tenant id") @RequestParam String tenantId,
+                                             @Parameter(description = "department id") @RequestParam String deptId) {
+        requireScope(tenantId, deptId);
+        ChatSessionDO session = restoreService.restore(tenantId, deptId, sessionId);
         return ApiResult.ok(SessionResponse.from(session));
     }
 

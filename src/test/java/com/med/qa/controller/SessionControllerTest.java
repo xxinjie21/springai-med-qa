@@ -21,6 +21,7 @@ import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.RoleType;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedSessionRestoreService;
 import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionArchiveChecksum;
 import com.med.qa.service.SessionPageQuery;
@@ -44,13 +45,16 @@ class SessionControllerTest {
 
     private MedTranscriptService transcriptService;
 
+    private MedSessionRestoreService restoreService;
+
     private SessionController controller;
 
     @BeforeEach
     void setUp() {
         sessionService = mock(MedChatSessionService.class);
         transcriptService = mock(MedTranscriptService.class);
-        controller = new SessionController(sessionService, transcriptService);
+        restoreService = mock(MedSessionRestoreService.class);
+        controller = new SessionController(sessionService, transcriptService, restoreService);
     }
 
     private static ChatSessionDO session(String id, SessionStatus status) {
@@ -204,6 +208,30 @@ class SessionControllerTest {
             assertThat(result.isSuccess()).isTrue();
             assertThat(result.getData().status()).isEqualTo(SessionStatus.ARCHIVED);
             verify(sessionService).archiveSession("hosp-1", "cardiology", "sess-1");
+        }
+
+        @Test
+        @DisplayName("restores a mis-archived session back to ACTIVE")
+        void restoresSession() {
+            when(restoreService.restore("hosp-1", "cardiology", "sess-1"))
+                    .thenReturn(session("sess-1", SessionStatus.ACTIVE));
+
+            ApiResult<SessionResponse> result =
+                    controller.restore("sess-1", "hosp-1", "cardiology");
+
+            assertThat(result.isSuccess()).isTrue();
+            assertThat(result.getData().status()).isEqualTo(SessionStatus.ACTIVE);
+            verify(restoreService).restore("hosp-1", "cardiology", "sess-1");
+        }
+
+        @Test
+        @DisplayName("refuses a blank scope before touching the restore service")
+        void restoreRejectsBlankScope() {
+            assertThatThrownBy(() -> controller.restore("sess-1", " ", "cardiology"))
+                    .isInstanceOf(BizException.class)
+                    .satisfies(ex -> assertThat(((BizException) ex).getErrorCode())
+                            .isEqualTo(ErrorCode.BAD_REQUEST));
+            verifyNoInteractions(restoreService);
         }
     }
 

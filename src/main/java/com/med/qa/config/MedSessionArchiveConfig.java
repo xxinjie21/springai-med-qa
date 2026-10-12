@@ -2,7 +2,9 @@ package com.med.qa.config;
 
 import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.mapper.ChatMessageMapper;
+import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.service.MedSessionArchiveExportScheduler;
 import com.med.qa.service.MedSessionArchiveExportService;
@@ -51,9 +53,16 @@ public class MedSessionArchiveConfig {
      * Redis available. The proxy only resolves when a run actually tries to take the cluster
      * mutex.</p>
      *
+     * <p>The session lock and the session mapper are plain mandatory collaborators: since D51 the export
+     * re-asserts the status of every candidate inside its session lock, because restoring a session is
+     * the one write that can move it out of {@code ARCHIVED} underneath a candidate this run already
+     * selected.</p>
+     *
      * @param messageMapper  MyBatis mapper over the sharded {@code med_message} table
      * @param archiveMapper  MyBatis mapper over the cold archive tables
      * @param codec          Protobuf codec of the unified storage spec
+     * @param lockService    distributed session lock serializing one candidate against a restore
+     * @param sessionMapper  MyBatis mapper over {@code med_session}, for the in-lock status re-assertion
      * @param redissonClient lazily resolved client used for the cluster-wide export mutex
      * @param properties     the {@code med.session.archive.*} policy
      * @return the export service
@@ -63,10 +72,12 @@ public class MedSessionArchiveConfig {
             ChatMessageMapper messageMapper,
             SessionArchiveMapper archiveMapper,
             ProtoMessageCodec codec,
+            SessionLockService lockService,
+            ChatSessionMapper sessionMapper,
             @Lazy RedissonClient redissonClient,
             MedSessionArchiveProperties properties) {
-        return new MedSessionArchiveExportService(messageMapper, archiveMapper, codec, redissonClient,
-                properties);
+        return new MedSessionArchiveExportService(messageMapper, archiveMapper, codec, lockService,
+                sessionMapper, redissonClient, properties);
     }
 
     /**

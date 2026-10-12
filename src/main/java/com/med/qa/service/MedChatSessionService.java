@@ -28,6 +28,12 @@ import java.util.UUID;
 /**
  * Lifecycle service of consultation sessions: creation, lookup, closing, archiving and paged listing.
  *
+ * <p>Every transition here moves a session <em>forward</em>. The one transition that moves a session
+ * back out of {@link SessionStatus#ARCHIVED} lives in {@link MedSessionRestoreService} (D51), which
+ * resolves and authorizes through {@link #getSession(String, String, String)} but owns its own
+ * compare-and-set — deliberately, so this class keeps offering no general-purpose "set any status"
+ * primitive.</p>
+ *
  * <h2>Where the session row lives</h2>
  * <p>Sessions are persisted in the single {@code med_session} table through {@link ChatSessionMapper}
  * (ShardingSphere-JDBC routes it via its {@code SINGLE} rule), while their messages stay in the 16
@@ -303,8 +309,10 @@ public class MedChatSessionService {
      * Closes an active session so it stops accepting messages.
      *
      * <p>Idempotent: closing an already closed session returns it unchanged. Archived sessions are
-     * rejected — archiving is the terminal state, and pretending to "close" it would hide the fact
-     * that the transcript is already cold.</p>
+     * rejected — the transcript is already cold, and "closing" one would hide that. Note that
+     * {@link SessionStatus#ARCHIVED} is <em>not</em> terminal any more: since D51 a mis-archived session
+     * can be moved back through {@link MedSessionRestoreService}, which is a deliberate, separately
+     * audited operation rather than a lifecycle transition this service may perform.</p>
      *
      * @param tenantId  hospital/tenant id, must not be blank
      * @param deptId    department id, must not be blank

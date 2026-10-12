@@ -32,10 +32,11 @@ import java.time.Duration;
  * <h2>Three switches, not two</h2>
  * <p>{@link #isEnabled()} defaults to {@code false} and {@link #isDryRun()} defaults to {@code true},
  * exactly as in the D38 index rebuild, the D47 sweep and the D48 export. On top of those,
- * {@link #getMinArchivedAge()} is a cooling-off window rather than a switch: it keeps the promise D47
- * made — "a wrongly archived session can be moved back" — from becoming an empty one, because moving it
- * back requires the transcript to still be there. A purge that could run immediately after archiving
- * would delete the very rows that promise depends on.</p>
+ * {@link #getMinArchivedAge()} is a cooling-off window rather than a switch, and since D51 it has a
+ * concrete meaning: it is exactly the interval during which {@code MedSessionRestoreService} can still
+ * move the session back. Moving it back requires the live rows to still be there, so a purge that could
+ * run immediately after archiving would delete the very rows that capability depends on. After the
+ * window the session stays readable through the certified cold copy — it just stops being reversible.</p>
  *
  * <h2>What the purge can never do</h2>
  * <p>It only ever deletes from {@code med_message}. The cold tables are read-only for this class: the

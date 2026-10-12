@@ -39,10 +39,11 @@ import java.time.Duration;
  *
  * <h2>What the export can never do</h2>
  * <p>It only ever inserts. No code path here deletes or updates a message in the hot shards, and none
- * deletes a row from the cold store: {@code MedChatSessionService#archiveSession}'s contract - "a
- * wrongly archived session can be moved back" - stays true only as long as the transcript is still
- * there. Purging the hot rows is a separate, irreversible operation that needs its own guard and its
- * own iteration.</p>
+ * deletes a row from the cold store: the promise that "a wrongly archived session can be moved back"
+ * (now implemented by {@code MedSessionRestoreService}, D51) stays true only as long as the transcript
+ * is still there. Purging the hot rows is a separate, irreversible operation that needs its own guard
+ * and its own iteration — and once it has run, moving the session back is refused while the certified
+ * cold copy stays readable.</p>
  *
  * <p>Every setter validates eagerly so a typo fails the application context at startup instead of
  * silently turning the export into a no-op or into an unbounded walk of every archived session.</p>

@@ -10,12 +10,15 @@ import com.med.qa.domain.entity.SessionArchiveManifestDO;
 import com.med.qa.domain.enums.RoleType;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatMessageMapper;
+import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisException;
@@ -28,6 +31,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,6 +40,9 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -87,6 +94,10 @@ class MedSessionArchiveExportServiceTest {
 
     private RLock lock;
 
+    private SessionLockService lockService;
+
+    private ChatSessionMapper sessionMapper;
+
     private MedSessionArchiveProperties properties;
 
     private MedSessionArchiveExportService service;
@@ -97,6 +108,8 @@ class MedSessionArchiveExportServiceTest {
         archiveMapper = mock(SessionArchiveMapper.class);
         redissonClient = mock(RedissonClient.class);
         lock = mock(RLock.class);
+        lockService = mock(SessionLockService.class);
+        sessionMapper = mock(ChatSessionMapper.class);
         properties = new MedSessionArchiveProperties();
         properties.setEnabled(true);
         properties.setDryRun(false);
@@ -106,8 +119,17 @@ class MedSessionArchiveExportServiceTest {
         when(lock.tryLock(anyLong(), anyLong(), any(TimeUnit.class))).thenReturn(true);
         when(lock.isHeldByCurrentThread()).thenReturn(true);
 
-        service = new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
-                redissonClient, properties, Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
+        // The session lock runs its action inline, and the in-lock status re-read sees an archived row:
+        // the default candidate is one the restore has not touched. Both defaults are overridden by the
+        // tests that pin the lock and the re-read themselves.
+        doAnswer(invocation -> ((Supplier<?>) invocation.getArgument(1)).get())
+                .when(lockService).executeLocked(any(ChatSessionDO.class), any());
+        when(sessionMapper.selectById(anyString()))
+                .thenAnswer(invocation -> archivedSession(invocation.getArgument(0)));
+
+        service = new MedSessionArchiveExportService(messageMapper, archiveMapper, codec, lockService,
+                sessionMapper, redissonClient, properties,
+                Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
     }
 
     // ------------------------------------------------------------------ the run itself
@@ -455,29 +477,92 @@ class MedSessionArchiveExportServiceTest {
     @DisplayName("no collaborator may be null")
     void collaboratorsMustNotBeNull() {
         assertThatThrownBy(() -> new MedSessionArchiveExportService(null, archiveMapper, codec,
-                redissonClient, properties))
+                lockService, sessionMapper, redissonClient, properties))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("messageMapper must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, null, codec,
-                redissonClient, properties))
+                lockService, sessionMapper, redissonClient, properties))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("archiveMapper must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, null,
-                redissonClient, properties))
+                lockService, sessionMapper, redissonClient, properties))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("codec must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
-                null, properties))
+                null, sessionMapper, redissonClient, properties))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("lockService must not be null");
+        assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
+                lockService, null, redissonClient, properties))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("sessionMapper must not be null");
+        assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
+                lockService, sessionMapper, null, properties))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("redissonClient must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
-                redissonClient, null))
+                lockService, sessionMapper, redissonClient, null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("properties must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportService(messageMapper, archiveMapper, codec,
-                redissonClient, properties, null))
+                lockService, sessionMapper, redissonClient, properties, null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("clock must not be null");
+    }
+
+    // ------------------------------------------------------------------ the session lock (D51)
+
+    @Test
+    @DisplayName("a candidate the restore moved back is skipped, and nothing is copied or certified")
+    void skipsACandidateThatLeftArchived() {
+        ChatSessionDO restored = archivedSession(SESSION);
+        restored.setStatus(SessionStatus.ACTIVE);
+        stubCandidates(restored);
+        when(sessionMapper.selectById(SESSION)).thenReturn(restored);
+
+        SessionArchiveExportReport report = service.exportOnce();
+
+        assertThat(report.candidates()).isEqualTo(1);
+        assertThat(report.skipped()).isEqualTo(1);
+        assertThat(report.exported()).isZero();
+        assertThat(report.mismatched()).isZero();
+        assertThat(report.failed()).isZero();
+        assertThat(report.failures()).isEmpty();
+        // Asserted on the mappers: certifying a restored session would leave an ACTIVE session whose
+        // manifest can never be refreshed (the candidate query is NOT EXISTS (manifest)).
+        verify(archiveMapper, never()).insertManifestIfAbsent(any());
+        verify(archiveMapper, never()).insertIfAbsent(any());
+        verify(messageMapper, never()).selectTranscriptBySessionId(anyString());
+    }
+
+    @Test
+    @DisplayName("a busy session lock is a skipped outcome, not a failure")
+    void skipsABusySession() {
+        stubCandidates(archivedSession(SESSION));
+        doThrow(new BizException(ErrorCode.SESSION_LOCKED, "busy"))
+                .when(lockService).executeLocked(any(ChatSessionDO.class), any());
+
+        SessionArchiveExportReport report = service.exportOnce();
+
+        assertThat(report.skipped()).isEqualTo(1);
+        assertThat(report.failed()).isZero();
+        assertThat(report.failures()).isEmpty();
+        verify(archiveMapper, never()).insertIfAbsent(any());
+        verify(archiveMapper, never()).insertManifestIfAbsent(any());
+    }
+
+    @Test
+    @DisplayName("the status is re-read inside the session lock, after the candidate query")
+    void reReadsTheStatusInsideTheLock() {
+        stubCandidates(archivedSession(SESSION));
+        when(messageMapper.selectTranscriptBySessionId(SESSION)).thenReturn(List.of());
+
+        service.exportOnce();
+
+        InOrder inOrder = inOrder(archiveMapper, lockService, sessionMapper);
+        inOrder.verify(archiveMapper).selectUnexportedArchivedSessions(any(), anyInt());
+        inOrder.verify(lockService).executeLocked(any(ChatSessionDO.class), any());
+        inOrder.verify(sessionMapper).selectById(SESSION);
     }
 
     // ------------------------------------------------------------------ helpers

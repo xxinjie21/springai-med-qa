@@ -9,7 +9,9 @@ import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.entity.SessionArchiveManifestDO;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.mapper.ChatMessageMapper;
+import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -18,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataAccessException;
+import org.springframework.lang.Nullable;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -73,14 +76,23 @@ import java.util.concurrent.TimeUnit;
  *       code path removes an archive row.</li>
  * </ul>
  *
- * <h2>Why there is no session lock</h2>
- * <p>D47's sweep takes the session lock because it races the message-append path for a session that is
- * still being written. This export does not: its candidates are {@code ARCHIVED}, which
- * {@code SessionStatus#isWritable()} excludes, and the write path checks that before every turn. Adding
- * the lock would buy nothing and cost a failure mode (a busy lock would have to be counted as
- * {@code skipped}), while the digest comparison above is what actually detects a torn read — a lock
- * prevents one, a checksum notices one. If a future iteration makes archived sessions writable again,
- * that change must add the lock here <em>and</em> keep the check.</p>
+ * <h2>Why there is a session lock (added in D51)</h2>
+ * <p>This export was written without one, and the argument was explicit: its candidates are
+ * {@code ARCHIVED}, which {@code SessionStatus#isWritable()} excludes, the write path checks that before
+ * every turn, so the digest comparison above is what actually detects a torn read — a lock prevents one,
+ * a checksum notices one. D51 made that premise false by adding {@link MedSessionRestoreService}, the
+ * first writer that may leave {@code ARCHIVED}, and a checksum <em>cannot</em> see it: restoring changes
+ * the status and retires the certification without touching a single transcript byte.</p>
+ *
+ * <p>Left unguarded, the interleaving is worse than a lost export: a candidate selected while it was
+ * archived, then restored, would be certified anyway — producing an {@code ACTIVE} session carrying a
+ * manifest for the transcript as it was before it became writable again. Since the candidate predicate
+ * is {@code NOT EXISTS (manifest)}, that session could never be re-certified, its cold copy would
+ * permanently describe a transcript that has since grown, and the purge would refuse it on every run.
+ * So each candidate is now exported inside {@link SessionLockService} — the same lock the append path,
+ * {@code archiveSession} and the restore take — and the session is re-read inside it: a candidate that
+ * is no longer {@code ARCHIVED} is counted as {@code skipped} with zero writes, and a busy lock is
+ * {@code skipped} too, not a failure (the D47 convention). The digest checks stay exactly as they were.</p>
  *
  * <p>Not annotated with {@code @Service} on purpose: {@code config/MedSessionArchiveConfig} declares it
  * behind {@code med.session.archive.enabled}, the same way the D47 sweep and the D38 rebuild are
@@ -95,6 +107,10 @@ public class MedSessionArchiveExportService {
     private final SessionArchiveMapper archiveMapper;
 
     private final ProtoMessageCodec codec;
+
+    private final SessionLockService lockService;
+
+    private final ChatSessionMapper sessionMapper;
 
     private final RedissonClient redissonClient;
 
@@ -112,6 +128,10 @@ public class MedSessionArchiveExportService {
      *                       {@code null}
      * @param archiveMapper  MyBatis mapper over the cold archive tables, must not be {@code null}
      * @param codec          Protobuf codec of the unified storage spec, must not be {@code null}
+     * @param lockService    distributed session lock serializing one candidate against a restore, must
+     *                       not be {@code null}
+     * @param sessionMapper  MyBatis mapper over {@code med_session}, used to re-assert the status of a
+     *                       candidate inside its lock, must not be {@code null}
      * @param redissonClient the shared client, used only for the cluster-wide export mutex, must not be
      *                       {@code null}
      * @param properties     the {@code med.session.archive.*} policy, must not be {@code null}
@@ -120,9 +140,12 @@ public class MedSessionArchiveExportService {
     public MedSessionArchiveExportService(ChatMessageMapper messageMapper,
                                           SessionArchiveMapper archiveMapper,
                                           ProtoMessageCodec codec,
+                                          SessionLockService lockService,
+                                          ChatSessionMapper sessionMapper,
                                           @Lazy RedissonClient redissonClient,
                                           MedSessionArchiveProperties properties) {
-        this(messageMapper, archiveMapper, codec, redissonClient, properties, Clock.systemUTC());
+        this(messageMapper, archiveMapper, codec, lockService, sessionMapper, redissonClient, properties,
+                Clock.systemUTC());
     }
 
     /**
@@ -132,6 +155,8 @@ public class MedSessionArchiveExportService {
      *                       {@code null}
      * @param archiveMapper  MyBatis mapper over the cold archive tables, must not be {@code null}
      * @param codec          Protobuf codec of the unified storage spec, must not be {@code null}
+     * @param lockService    distributed session lock serializing one candidate, must not be {@code null}
+     * @param sessionMapper  MyBatis mapper over {@code med_session}, must not be {@code null}
      * @param redissonClient the shared client, must not be {@code null}
      * @param properties     the {@code med.session.archive.*} policy, must not be {@code null}
      * @param clock          clock that stamps {@code archived_at}, must not be {@code null}
@@ -140,6 +165,8 @@ public class MedSessionArchiveExportService {
     public MedSessionArchiveExportService(ChatMessageMapper messageMapper,
                                           SessionArchiveMapper archiveMapper,
                                           ProtoMessageCodec codec,
+                                          SessionLockService lockService,
+                                          ChatSessionMapper sessionMapper,
                                           @Lazy RedissonClient redissonClient,
                                           MedSessionArchiveProperties properties,
                                           Clock clock) {
@@ -151,6 +178,12 @@ public class MedSessionArchiveExportService {
         }
         if (codec == null) {
             throw new IllegalArgumentException("codec must not be null");
+        }
+        if (lockService == null) {
+            throw new IllegalArgumentException("lockService must not be null");
+        }
+        if (sessionMapper == null) {
+            throw new IllegalArgumentException("sessionMapper must not be null");
         }
         if (redissonClient == null) {
             throw new IllegalArgumentException("redissonClient must not be null");
@@ -164,6 +197,8 @@ public class MedSessionArchiveExportService {
         this.messageMapper = messageMapper;
         this.archiveMapper = archiveMapper;
         this.codec = codec;
+        this.lockService = lockService;
+        this.sessionMapper = sessionMapper;
         this.redissonClient = redissonClient;
         this.properties = properties;
         this.clock = clock;
@@ -286,7 +321,7 @@ public class MedSessionArchiveExportService {
                     continue;
                 }
                 try {
-                    CandidateResult result = exportOne(candidate);
+                    CandidateResult result = exportUnderSessionLock(candidate);
                     switch (result.outcome()) {
                         case EXPORTED -> exported++;
                         case SKIPPED -> skipped++;
@@ -314,6 +349,59 @@ public class MedSessionArchiveExportService {
                 failures);
         log.info("cold archive export finished: {}", report.summary());
         return report;
+    }
+
+    /**
+     * Processes one candidate inside its session lock, re-asserting the status the candidate query
+     * assumed.
+     *
+     * <p>The batch was selected before the lock was taken, so a candidate the restore moved back in the
+     * meantime arrives here stale. Certifying it would produce an {@code ACTIVE} session carrying a
+     * manifest for a transcript it may already be extending — and since the candidate predicate is
+     * {@code NOT EXISTS (manifest)}, it could never be re-certified. Only a session that is still
+     * {@code ARCHIVED} is exported. A busy session is a {@code skipped} outcome, not a failure — the
+     * next run picks it up (the D47 convention).</p>
+     *
+     * @param candidate the session the candidate query returned
+     * @return what happened to the candidate
+     * @throws BizException {@link ErrorCode#STORAGE_ERROR} when the re-read fails
+     */
+    private CandidateResult exportUnderSessionLock(ChatSessionDO candidate) {
+        try {
+            return lockService.executeLocked(candidate, () -> {
+                ChatSessionDO current = readSession(candidate.getSessionId());
+                if (current == null || current.getStatus() != SessionStatus.ARCHIVED) {
+                    log.info("session {} is no longer archived ({}), skipping it",
+                            candidate.getSessionId(),
+                            current == null ? "row missing" : current.getStatus().name());
+                    return CandidateResult.skipped();
+                }
+                return exportOne(current);
+            });
+        } catch (BizException ex) {
+            if (ex.getErrorCode() == ErrorCode.SESSION_LOCKED) {
+                log.info("session {} is busy, skipping it for this run", candidate.getSessionId());
+                return CandidateResult.skipped();
+            }
+            throw ex;
+        }
+    }
+
+    /**
+     * Re-reads one session row.
+     *
+     * @param sessionId the session id
+     * @return the row, or {@code null} when it disappeared
+     * @throws BizException {@link ErrorCode#STORAGE_ERROR} when the query fails
+     */
+    @Nullable
+    private ChatSessionDO readSession(String sessionId) {
+        try {
+            return sessionMapper.selectById(sessionId);
+        } catch (DataAccessException ex) {
+            throw new BizException(ErrorCode.STORAGE_ERROR,
+                    "failed to re-read session " + sessionId + " before exporting it", ex);
+        }
     }
 
     /**

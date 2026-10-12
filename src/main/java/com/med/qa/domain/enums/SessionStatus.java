@@ -3,6 +3,12 @@ package com.med.qa.domain.enums;
 /**
  * Lifecycle status of a consultation session:
  * ACTIVE=0 (ongoing) / CLOSED=1 (finished by user or timeout) / ARCHIVED=2 (cold data).
+ *
+ * <p>{@link #ARCHIVED} is a terminal state for the lifecycle transitions of
+ * {@code MedChatSessionService} — nothing there closes, reopens or re-archives one — but it is not
+ * terminal for the system as a whole: D51 added {@code MedSessionRestoreService}, which moves a
+ * mis-archived session back to {@link #ACTIVE} while its live rows still exist. Anything that assumes
+ * "archived means nobody will ever write this session again" has to take the session lock instead.</p>
  */
 public enum SessionStatus {
 

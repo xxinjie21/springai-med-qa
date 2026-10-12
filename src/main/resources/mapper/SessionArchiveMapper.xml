@@ -118,6 +118,18 @@
     </select>
 
     <!--
+      Retires the certification of a session a restore moved back to the live tier (D51). The manifest is
+      a state row - the D48 export query and the D50 purge query both read it - so it is the manifest that
+      leaves when the live copy becomes the record of truth again, never the cold rows, which are the
+      evidence. The caller only reaches this statement after proving the live transcript reproduces the
+      digest this row certifies, so retiring the claim cannot orphan a byte.
+    -->
+    <delete id="deleteManifest">
+        DELETE FROM med_session_archive
+        WHERE session_id = #{sessionId}
+    </delete>
+
+    <!--
       Candidate query of the hot-shard purge (D50). Same shape as the D48 export query, and for the same
       reason: the three predicates have to travel inside the SQL. EXISTS rather than a JOIN keeps the
       statement identical in form to selectUnexportedArchivedSessions, which is already proven to route

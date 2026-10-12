@@ -331,6 +331,37 @@ springai-med-qa/
 > D49 **刻意没有**加任何删除能力，也没有给读路径加开关：读是常驻能力，能被开关关掉的读路径
 > 等于给运维发一把「静默 404」的钥匙。
 
+### 阶段 12：误归档的搬回与冷热链路的一致性（D51–D52）
+
+> 阶段 12 的出发点：D47 / D48 / D50 的每一份文档都在用同一句话论证自己的存在——「误归档的会话
+> 可以搬回来」。`MedSessionRetentionService` 的类注释说「轨迹原封不动，误归档的会话可以搬回」，
+> `MedSessionArchiveProperties` 说这条承诺「只在轨迹还在时成立」，`MedSessionPurgeProperties` 的
+> `min-archived-age` 说这个冷静期就是「不让 D47 的承诺变成空话」的东西（`MedSessionPurgeConfigTest`
+> 甚至有一条用例叫「零或负的冷静期被拒绝，因为它会掏空 D47 的承诺」），`application.yml` 与两份
+> README 逐字复述。**但没有任何代码能把一个会话搬回来**：`MedChatSessionService` 只有
+> create / get / close / archive / list / page，而 `closeSession` 的 javadoc 把 `ARCHIVED` 写成
+> 「终态」。这是阶段 8–11 那类偏差的第 6 次出现——**注释承诺了代码没有的行为**——而且这一次
+> 代价已经被真实支付：D50 为这句话付出了 7 天冷静期（宁可让热行多留一周，也不让搬回失去意义）。
+>
+> 阶段 12 把这句话变成真的，并回答随之而来的第二个问题：**搬回会打破两个冷热作业赖以成立的前提**。
+> D48 与 D50 都明确论证过「候选是 `ARCHIVED`，写入路径拒绝写归档会话，所以不需要抢会话锁，
+> 摘要比较才是发现撕裂读的手段」。恢复是**第一个能离开 `ARCHIVED` 的写者**，而摘要比较**看不见它**
+> ——恢复不改轨迹的字节，只改状态与认证。所以阶段 12 必须同时给两个作业补上会话锁，并把
+> 「候选选取时是 `ARCHIVED`」这条陈旧读在锁内重新确认。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D51 | 误归档会话的恢复（restore） | 把「搬回一个误归档的会话」做成一次请求态操作：`MedSessionRestoreService`（`com.med.qa.service`，`@Service`，**常驻**——恢复不是可选后台能力，它是 `archiveSession` 的逆操作，给运维一个能关掉它的开关等于让误归档不可挽回）暴露 `ChatSessionDO restore(tenantId, deptId, sessionId)`。**授权完全复用 `MedChatSessionService#getSession`**（患者越权 `FORBIDDEN`、跨租户/科室按不存在上报 `NOT_FOUND`），**不新增任何无守卫的「直接改状态」原语**（D41/D42 的教训）；状态迁移在 `SessionLockService` 的会话锁内完成，与消息追加、归档、清理同一把锁。**搬回的前提是活副本仍然是那份被认证的轨迹**，三道检查按序：① 状态必须是 `ARCHIVED`（其它状态即 `BAD_REQUEST`，只有归档会话需要搬回）；② `med_session.purged_at` 必须为 `NULL`——热行已被 D50 回收的会话，其活副本不再存在，拒绝并点名原因；③ 若存在导出清单，热轨迹的摘要必须复现清单的 `payload_checksum`（复用 `TranscriptDigests`，与导出/复核/读取/清理同一口径），复现不了即拒绝。②③ **不是冗余**：③ 抓「漂移」，② 抓「已被回收但轨迹恰好为空」这种 ③ 看不见的形态，两条各有独立用例。**搬回不重建热行**：`med_message_archive` → `med_message` 的回灌会让「归档」变成可逆的物理操作，而 D50 的冷静期正是为「回收之前可以搬回」而设——回收之后记录仍然可读（D49），只是活副本不再可重建；这条界线与「为什么是 7 天」写进 javadoc。**撤销认证的时机与顺序**：先 `SessionArchiveMapper#deleteManifest(sessionId)` 撤销导出清单，再 `ChatSessionMapper#updateStatus(sessionId, ACTIVE, ARCHIVED, now)` 翻状态——顺序不可交换，因为清单是**状态行**（D48/D50 的候选谓词读它），冷行才是证据；中断在两步之间留下「`ARCHIVED` 且无清单」的形态，下一次导出会重新认证同一份轨迹并收敛，反过来（先翻状态）会留下「`ACTIVE` 却带着一份描述旧轨迹的清单」，D48 的 `NOT EXISTS manifest` 谓词会让它永远不再被认证。撤销认证不删任何字节：删除前已证明热行复现了它认证的内容，而重新认证只需一次导出。**两个冷热作业补会话锁**：`MedSessionPurgeService` 与 `MedSessionArchiveExportService` 的每个候选改为在 `SessionLockService` 的会话锁内处理，并在锁内 `selectById` 重读会话、非 `ARCHIVED` 即记 `skipped` 且零改动——D48/D50 跳过会话锁的前提（`ARCHIVED` 是终态、没有写者）由 D51 亲手打破，而它们赖以防撕裂读的摘要比较**看不见恢复**（恢复不改轨迹字节），互斥只能靠锁；锁忙记 `skipped` 不是失败（与 D47 同源）。**暴露面**：`SessionController` 新增 `POST /api/sessions/{sessionId}/restore`（`@RequireDept(source = QUERY)`，与 close / archive 同一条 scope 规则），响应 `SessionResponse`；`@MedAudit(action = "SESSION_RESTORE")` 留痕。**口径校正**：`closeSession` 的 javadoc（「归档是终态」→「归档不再是终态，搬回是独立操作，但在这里仍然不能『关闭』它」）、`SessionStatus#ARCHIVED`、`MedSessionRetentionService` / `MedSessionArchiveProperties` / `MedSessionPurgeProperties` 的「搬回」措辞改为指向本迭代的服务。守护测试：`MedSessionRestoreServiceTest`（搬回、非归档拒绝、`purged_at` 非空拒绝、热行漂移拒绝、清单缺失时直接搬回、**清单先删后翻的 `InOrder` 顺序断言**）、`SessionControllerTest` 新增用例、`MedSessionPurgeServiceTest` / `MedSessionArchiveExportServiceTest` 新增「会话锁被占 → `skipped` 零改动」「候选已被搬回 → `skipped` 零删除」、`MedStorageAndLockIntegrationTest` 在真实 MySQL 上跑完整闭环（归档 → 导出 → 搬回（热行逐字节未变、状态 `ACTIVE`）→ 再归档 → 重新导出 → 可清理）以及「热行被回收后搬回被拒」 | `feat(session): restore a mis-archived session before its hot rows are reclaimed` |
+| D52 | 恢复后遗留冷副本的退役回收（**本阶段未实现，下一轮才做**） | D51 搬回一个会话时会撤销它的导出清单，但 `med_message_archive` 里的字节一行不动——于是冷表里留下了一份**没有清单的孤儿快照**：读路径不会读它（只有清单能决定冷副本作答），清理也不会碰它（D50 只删 `med_message`）。它既不是证据（没有清单在认证它）也不是状态（没有谓词读它），只是占着空间的副本。回收它需要自己的守卫与自己的迭代：① 只回收**没有活清单**的会话的冷行（有清单的冷行是证据，一行都不能动）；② 必须与导出、恢复互斥（同一家族 `RLock`）；③ `med.session.reclaim.*` 默认 `enabled=false` **且** `dry-run=true`；④ 报告与告警与 D47/D48/D50 同形 | `feat(session): reclaim orphaned cold copies left behind by a restore` |
+
+> 阶段 12 进度：**D51 已完成，D52 未开始**。D51 让「误归档可以搬回」第一次有了代码，
+> 并且顺手补上两个冷热作业在新写者出现之后必须持有的会话锁。
+>
+> **阶段 12 之后没有 D53**：下次运行必须先扩写本路线图（新增阶段 13）再实现，不得自造迭代编号。
+> D51 **刻意没有**让恢复重建热行，也**刻意没有**回收被撤销认证后遗留的冷副本：前者会把「归档」
+> 变成可逆的物理操作、让 D50 的冷静期失去意义，后者需要自己的守卫与自己的迭代，路线图里
+> 只给了它一个编号（D52）。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

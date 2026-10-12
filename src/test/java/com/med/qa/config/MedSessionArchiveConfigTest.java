@@ -1,7 +1,10 @@
 package com.med.qa.config;
 
 import com.med.qa.mapper.ChatMessageMapper;
+import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.MedLockProperties;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.service.MedSessionArchiveExportScheduler;
 import com.med.qa.service.MedSessionArchiveExportService;
@@ -237,6 +240,21 @@ class MedSessionArchiveConfigTest {
         @Bean
         RedissonClient redissonClient() {
             return mock(RedissonClient.class);
+        }
+
+        @Bean
+        ChatSessionMapper chatSessionMapper() {
+            return mock(ChatSessionMapper.class);
+        }
+
+        /**
+         * D51 made the export hold the session lock, so the wiring now needs the lock service. It is built
+         * for real (rather than mocked) because {@code startsWithoutRedis} is about the lock service not
+         * touching Redisson at construction time — a mock would assert nothing.
+         */
+        @Bean
+        SessionLockService sessionLockService(RedissonClient redissonClient) {
+            return new SessionLockService(redissonClient, new MedLockProperties());
         }
     }
 }

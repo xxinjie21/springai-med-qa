@@ -4,6 +4,7 @@ import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
+import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.memory.serde.ProtoMessageCodec;
 import com.med.qa.service.MedSessionPurgeScheduler;
 import com.med.qa.service.MedSessionPurgeService;
@@ -51,10 +52,15 @@ public class MedSessionPurgeConfig {
      * project: creating the client opens a connection, and the context must be able to refresh without
      * Redis available. The proxy only resolves when a run actually tries to take the cluster mutex.</p>
      *
+     * <p>The session lock is a plain mandatory collaborator, not a lazily resolved one: since D51 it is
+     * part of what makes one candidate accountable, because restoring a session is the one write that can
+     * move it out of {@code ARCHIVED} underneath a candidate this run already selected.</p>
+     *
      * @param sessionMapper  MyBatis mapper over {@code med_session}
      * @param archiveMapper  MyBatis mapper over the cold archive tables
      * @param messageMapper  MyBatis mapper over the sharded {@code med_message} table
      * @param codec          Protobuf codec of the unified storage spec
+     * @param lockService    distributed session lock serializing one candidate against a restore
      * @param redissonClient lazily resolved client used for the cluster-wide purge mutex
      * @param properties     the {@code med.session.purge.*} policy
      * @return the purge service
@@ -65,10 +71,11 @@ public class MedSessionPurgeConfig {
             SessionArchiveMapper archiveMapper,
             ChatMessageMapper messageMapper,
             ProtoMessageCodec codec,
+            SessionLockService lockService,
             @Lazy RedissonClient redissonClient,
             MedSessionPurgeProperties properties) {
         return new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper, codec,
-                redissonClient, properties);
+                lockService, redissonClient, properties);
     }
 
     /**

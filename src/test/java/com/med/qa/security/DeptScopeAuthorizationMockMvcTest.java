@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -17,6 +18,7 @@ import com.med.qa.controller.SessionController;
 import com.med.qa.domain.entity.ChatSessionDO;
 import com.med.qa.domain.enums.SessionStatus;
 import com.med.qa.service.MedChatSessionService;
+import com.med.qa.service.MedSessionRestoreService;
 import com.med.qa.service.MedTranscriptService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,6 +49,8 @@ class DeptScopeAuthorizationMockMvcTest {
 
     private MedTranscriptService transcriptService;
 
+    private MedSessionRestoreService restoreService;
+
     private MedSecurityProperties properties;
 
     private MockMvc mockMvc;
@@ -55,10 +59,12 @@ class DeptScopeAuthorizationMockMvcTest {
     void setUp() {
         sessionService = mock(MedChatSessionService.class);
         transcriptService = mock(MedTranscriptService.class);
+        restoreService = mock(MedSessionRestoreService.class);
         properties = new MedSecurityProperties();
         DeptScopeInterceptor interceptor = new DeptScopeInterceptor(
                 properties, new DeptScopeGuard(), new DeptIdResolver());
-        mockMvc = MockMvcBuilders.standaloneSetup(new SessionController(sessionService, transcriptService))
+        mockMvc = MockMvcBuilders.standaloneSetup(
+                        new SessionController(sessionService, transcriptService, restoreService))
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .addInterceptors(interceptor)
                 .build();
@@ -176,6 +182,35 @@ class DeptScopeAuthorizationMockMvcTest {
 
             assertThat(result.getResponse().getContentAsString()).contains("\"code\":40300");
             verifyNoInteractions(sessionService, transcriptService);
+        }
+
+        @Test
+        @DisplayName("D51: restoring a session of another department gets 403 and never reaches the service")
+        void restoreOfOtherDepartmentIsForbidden() throws Exception {
+            authenticateStaff();
+
+            MvcResult result = mockMvc.perform(post("/api/sessions/{sessionId}/restore", "s-1")
+                            .param("tenantId", "hosp-1")
+                            .param("deptId", OTHER_DEPT))
+                    .andExpect(status().isForbidden())
+                    .andReturn();
+
+            assertThat(result.getResponse().getContentAsString()).contains("\"code\":40300");
+            verifyNoInteractions(restoreService);
+        }
+
+        @Test
+        @DisplayName("D51: restoring inside the own department reaches the restore service")
+        void restoreOwnDepartmentIsAllowed() throws Exception {
+            authenticateStaff();
+            when(restoreService.restore("hosp-1", OWN_DEPT, "s-1")).thenReturn(session());
+
+            mockMvc.perform(post("/api/sessions/{sessionId}/restore", "s-1")
+                            .param("tenantId", "hosp-1")
+                            .param("deptId", OWN_DEPT))
+                    .andExpect(status().isOk());
+
+            verify(restoreService).restore("hosp-1", OWN_DEPT, "s-1");
         }
     }
 

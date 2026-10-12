@@ -109,6 +109,26 @@ public interface SessionArchiveMapper {
     SessionArchiveManifestDO selectManifest(@Param("sessionId") String sessionId);
 
     /**
+     * Retires the export manifest of a session whose live copy became the record of truth again (D51).
+     *
+     * <p>A restore moves a session back to the live tier and the certification it was exported under no
+     * longer governs anything: the session is writable again, so the transcript will diverge from the
+     * frozen copy on the very next turn. Leaving the row behind would be worse than untidy - D48's
+     * candidate query is {@code NOT EXISTS (manifest)}, so the session could never be re-certified, the
+     * cold copy would keep describing a transcript that no longer exists, and D50's purge would refuse
+     * it on every single run.</p>
+     *
+     * <p>The manifest is retired rather than deleted-and-forgotten: it is a <em>state</em> row (both
+     * candidate queries read it), while the cold rows are the evidence and are not touched. The caller
+     * reaches this statement only after proving the live transcript reproduces the digest this manifest
+     * certifies, so no byte loses its credential; re-certifying the session is one export away.</p>
+     *
+     * @param sessionId the session whose certification is being retired
+     * @return {@code 1} when a manifest was retired, {@code 0} when the session had none
+     */
+    int deleteManifest(@Param("sessionId") String sessionId);
+
+    /**
      * Lists one page of archived sessions whose certified hot rows are old enough to be retired (D50),
      * oldest first.
      *
