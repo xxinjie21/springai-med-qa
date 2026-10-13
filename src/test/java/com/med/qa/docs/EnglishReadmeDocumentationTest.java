@@ -459,6 +459,32 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D52 orphan reclaim, its containment guard and why it needs no window")
+    void apiChapterDocumentsTheD52OrphanReclaim() {
+        // A translation gap here is worse than a translation gap elsewhere: the two things a reader is
+        // most likely to misread - that the guard is containment by message id rather than a digest, and
+        // that the missing cooling-off window is deliberate rather than an omission - both invert the
+        // safety story if they are dropped.
+        assertThat(english).contains("D52");
+        // Two assertions here have to be stronger than the obvious form. A bare `contains("D52")` is
+        // satisfied by the roadmap row, and `contains("MedSessionReclaimService")` is satisfied by the
+        // guard-test class name `MedSessionReclaimServiceTest` - both would stay green after the whole
+        // chapter was deleted. The heading and the configuration prefix cannot be satisfied that way.
+        assertThat(english).contains("#### Reclaiming orphaned cold copies (D52)");
+        assertThat(english).contains("med.session.reclaim.enabled");
+        assertThat(english).contains("MedSessionReclaimService");
+        assertThat(english).contains("med:lock:session:reclaim");
+        assertThat(english).contains("MED_SESSION_RECLAIM_ENABLED");
+        assertThat(english).contains("MED_SESSION_RECLAIM_DRY_RUN");
+        assertThat(english).contains("session-reclaim-refused");
+        assertThat(english).contains("session-reclaim-failed");
+        assertThat(english).contains("deleteColdCopy");
+        assertThat(english).contains("MedSessionReclaimServiceTest");
+        assertThat(english).contains("SessionReclaimMapperShardingTest");
+        assertThat(english).contains("MedSessionReclaimConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

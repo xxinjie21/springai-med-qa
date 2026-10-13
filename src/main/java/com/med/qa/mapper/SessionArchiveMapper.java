@@ -175,4 +175,72 @@ public interface SessionArchiveMapper {
      */
     long countPurgeableArchivedSessions(@Param("status") SessionStatus status,
                                         @Param("archivedBefore") long archivedBefore);
+
+    /**
+     * Lists one page of sessions whose cold copy was orphaned by a restore (D52), oldest first.
+     *
+     * <p>Three predicates, all of them in the SQL for the same reason D48's and D50's candidate queries
+     * keep their filters there:</p>
+     * <ol>
+     *   <li>{@code status < :archivedStatus} — a cold session's uncertified cold copy is the export's work
+     *       in progress, not an orphan. The predicate is written as a strict upper bound rather than
+     *       {@code <>} on purpose: {@link SessionStatus#ARCHIVED} carries the highest code of the enum, so
+     *       the two are equivalent, and the bound form is a single range on the leading column of
+     *       {@code idx_med_session_retention (status, updated_at)}. That lets the database walk the index
+     *       in {@code updated_at} order and stop after {@code LIMIT} candidates instead of materialising
+     *       and sorting every non-archived session. The equivalence is pinned by a test, because it is an
+     *       assumption about the enum rather than about this statement.</li>
+     *   <li>{@code NOT EXISTS (med_session_archive)} — a manifest makes the cold copy evidence, and
+     *       evidence is never reclaimed. This is also why the query lives on this mapper rather than on
+     *       {@link ChatSessionMapper}: the session mapper must not learn that an archive exists.</li>
+     *   <li>{@code EXISTS (med_message_archive)} — a session with no cold rows has nothing to reclaim, and
+     *       without this predicate every non-archived session would be fetched on every run and skipped
+     *       one by one. Note that the predicate <em>is</em> the completion signal: once the rows are gone
+     *       the session leaves the candidate set by itself, which is why this job needs no marker column
+     *       (unlike D50, whose {@code purged_at} exists because "are the hot rows still there?" is not
+     *       observable from {@code med_session}).</li>
+     * </ol>
+     *
+     * <p>Ordering is {@code updated_at} ascending (then {@code session_id} as a tie-break, so the page
+     * boundary is stable when many sessions share a millisecond). A restore stamps {@code updated_at}, so
+     * this drains the oldest orphans first.</p>
+     *
+     * @param archivedStatus the cold status, normally {@link SessionStatus#ARCHIVED}; every status below
+     *                       it is a candidate
+     * @param limit          maximum number of rows, must be strictly positive
+     * @return the orphaned sessions ordered by {@code updated_at} ascending, possibly empty, never
+     *         {@code null}
+     */
+    List<ChatSessionDO> selectReclaimableOrphans(@Param("archivedStatus") SessionStatus archivedStatus,
+                                                 @Param("limit") int limit);
+
+    /**
+     * Counts the sessions {@link #selectReclaimableOrphans(SessionStatus, int)} would return.
+     *
+     * <p>Reported as the backlog of a reclaim run. Unlike the purge's backlog this one is expected to read
+     * zero after a successful run that drained its batches, because the candidate predicate observes the
+     * deletion itself.</p>
+     *
+     * @param archivedStatus the cold status, normally {@link SessionStatus#ARCHIVED}
+     * @return the number of orphaned cold copies, never negative
+     */
+    long countReclaimableOrphans(@Param("archivedStatus") SessionStatus archivedStatus);
+
+    /**
+     * Deletes the whole cold copy of a session (D52).
+     *
+     * <p>Reached only after the caller has proved the live transcript still holds every message these
+     * rows hold, and that no manifest certifies them — i.e. only for a copy that is a duplicate and not
+     * evidence. The table is not sharded, so ShardingSphere routes this through its {@code SINGLE} rule
+     * and the delete is a single-table operation.</p>
+     *
+     * <p>The statement deletes by {@code session_id} rather than by a list of message ids: the caller has
+     * already read the copy and verified it, and deleting "whatever is there for this session" is what
+     * makes an interrupted run converge — the next pass reads the remaining rows, verifies them against
+     * the live transcript again, and continues.</p>
+     *
+     * @param sessionId the session whose orphaned cold copy is being retired
+     * @return the number of deleted rows; {@code 0} when another run got there first
+     */
+    int deleteColdCopy(@Param("sessionId") String sessionId);
 }

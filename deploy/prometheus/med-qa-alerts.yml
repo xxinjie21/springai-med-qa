@@ -224,6 +224,51 @@ groups:
             being altered outside the application.
           runbook: "docs/DEPLOYMENT.md#711-热分表清理d50"
 
+      - alert: MedQaSessionReclaimFailed
+        # D52. The orphan reclaim retires the cold copies a D51 restore left behind. When a run fails,
+        # nothing has been lost - every deletion is preceded by a containment proof - but the cold store
+        # stops shrinking, and a reclaim that stopped running looks identical to a hospital with no
+        # orphaned copies.
+        expr: increase(med_qa_alert_total{code="session-reclaim-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-reclaim
+        annotations:
+          summary: "The orphaned cold copy reclaim is failing"
+          description: >-
+            MedSessionReclaimScheduler reported a failed run, so the cold copies a restore orphaned are
+            keeping their rows in med_message_archive. Check MySQL reachability and Redis (the run takes
+            the cluster-wide mutex med:lock:session:reclaim before touching any row), then review
+            med.session.reclaim.* - a dry-run deployment verifies and reports without deleting anything,
+            which is not a failure.
+          runbook: "docs/DEPLOYMENT.md#713-孤儿冷副本回收d52"
+
+      - alert: MedQaSessionReclaimRefused
+        # D52. The reclaim declined to delete at least one cold copy because it could not account for it:
+        # the copy holds messages the live transcript does not. Nothing was deleted - this is the job
+        # refusing to act, not an incident on its own - but it is the only signal that says "there is a
+        # copy of a consultation the application cannot account for", and it will not clear by itself. A
+        # log line would hide it, because a refused copy stays a candidate and the backlog simply stops
+        # draining, which looks exactly like a job that is keeping up.
+        expr: increase(med_qa_alert_total{code="session-reclaim-refused"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: session-reclaim
+        annotations:
+          summary: "An orphaned cold copy could not be accounted for before being reclaimed"
+          description: >-
+            MedSessionReclaimService refused {{ $value }} session(s): med_message_archive holds messages
+            that the live shard in med_message no longer holds, so the cold copy may be their only
+            surviving record. Nothing was deleted. Read the session with
+            GET /api/sessions/{sessionId}/transcript (which reports whether the hot shard or the cold copy
+            answered) and compare the two copies before changing anything; a repeated refusal for the same
+            session means the live rows were removed outside the application or the manifest was removed
+            by hand - the purge refuses to run without one, so an orphan that is the only copy should not
+            exist.
+          runbook: "docs/DEPLOYMENT.md#713-孤儿冷副本回收d52"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.

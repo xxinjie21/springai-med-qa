@@ -12,6 +12,7 @@ import com.med.qa.common.exception.ErrorCode;
 import com.med.qa.config.MedSessionProperties;
 import com.med.qa.config.MedSessionArchiveProperties;
 import com.med.qa.config.MedSessionPurgeProperties;
+import com.med.qa.config.MedSessionReclaimProperties;
 import com.med.qa.config.RedissonConfig;
 import com.med.qa.domain.entity.ArchivedMessageDO;
 import com.med.qa.domain.entity.ChatMessageDO;
@@ -36,10 +37,12 @@ import com.med.qa.memory.sharding.Crc32ShardingAlgorithm;
 import com.med.qa.service.MedChatSessionService;
 import com.med.qa.service.MedSessionArchiveExportService;
 import com.med.qa.service.MedSessionPurgeService;
+import com.med.qa.service.MedSessionReclaimService;
 import com.med.qa.service.MedSessionRestoreService;
 import com.med.qa.service.MedTranscriptService;
 import com.med.qa.service.SessionArchiveChecksum;
 import com.med.qa.service.SessionPurgeReport;
+import com.med.qa.service.SessionReclaimReport;
 import com.med.qa.service.SessionTranscript;
 import com.med.qa.service.TranscriptDigests;
 import java.io.IOException;
@@ -755,10 +758,145 @@ class MedStorageAndLockIntegrationTest {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Retiring the cold copies a restore orphaned (D52)
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("D52: a restore orphans a cold copy, and the reclaim retires it without touching a live row")
+    void reclaimsTheColdCopyARestoreOrphaned() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "孤儿冷副本").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 3; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        // The real pipeline produces the orphan: export certifies the copy, the restore retires the
+        // certification and leaves the rows. Nothing is hand-written, so the case is about the pipeline.
+        exportService().exportOnce();
+        assertEquals(3L, countArchivedRows(sessionId), "the export must have copied the transcript");
+        restoreService.restore(TENANT, DEPT, sessionId);
+
+        assertEquals(SessionStatus.ACTIVE, sessionMapper.selectById(sessionId).getStatus());
+        assertNull(archiveMapper.selectManifest(sessionId), "the restore retires the certification");
+        assertEquals(3L, countArchivedRows(sessionId),
+                "and leaves the cold rows behind - the orphan this job exists for");
+
+        SessionReclaimReport report = reclaimService(false).reclaimOnce();
+
+        assertEquals(SessionReclaimReport.Outcome.COMPLETED, report.outcome());
+        assertFalse(report.dryRun());
+        assertTrue(report.reclaimedAnything(),
+                "the orphaned copy must be reachable by the candidate query: " + report.summary());
+        assertEquals(0, report.failed(), report.failures().toString());
+        // Asserted per session rather than on the global counters: the reclaim has no cooling-off window
+        // by design, so other suites in this shared database may legitimately hold orphans too.
+        assertEquals(0L, countArchivedRows(sessionId), "the orphaned cold copy must be gone");
+        // Nothing else moved: the live transcript is the record of truth and keeps every row...
+        assertEquals(3L, countSessionRows(sessionId),
+                "the reclaim deletes the cold copy, never a live row");
+        // ...the session is still live, and the read path answers from the shard it always had.
+        assertEquals(SessionStatus.ACTIVE, sessionMapper.selectById(sessionId).getStatus());
+        SessionTranscript read = transcriptService.read(TENANT, DEPT, sessionId);
+        assertEquals(SessionTranscript.Source.HOT, read.source());
+        assertEquals(3, read.messageCount());
+    }
+
+    @Test
+    @DisplayName("D52: a certified copy is evidence and is never touched")
+    void neverTouchesACertifiedColdCopy() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "证据不可删").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 2; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        List<ArchivedMessageDO> coldRows = coldCopy(sessionId, patientId, transcript);
+        for (ArchivedMessageDO row : coldRows) {
+            archiveMapper.insertIfAbsent(row);
+        }
+        String certified = TranscriptDigests.ofArchived(coldRows);
+        archiveMapper.insertManifestIfAbsent(new SessionArchiveManifestDO(sessionId, TENANT, DEPT,
+                patientId, transcript.size(), certified, 1_735_000_000_000L));
+
+        reclaimService(false).reclaimOnce();
+
+        // A manifest makes the copy the only record of what was archived, so a reclaim that touched it
+        // would destroy the evidence D48 exists to produce - and D50 would then refuse the session
+        // forever. The manifest is what makes the copy off limits, and it is checked inside the lock.
+        assertEquals(2L, countArchivedRows(sessionId));
+        assertEquals(certified, archiveMapper.selectManifest(sessionId).getPayloadChecksum());
+    }
+
+    @Test
+    @DisplayName("D52: a copy holding messages the live transcript lacks is refused, not deleted")
+    void refusesToReclaimACopyTheLiveTranscriptCannotAccountFor() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "无法对账").getSessionId();
+        List<ChatMessageDO> transcript = new java.util.ArrayList<>();
+        for (int turn = 1; turn <= 2; turn++) {
+            ChatMessageDO message = turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L);
+            repository.append(message);
+            transcript.add(message);
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        exportService().exportOnce();
+        restoreService.restore(TENANT, DEPT, sessionId);
+        // Now break the premise the reclaim relies on: the live rows disappear while the orphaned copy
+        // stays. That is the one shape in which the copy may be the only surviving record, and the job
+        // has to notice it rather than trust that a copy without a manifest is always redundant.
+        assertEquals(2, messageMapper.deleteBySessionId(sessionId), "the live rows must really be gone");
+
+        SessionReclaimReport report = reclaimService(false).reclaimOnce();
+
+        assertTrue(report.sawRefusal(),
+                "a copy the live transcript cannot account for must be refused: " + report.summary());
+        assertEquals(0, report.failed(), report.failures().toString());
+        assertTrue(report.failures().stream()
+                        .anyMatch(line -> line.contains(sessionId) && line.contains("REFUSED")),
+                "the refusal has to name the session: " + report.failures());
+        assertEquals(2L, countArchivedRows(sessionId), "a refusal must not delete a single row");
+    }
+
+    @Test
+    @DisplayName("D52: a dry run verifies every copy and deletes nothing")
+    void reclaimDryRunVerifiesWithoutDeletingAnything() throws Exception {
+        String patientId = "patient-it-" + UUID.randomUUID();
+        String sessionId = sessionService.createSession(TENANT, DEPT, patientId, "回收演练").getSessionId();
+        for (int turn = 1; turn <= 3; turn++) {
+            repository.append(turnMessage(sessionId, patientId, "第 " + turn + " 轮对话",
+                    1_735_000_000_000L + turn * 1_000L));
+        }
+        sessionService.archiveSession(TENANT, DEPT, sessionId);
+        exportService().exportOnce();
+        restoreService.restore(TENANT, DEPT, sessionId);
+        assertEquals(3L, countArchivedRows(sessionId));
+
+        SessionReclaimReport report = reclaimService(true).reclaimOnce();
+
+        assertTrue(report.dryRun());
+        assertEquals(SessionReclaimReport.Outcome.COMPLETED, report.outcome());
+        // A dry run performs the full verification, so it reports what it *would* retire - the number an
+        // operator uses to decide whether to arm the job.
+        assertTrue(report.reclaimedAnything(), "a dry run must still report what it would delete");
+        assertEquals(3L, countArchivedRows(sessionId), "a dry run must not delete a single row");
+        assertEquals(3L, countSessionRows(sessionId));
+    }
+
     /**
      * Builds the purge service the D50 cases drive, wired exactly like {@code MedSessionPurgeConfig}
      * wires it in production (same mappers, same codec, same Redisson client) but with a policy that
-     * fits a test: a 30-day cooling-off window, one pass, and a small batch.     *
+     * fits a test: a 30-day cooling-off window, one pass, and a small batch.
+     *
      * <p>The 30-day window is also what isolates these cases from every other session in the shared
      * database. Only a session whose {@code updated_at} was explicitly backdated by
      * {@link #backdateSession} is old enough to be a candidate, so the suites in this class cannot
@@ -777,6 +915,31 @@ class MedStorageAndLockIntegrationTest {
         properties.setLockLeaseTime(Duration.ofSeconds(30));
         return new MedSessionPurgeService(sessionMapper, archiveMapper, messageMapper, codec,
                 lockService, redissonClient, properties, Clock.systemUTC());
+    }
+
+    /**
+     * Builds the reclaim service the D52 cases drive, wired exactly like
+     * {@code MedSessionReclaimConfig} wires it in production (same mappers, same Redisson client, same
+     * session lock) but with a policy that fits a test.
+     *
+     * <p>There is no cooling-off window to shrink here: the reclaim deliberately has none, because unlike
+     * the purge it destroys no capability — the bytes it deletes stay in the live transcript. That also
+     * means these cases cannot isolate themselves from the rest of the shared database the way the D50
+     * cases do with their 30-day window, so their assertions are about the session under test rather than
+     * about global counters.</p>
+     *
+     * @param dryRun {@code true} to verify and report without deleting
+     * @return a ready-to-run service, never {@code null}
+     */
+    private static MedSessionReclaimService reclaimService(boolean dryRun) {
+        MedSessionReclaimProperties properties = new MedSessionReclaimProperties();
+        properties.setDryRun(dryRun);
+        properties.setBatchSize(50);
+        properties.setMaxBatches(1);
+        properties.setLockWaitTime(Duration.ofSeconds(5));
+        properties.setLockLeaseTime(Duration.ofSeconds(30));
+        return new MedSessionReclaimService(sessionMapper, archiveMapper, messageMapper, lockService,
+                redissonClient, properties, Clock.systemUTC());
     }
 
     /**

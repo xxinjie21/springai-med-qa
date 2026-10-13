@@ -420,6 +420,14 @@ livenessProbe:
 | `MED_SESSION_PURGE_INITIAL_DELAY` | `15m` | 启动后首次运行的延迟 |
 | `MED_SESSION_PURGE_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
 | `MED_SESSION_PURGE_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
+| `MED_SESSION_RECLAIM_ENABLED` | `false` | 孤儿冷副本回收总开关（见 7.13） |
+| `MED_SESSION_RECLAIM_DRY_RUN` | `true` | 开启后仍只报告不删除（但走完整校验） |
+| `MED_SESSION_RECLAIM_BATCH_SIZE` | `50` | 每批取多少会话 |
+| `MED_SESSION_RECLAIM_MAX_BATCHES` | `5` | 单次运行最多几批 |
+| `MED_SESSION_RECLAIM_CHECK_INTERVAL` | `12h` | 两次运行之间的固定延迟 |
+| `MED_SESSION_RECLAIM_INITIAL_DELAY` | `15m` | 启动后首次运行的延迟 |
+| `MED_SESSION_RECLAIM_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
+| `MED_SESSION_RECLAIM_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
 
 ### 5.5 RAG
 
@@ -1106,7 +1114,8 @@ POST /api/sessions/{sessionId}/restore?tenantId=<tenant>&deptId=<dept>
 **顺序不可交换**：先撤销清单（`SessionArchiveMapper#deleteManifest`），再翻状态。中断在两步之间留下
 「`ARCHIVED` 且无清单」，下一次导出会把同一份轨迹重新认证并收敛；反过来（先翻状态）会留下「`ACTIVE` 却带着
 一份描述旧轨迹的清单」，而导出的候选谓词是 `NOT EXISTS (清单)`——**它永远不会再被认证**，清理作业则每轮都
-拒绝它。清单是**状态行**（候选谓词读它），冷行是**证据**：搬回不动冷表一个字节。
+拒绝它。清单是**状态行**（候选谓词读它），冷行是**证据**：搬回不动冷表一个字节。**那份被留下的、已经没有清单的
+冷副本由 7.13 退役回收**——搬回自己不碰它，是刻意的分工。
 
 **D51 同时给两个冷热作业补上了会话锁。** 7.11 的「不加会话锁」有一个写下来的前提：候选都是 `ARCHIVED`，
 写入路径拒绝写归档会话。**搬回是第一个能离开 `ARCHIVED` 的写者，前提当场失效**——而且摘要比对看不见它
@@ -1127,6 +1136,74 @@ POST /api/sessions/{sessionId}/restore?tenantId=<tenant>&deptId=<dept>
   `SessionControllerTest`、`MedSessionPurgeServiceTest` / `MedSessionArchiveExportServiceTest`（锁被占
   零改动、候选已被搬回零删除、状态重读在锁内），以及 `MedStorageAndLockIntegrationTest` 的收敛闭环
   「归档 → 导出 → 搬回 → 追加新轮次 → 再归档 → 重新导出 → 可清理」。
+
+---
+
+### 7.13 孤儿冷副本回收（D52）
+
+D51 搬回一个会话时会撤销它的导出清单，但 `med_message_archive` 里的字节一行不动——于是冷表里留下了一份
+**没有清单的孤儿快照**。它既不是**证据**（没有清单在认证它），也不是**状态**（没有谓词读它）：7.10 的读路径
+只认清单，7.11 的清理只删 `med_message`。它只是占着空间的一份重复副本。D52 负责退役它，作业与调度器是
+`MedSessionReclaimService` 与 `MedSessionReclaimScheduler`（`med.session.reclaim.enabled=false` 时二者
+都不存在，定时器不碰数据库）。
+
+**它回收什么**（三条候选谓词写进同一条 SQL，缺一即不是候选）：
+
+1. `med_session.status < ARCHIVED`——会话**已经离开** `ARCHIVED`（搬回把它翻回了 `ACTIVE`）。仍为
+   `ARCHIVED` 的会话正在被导出作业处理，一律不碰。用严格小于而不是 `<>`，是因为 `ARCHIVED` 恰好是枚举里
+   最大的状态码，于是这条谓词在 `idx_med_session_retention (status, updated_at)` 上仍是一个**单区间**；
+   这个等价关系由 `SessionReclaimMapperShardingTest#archivedIsTheHighestStatusCode` 钉住，改枚举顺序会变红。
+2. `NOT EXISTS (SELECT 1 FROM med_session_archive WHERE session_id = s.session_id)`——**有清单的冷行是
+   证据，一行都不能动**。这是本迭代的第一条硬约束。
+3. `EXISTS (SELECT 1 FROM med_message_archive WHERE session_id = s.session_id)`——没有冷行的会话根本
+   不需要回收。这条谓词**同时就是完成信号**：回收只删冷行，删完候选自然消失，所以**不需要退役标记列**
+   （与 7.11 的 `med_session.purged_at` 相反）。
+
+**它要求什么**（两道检查，缺一即 `refused`）：
+
+1. **锁内重读**：候选是在锁外选出来的，而搬回（7.12）可以在两次读之间把会话送回 `ARCHIVED`。所以在会话锁内
+   `selectById` 重读，状态不是「已离开 `ARCHIVED`」就记 `skipped` 零改动——否则会删掉导出作业正在认证的副本。
+2. **包含关系**：冷副本的每个 `message_id` 都必须仍能在**活轨迹**里找到。孤儿没有清单，所以没有摘要可比，
+   7.11 的「摘要复现」在这里无从下手；包含关系问的是唯一有意义的问题——**这份副本有没有可能承载活轨迹
+   没有的东西**。有，即拒绝，并且**删 0 行**。
+
+**顺序不可交换**：先在会话锁内证明包含关系，再删冷行（`SessionArchiveMapper#deleteColdCopy`，只按
+`session_id` 删 `med_message_archive`）。只删冷副本，**热表、`med_session`、清单一个字节都不动**。
+
+**它刻意不做什么**：**不加冷静期**。7.11 的 `min-archived-age` 是「活副本还能不能重建」的窗口，而 D52 删掉的
+这份副本不承载任何能力——删了它，7.10 的读路径照样按清单作答（有清单的冷行根本不在候选里），被搬回的会话
+照样可写。窗口只会推迟空间的释放，同时假装在保护什么。因此 `med.session.reclaim.*` 里**没有**
+`min-archived-age` 这一族键，这是**契约而不是遗漏**（`MedSessionReclaimConfigTest#thereIsNoCoolingOffWindow`
+钉住它，键缺失与「显式配置成 0」都判红）。
+
+**互斥**：集群互斥锁是 `med:lock:session:reclaim`（与 `med:lock:session:purge` /
+`med:lock:session:archive:export` 同族但**不同键**，不可配置）；每个候选还在
+`med:lock:chat:{tenant}:{dept}:{session}` 会话锁内处理，与追加、归档、清理、搬回同一把锁。锁忙记
+`skipped`（不是失败），Redis 不可达**向上抛**。
+
+**告警**：`session-reclaim-completed`（INFO，**只在真删了东西且非 dry-run 时**发）、
+`session-reclaim-refused`（WARNING，**在完成通知之前独立发出**）、`session-reclaim-failed`（ERROR）。
+「作业停了」与「没有孤儿可回收」外观完全一样，所以拒绝更不能静默。
+
+**排查**：
+
+- 报告里 `refused > 0` → 消息里有具体原因。最常见的是「冷副本里有活轨迹找不到的 `message_id`」，说明有人
+  绕过写入路径动过热表。先跑 7.10 的读路径确认还能读出什么，**不要**手工删冷行。
+- 报告里 `candidates = 0` 且 `reclaimed = 0` → 没有孤儿，正常。孤儿只在「导出过、又被搬回」之后出现。
+- 期望回收却一直 `skipped` → 检查该会话是不是又被归档了：`status = ARCHIVED` 时导出作业会重新认证它，
+  此时它是证据，D52 不动它。
+- 报告里出现 `skipped-lock-held` → 互斥生效，不是故障。**不要**为了让它跑起来去调小
+  `MED_SESSION_RECLAIM_LOCK_WAIT`。
+- 单实例调试：先 `MED_SESSION_RECLAIM_ENABLED=true` 且保持 `MED_SESSION_RECLAIM_DRY_RUN=true`，看一轮报告里的
+  `candidates` / `refused` 是否合理，再关掉 dry-run。
+
+**跨组件契约**：`SessionReclaimReportTest`、`MedSessionReclaimPropertiesTest`、
+`MedSessionReclaimServiceTest`（三条候选谓词各有用例、锁内状态重读的 `InOrder`、包含关系失败即 `refused`
+且零删除、dry-run 只验不删、锁忙零改动、单候选失败不中断整轮）、`MedSessionReclaimSchedulerTest`、
+`MedSessionReclaimConfigTest`（开关真的增删 Bean、`@Scheduled` 占位符键在 `application.yml` 里真实存在、
+**没有冷静期键**）、`SessionReclaimMapperShardingTest`（真实 DDL 下候选谓词逐条生效、删除只命中冷表），
+以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + Redis 上验证
+「导出 + 搬回制造孤儿 → 回收它 → 活轨迹一行不少、状态与清单不动」。
 
 ---
 

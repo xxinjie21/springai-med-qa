@@ -229,6 +229,38 @@ med:
       initial-delay: ${MED_SESSION_PURGE_INITIAL_DELAY:15m}
       lock-wait-time: ${MED_SESSION_PURGE_LOCK_WAIT:5s}
       lock-lease-time: ${MED_SESSION_PURGE_LOCK_LEASE:5m}
+    # Retiring the cold copies a restore orphaned (D52). D51 moves a mis-archived session back to the live
+    # tier and retires its export certification, but the rows D48 copied into med_message_archive stay:
+    # the read path never consults them (only a manifest can make a cold copy answer) and the purge never
+    # touches them (D50 deletes from med_message only). What is left is neither evidence nor state - just
+    # a duplicate of bytes the live transcript still holds.
+    #
+    # What makes a deletion accountable here is NOT a digest: an orphan has no certification to compare
+    # against. It is containment - the live transcript must hold every message the cold copy holds, and a
+    # copy that holds anything else is refused (reported, alerted, left untouched). That guard is what
+    # keeps this job safe without borrowing another component's invariant ("the purge refuses without a
+    # manifest, so a copy without one is always redundant"): that argument belongs to D50, and D48/D49/D50
+    # all learned that such an invariant has to be re-established locally or the next iteration breaks it.
+    #
+    # Two conservative defaults, and deliberately no cooling-off window: unlike the purge, deleting this
+    # copy destroys no capability - the bytes stay in the live transcript and the session is writable
+    # again - so a window would delay the release of space while pretending to protect something. The
+    # window the purge carries exists because it makes a session impossible to move back.
+    #
+    # Only the cold copy of a candidate is ever deleted: this job never touches med_message and never
+    # deletes a manifest row.
+    #
+    # batch-size * max-batches bounds how many copies one run may retire; a run that hits that bound
+    # reports the remaining backlog and the next run continues (oldest orphan first).
+    reclaim:
+      enabled: ${MED_SESSION_RECLAIM_ENABLED:false}
+      dry-run: ${MED_SESSION_RECLAIM_DRY_RUN:true}
+      batch-size: ${MED_SESSION_RECLAIM_BATCH_SIZE:50}
+      max-batches: ${MED_SESSION_RECLAIM_MAX_BATCHES:5}
+      check-interval: ${MED_SESSION_RECLAIM_CHECK_INTERVAL:12h}
+      initial-delay: ${MED_SESSION_RECLAIM_INITIAL_DELAY:15m}
+      lock-wait-time: ${MED_SESSION_RECLAIM_LOCK_WAIT:5s}
+      lock-lease-time: ${MED_SESSION_RECLAIM_LOCK_LEASE:5m}
   # Schema migration target (D34). Flyway must talk to the physical MySQL server, never to the
   # ShardingSphere data source declared under spring.datasource: the migrations create the physical
   # shard tables med_message_0..15, which are precisely the tables the sharding proxy treats as

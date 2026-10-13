@@ -503,6 +503,31 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D52 orphan reclaim, its containment guard and why it needs no window")
+    void apiChapterDocumentsTheD52OrphanReclaim() {
+        // The README is where a reader forms the mental model, and the D52 model has two parts that are
+        // easy to get backwards: the guard is containment by message id rather than a digest (an orphan
+        // has no manifest, so there is nothing to reproduce), and there is deliberately no cooling-off
+        // window because the copy being retired carries no capability - a reader who assumes every
+        // deletion in this project sits behind the 7-day window would conclude the guard is missing.
+        assertThat(readme).contains("（D52）");
+        // The heading pins the iteration marker to the section itself: asserting on a bare "（D52）"
+        // would be satisfied by the roadmap row, so deleting the whole chapter would not turn this red.
+        assertThat(readme).contains("#### 孤儿冷副本的回收（D52）");
+        assertThat(readme).contains("med.session.reclaim.enabled");
+        assertThat(readme).contains("MedSessionReclaimService");
+        assertThat(readme).contains("med:lock:session:reclaim");
+        assertThat(readme).contains("MED_SESSION_RECLAIM_ENABLED");
+        assertThat(readme).contains("MED_SESSION_RECLAIM_DRY_RUN");
+        assertThat(readme).contains("session-reclaim-refused");
+        assertThat(readme).contains("session-reclaim-failed");
+        assertThat(readme).contains("deleteColdCopy");
+        assertThat(readme).contains("MedSessionReclaimServiceTest");
+        assertThat(readme).contains("SessionReclaimMapperShardingTest");
+        assertThat(readme).contains("MedSessionReclaimConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

@@ -226,6 +226,8 @@ class AlertingStackConfigTest {
                 "MedQaSessionArchiveMismatch",
                 "MedQaSessionPurgeFailed",
                 "MedQaSessionPurgeRefused",
+                "MedQaSessionReclaimFailed",
+                "MedQaSessionReclaimRefused",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -439,6 +441,51 @@ class AlertingStackConfigTest {
         assertThat(applicationYml).contains("MED_SESSION_PURGE_ENABLED:false");
         assertThat(applicationYml).contains("MED_SESSION_PURGE_DRY_RUN:true");
         assertThat(applicationYml).contains("MED_SESSION_PURGE_MIN_ARCHIVED_AGE:7d");
+    }
+
+    @Test
+    @DisplayName("the D52 reclaim rules select the codes the scheduler actually exports")
+    void reclaimRulesMatchTheExportedCodes() throws IOException {
+        // Same drift trap as the purge rules, with one difference worth asserting: this job has no
+        // cooling-off window, so "the reclaim stopped working" and "this hospital has no orphans" produce
+        // exactly the same observable state. The failure and refusal codes are therefore the only two
+        // signals the reclaim produces at all, and a rule that quietly stopped selecting one would leave
+        // the cold store growing with nothing to look at.
+        String scheduler = read("src/main/java/com/med/qa/service/MedSessionReclaimScheduler.java");
+        assertThat(scheduler).contains("session-reclaim-failed");
+        assertThat(scheduler).contains("session-reclaim-refused");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-reclaim-failed\"");
+        assertThat(read(ALERT_RULES)).contains("code=\"session-reclaim-refused\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionReclaimFailed");
+        assertThat(read(ALERT_RULES)).contains("MedQaSessionReclaimRefused");
+        // Nothing is lost when either fires - every deletion is preceded by a containment proof, and a
+        // refusal deletes nothing at all - so both warn rather than page, and both must be routable to
+        // their own component so a reclaim storm cannot hide behind the purge's.
+        assertThat(read(ALERT_RULES)).contains("component: session-reclaim");
+        assertThat(read(ALERT_RULES)).contains("severity: warning");
+    }
+
+    @Test
+    @DisplayName("the reclaim switches are declared in application.yml and default to off and dry")
+    void reclaimPropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_SESSION_RECLAIM_ENABLED",
+                "MED_SESSION_RECLAIM_DRY_RUN",
+                "MED_SESSION_RECLAIM_BATCH_SIZE",
+                "MED_SESSION_RECLAIM_MAX_BATCHES");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // The second job in the project that deletes clinical data gets the same two conservative
+        // defaults as the first: not armed by the repository, and still not deleting after being armed.
+        assertThat(applicationYml).contains("MED_SESSION_RECLAIM_ENABLED:false");
+        assertThat(applicationYml).contains("MED_SESSION_RECLAIM_DRY_RUN:true");
+        // And it deliberately does NOT get the third one. The purge's cooling-off window protects the
+        // ability to move a session back; an orphaned copy carries no such ability, so a window here
+        // would only postpone the release of space. The absence is the contract, so it is asserted.
+        assertThat(applicationYml).doesNotContain("MED_SESSION_RECLAIM_MIN_ARCHIVED_AGE");
+        assertThat(applicationYml).doesNotContain("MED_SESSION_RECLAIM_MIN_ORPHAN_AGE");
     }
 
     @Test

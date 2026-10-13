@@ -766,6 +766,89 @@ turn → archive again → export again (the cold copy grows to four rows) → r
 is refused once the hot rows were reclaimed, and the record is still readable from the cold copy" and "a
 session whose lock is held by another thread is skipped by the purge with every row intact".
 
+#### Reclaiming orphaned cold copies (D52)
+
+**What this closes is the tail D51 created for itself.** Restoring a mis-archived session retires its
+export certification but leaves every byte in `med_message_archive` exactly where it was — so the cold
+table ends up holding a snapshot **with no manifest**. Such a snapshot is neither evidence nor state: the
+read path never consults it (`MedTranscriptService` decides which tier answers by reproducing the manifest
+digest, and there is no manifest) and D50 never touches it (the purge deletes from `med_message` only). It
+is just a duplicate occupying space.
+
+`MedSessionReclaimService` (gated by `med.session.reclaim.enabled`, the same way D47/D48/D50 are) retires
+it, and it is the project's **second job that deletes clinical data**. Three predicates, in this order,
+none of them a formality:
+
+1. **The session must no longer be cold.** The candidate query only takes sessions with
+   `status < ARCHIVED` (see below), and the status is re-read inside the session lock — an `ARCHIVED`
+   session's uncertified cold copy is the **export's work in progress**, not an orphan: those are the very
+   rows the export is about to certify, so reclaiming them would be the job fighting its sibling.
+2. **There must be no live certification.** A manifest makes the cold copy evidence, and nothing may
+   delete evidence. This is re-checked **inside the lock** rather than trusted from the candidate query,
+   because the query ran outside it: a session archived and exported in between would otherwise lose the
+   rows that certification describes — the very thing D48 exists to produce (the same shape as the purge's
+   in-lock status re-read).
+3. **The live transcript must hold every message the cold copy holds.** This replaces the digest
+   comparison the purge uses: a digest is a claim about *a* certified transcript, and an orphan has no
+   certification to compare against. What can be checked is **containment** — the copy is a subset of the
+   live transcript, so removing it removes nothing that is not still there.
+
+Predicate 3 is what keeps the job safe **without borrowing another component's invariant**. The argument
+"a cold copy is always redundant because the only path that destroys the hot rows, the purge, refuses to
+run without a manifest" is true today, but it is an argument about D50; the lesson D48/D49/D50 all learned
+is that **an invariant belonging to another component has to be re-established locally or the next
+iteration breaks it**. So the job really reads the live transcript and refuses when the copy holds
+anything it does not. In a healthy deployment that branch is unreachable, which is the point: it costs one
+read and it is the difference between "a redundant copy was released" and "the only record of a
+consultation was deleted".
+
+The rest of the trade-offs:
+
+- **No marker column and no cooling-off window**, both deliberately opposite to D50. No marker, because the
+  **candidate predicate observes the deletion itself** (the rows are gone, so the session stops being a
+  candidate) and an interrupted run converges on its own. No window, because deleting what this job deletes
+  **destroys no capability** — the bytes stay in the live transcript and the session is writable again — so
+  a window would only delay the release of space while pretending to protect something (D50's window exists
+  because it makes moving a session back impossible).
+- **Containment is compared by message id, not by bytes.** The cold row's payload was encoded from the same
+  message the live row holds, and nothing in this project rewrites a stored message (appends are
+  `insertIfAbsent`, and the only UPDATE `med_message` has ever had is the `masked` flag — the D44
+  contract). Re-encoding the live rows to compare bytes would introduce a second, weaker notion of equality
+  — one a cosmetic difference in map ordering could use to refuse a healthy copy — while answering the same
+  question. The digest machinery is deliberately not reused either: it needs a certification to compare
+  against, and the premise here is that there is none.
+- Cluster-wide mutual exclusion uses `med:lock:session:reclaim` (losing the race reports
+  `skipped-lock-held` without touching the database), every candidate is processed inside
+  `SessionLockService`'s session lock, and `batch-size × max-batches` bounds one run.
+- Alert codes: `session-reclaim-completed` (INFO, only when something was really deleted and it was not a
+  dry run), `session-reclaim-refused` (WARNING — **nothing was deleted**, but it is the only signal that
+  says a consultation copy cannot be accounted for), `session-reclaim-failed` (WARNING).
+
+Guards: `MedSessionReclaimServiceTest` (**one message missing from the live transcript refuses, an empty
+live transcript refuses**, a manifest appearing inside the lock is `skipped` and the copy is not even read,
+a candidate that went cold again is `skipped` with zero archive reads, a dry run writes nothing yet
+verifies everything, a replica without the mutex touches no row, one failing candidate never aborts the
+run), `SessionReclaimMapperShardingTest` (the candidate query needs all three predicates, **`ARCHIVED`
+must keep the highest status code** — `status < ARCHIVED` being equivalent to "not archived" is what the
+index-range reasoning rests on — **deleting the cold rows is itself the completion signal**, and
+`deleteColdCopy` removes one session's rows without touching the manifest table or the 16 hot shards),
+`MedSessionReclaimConfigTest` (the switch really adds and removes beans, the `@Scheduled` placeholder keys
+exist, and **there is deliberately no cooling-off key**), `MedSessionReclaimPropertiesTest`,
+`SessionReclaimReportTest`, `MedSessionReclaimSchedulerTest` (the completion / refusal / failure alerts and
+silence on a dry run), and `MedStorageAndLockIntegrationTest` on real MySQL and Redis: **a real export plus
+a real restore manufacture the orphan, the reclaim retires it, and the live transcript keeps every row with
+the read path still answering from the shard**, alongside "a certified copy is never touched" and "a copy
+whose live rows were erased is refused". As the project's convention requires, the load-bearing guards were
+**watched to go red**: short-circuiting the containment check into "delete anyway" turned exactly the refusal
+cases red — the three in `MedSessionReclaimServiceTest$Refusals` (one message missing, an empty live
+transcript, a refused copy staying a candidate) plus `dryRunReportsRefusals`, because a dry run has to report
+refusals too — and left the other 26 green; dropping `NOT EXISTS (med_session_archive)` from the candidate
+query turned exactly the two candidate cases of `SessionReclaimMapperShardingTest`
+(`candidateQueryRequiresEveryPredicate`, `countMatchesTheSelection`) red and left the other five green. Both
+were restored and re-run green. The four new documentation and alert guards were watched to go red the same
+way: deleting the chapter heading from each of the three documents and renaming the configuration prefix and
+the alert turned one case in each of the four suites red.
+
 ---
 
 ## Error codes
@@ -815,6 +898,7 @@ session whose lock is held by another thread is skipped by the purge with every 
 | `MED_SESSION_RETENTION_ENABLED` / `MED_SESSION_RETENTION_DRY_RUN` | `false` / `true` | Stale-session retention sweep (off and report-only by default, see D47) |
 | `MED_SESSION_ARCHIVE_ENABLED` / `MED_SESSION_ARCHIVE_DRY_RUN` | `false` / `true` | Cold archive export of archived transcripts (off and report-only by default, see D48) |
 | `MED_SESSION_PURGE_ENABLED` / `MED_SESSION_PURGE_DRY_RUN` | `false` / `true` | Hot-shard purge of certified cold copies (off, report-only and with a 7-day cooling-off window by default, see D50) |
+| `MED_SESSION_RECLAIM_ENABLED` / `MED_SESSION_RECLAIM_DRY_RUN` | `false` / `true` | Reclaim of orphaned cold copies (off and report-only by default, and **deliberately with no cooling-off window**: it destroys no capability, see D52) |
 | `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | Staleness window and per-run batch bounds |
 | `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | Retention sweep period and startup grace period |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
@@ -1259,7 +1343,7 @@ the loop of code, unit tests, commit and push:
 | Phase 9, durable transcript and retrieval-metadata isolation | D44 to D46 | Complete (D44: MySQL keeps the full transcript, the window write path became an idempotent append serialized by an `RLock`, guarded by `ChatMemoryWindowIntegrationTest` and `MedStorageAndLockIntegrationTest`; D45: `metadata-mode` moved from `EMBED` to `NONE`, the code fallback was converged on `NONE` too, and `EmbeddingMetadataContractTest` demonstrates with the real formatter whether the isolation tags enter the vector; D46: window-semantics comments aligned, deployment prerequisites (utf8mb4, H2 console) corrected, and the privacy-layer comments fixed, guarded by `MemoryWindowSemanticsTest` / `DeploymentPrerequisiteTest` / `PrivacyMaskingDocumentationTest`) |
 | Phase 10, session lifecycle governance and retention | D47 to D48 | Complete (D47: the "retention job sweeping stale sessions" that `archiveSession`'s javadoc has promised since D20 now exists — stale `ACTIVE` sessions move to `ARCHIVED`, the staleness predicate travels inside the archiving statement itself, the archive runs under the session lock, cluster-wide mutual exclusion uses an `RLock`, and the capability is off and report-only by default. D48: "archived" finally has a verifiable counterpart in storage — the full transcript of every archived session is copied in the Protobuf encoding into the non-sharded `med_message_archive` table, and a manifest row (count + SHA-256 digest) is written into `med_session_archive` only after the source has been shown to be stable and the cold copy has been shown to reproduce the digest; **insert-only, nothing is deleted**. Guarded by `MedSessionRetentionServiceTest` / `ChatSessionMapperRetentionShardingTest` / `MedSessionRetentionConfigTest` / `MedSessionArchiveExportServiceTest` / `SessionArchiveMapperShardingTest` / `MedSessionArchiveConfigTest`) |
 | Phase 11, archived-transcript readability and hot-data close-out | D49 to D50 | Complete (D49: the single read path that ends "archived means gone" — `MedTranscriptService` resolves scope and ownership through the lifecycle service first, then decides between the hot shard and the cold copy by recomputing the canonical digest, and refuses when neither reproduces the certification; `SessionController` gained `GET /api/sessions/{sessionId}/transcript`, and the response names the `source` and the digest. D50: the other half of the cold/hot split — `MedSessionPurgeService` deletes the hot rows only after **both the cold copy and the live shard reproduce the manifest digest** (the cold copy is verified first, because until it holds the hot rows are the only copy), retires the session through the new `med_session.purged_at` column (V6), **deletes only from `med_message` and never touches a cold row**, defaults to off, report-only and a 7-day cooling-off window, and excludes replicas through `med:lock:session:purge`. Guarded by `MedSessionPurgeServiceTest` / `SessionPurgeMapperShardingTest` / `MedSessionPurgeConfigTest` / `MedSessionPurgePropertiesTest` / `SessionPurgeReportTest` / `MedSessionPurgeSchedulerTest`, with real MySQL + Redis proving that after a real purge D49's read path serves the cold copy) |
-| Phase 12, moving a mis-archived session back and keeping the cold/hot chain consistent | D51 to D52 | In progress (D51: "a wrongly archived session can be moved back" turns from a sentence cited in six places into code — `MedSessionRestoreService` moves an `ARCHIVED` session back to `ACTIVE` inside the session lock, after the lifecycle service has authorized it, and only when `purged_at IS NULL` and the live transcript reproduces the export manifest's digest; the certification is retired **before** the status flips (the reverse order would make the session permanently un-certifiable). Restoring **deliberately does not rebuild the hot rows**, which is what finally gives D50's cooling-off window a precise meaning: it is the restore window. Both `MedSessionPurgeService` and `MedSessionArchiveExportService` gained the session lock and an in-lock status re-read, because restoring is the first writer that can leave `ARCHIVED` and a checksum cannot see it. Guarded by `MedSessionRestoreServiceTest` / `SessionControllerTest` / new cases in both job suites, with real MySQL + Redis running the converging loop "archive → export → restore → archive again → export again → reclaimable". D52 not started) |
+| Phase 12, moving a mis-archived session back and keeping the cold/hot chain consistent | D51 to D52 | Done (D51: "a wrongly archived session can be moved back" turns from a sentence cited in six places into code — `MedSessionRestoreService` moves an `ARCHIVED` session back to `ACTIVE` inside the session lock, after the lifecycle service has authorized it, and only when `purged_at IS NULL` and the live transcript reproduces the export manifest's digest; the certification is retired **before** the status flips (the reverse order would make the session permanently un-certifiable). Restoring **deliberately does not rebuild the hot rows**, which is what finally gives D50's cooling-off window a precise meaning: it is the restore window. Both `MedSessionPurgeService` and `MedSessionArchiveExportService` gained the session lock and an in-lock status re-read, because restoring is the first writer that can leave `ARCHIVED` and a checksum cannot see it. Guarded by `MedSessionRestoreServiceTest` / `SessionControllerTest` / new cases in both job suites, with real MySQL + Redis running the converging loop "archive → export → restore → archive again → export again → reclaimable". D52: the tail D51 created for itself is closed — restoring retires the export certification but leaves the bytes in `med_message_archive`, so the cold table keeps a snapshot **with no manifest** that is neither evidence nor state. `MedSessionReclaimService` applies three predicates in order: the session must no longer be cold (an uncertified copy of an `ARCHIVED` session is the export's work in progress), there must be no live certification (re-checked inside the lock, or a freshly certified copy would be deleted), and **the live transcript must hold every message the copy holds** (which replaces the digest comparison, since an orphan has no certification, and is the guard that avoids borrowing D50's invariant). **Deliberately no marker column** — the candidate predicate observes the deletion — **and no cooling-off window**, because no capability is destroyed. Guarded by `MedSessionReclaimServiceTest` / `SessionReclaimMapperShardingTest` / `MedSessionReclaimConfigTest` / `MedSessionReclaimPropertiesTest` / `SessionReclaimReportTest` / `MedSessionReclaimSchedulerTest`, with real MySQL + Redis proving "a real export plus a real restore manufacture the orphan, the reclaim retires it, and the live transcript keeps every row") |
 
 ---
 

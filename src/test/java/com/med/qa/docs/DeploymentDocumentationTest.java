@@ -348,6 +348,43 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D52 orphan reclaim, its two guards and why it has no cooling-off window")
+    void sessionReclaimIsDocumented() {
+        // The operator-facing half of D52, and the trap here is subtler than D50's: this job deletes
+        // cold rows, so an operator who reads it as "the purge, but for the other table" would expect a
+        // cooling-off window and, finding none, either add one or assume the guard is missing. The
+        // chapter has to explain that the window protects a capability (rebuilding the live copy) that
+        // an orphan does not carry, and that the guard is containment rather than a digest - because an
+        // orphan has no manifest to reproduce. It also has to name the refusal, since a refused orphan
+        // and an empty backlog look identical from the outside.
+        assertThat(handbook).contains("7.13");
+        assertThat(handbook).contains("（D52）");
+        // The heading is asserted whole, and the configuration prefix is asserted separately: `7.13` and
+        // `（D52）` each appear elsewhere in the handbook, and `MedSessionReclaimService` is a substring of
+        // the guard-test class name, so any of those alone would stay green with the chapter deleted.
+        assertThat(handbook).contains("### 7.13 孤儿冷副本回收（D52）");
+        assertThat(handbook).contains("med.session.reclaim.enabled");
+        assertThat(handbook).contains("MED_SESSION_RECLAIM_ENABLED");
+        assertThat(handbook).contains("MED_SESSION_RECLAIM_DRY_RUN");
+        assertThat(handbook).contains("med:lock:session:reclaim");
+        assertThat(handbook).contains("MedSessionReclaimService");
+        assertThat(handbook).contains("MedSessionReclaimScheduler");
+        assertThat(handbook).contains("deleteColdCopy");
+        assertThat(handbook).contains("message_id");
+        assertThat(handbook).contains("refused");
+        assertThat(handbook).contains("session-reclaim-completed");
+        assertThat(handbook).contains("session-reclaim-refused");
+        assertThat(handbook).contains("session-reclaim-failed");
+        // The absence of a cooling-off window is a contract, not an oversight: the chapter must say so
+        // out loud, and must not quietly document a key that the job does not read.
+        assertThat(handbook).contains("不加冷静期");
+        assertThat(handbook).doesNotContain("MED_SESSION_RECLAIM_MIN_ARCHIVED_AGE");
+        assertThat(handbook).contains("MedSessionReclaimServiceTest");
+        assertThat(handbook).contains("SessionReclaimMapperShardingTest");
+        assertThat(handbook).contains("MedSessionReclaimConfigTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
