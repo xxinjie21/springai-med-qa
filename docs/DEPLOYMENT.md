@@ -668,7 +668,13 @@ docker compose --profile observability up -d
 > Alertmanager UI 看到，只是不会推到手机上。
 
 自定义应用指标：`med_qa_alert_total{severity,code,component}`（计数器）与
-`med_qa_alert_last_epoch_seconds`（最近一次告警时间戳，可用于 dead-man's-switch 规则）。
+`med_qa_alert_last_epoch_seconds`（最近一次**告警**的时间戳）。
+
+> **它不是 dead-man's switch（D53 修正）**：D33 起这里的原文写着「可用于 dead-man's-switch 规则」，
+> 但那条规则从来不存在，而且这个 gauge 的语义也做不到这件事——它回答的是「上次**告警**是什么时候」，
+> 而死信开关要回答的是「上次**评估**是什么时候」。一个运行正常的医院**不产生告警**，基于它的开关会为
+> 一次正确的部署永久误报；四个后台作业在无事可做时又**刻意保持沉默**，所以「空转的作业」与「死掉的作业」
+> 在这里完全一样。真正的死信开关见 §7.14。
 
 ### 7.5 告警投递顺序与探测失败信号（D43）
 
@@ -1204,6 +1210,93 @@ D51 搬回一个会话时会撤销它的导出清单，但 `med_message_archive`
 **没有冷静期键**）、`SessionReclaimMapperShardingTest`（真实 DDL 下候选谓词逐条生效、删除只命中冷表），
 以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + Redis 上验证
 「导出 + 搬回制造孤儿 → 回收它 → 活轨迹一行不少、状态与清单不动」。
+
+---
+
+### 7.14 后台作业的运行账本与停摆检测（D53）
+
+D47 / D48 / D50 / D52 的四份文档都写着同一句话——**「作业停了与医院没有可清理的会话外观完全一样」**——
+但四个作业**没有任何东西能回答「它上一次运行是什么时候」**：告警只在**失败**时发（`-failed`），
+或在**真的做了事**时发（`-completed` INFO，安静的一夜什么都不发）。于是「作业健康且无事可做」与
+「作业在三个月前就死了」的可观测面完全相同：零告警、零指标、零日志。
+
+更根本的一条：**依赖作业运行才能产生的告警，永远无法发现作业没有运行**。四个 `-failed` 规则全部由作业
+自己发出，所以它们对「作业整个停了」这一类故障结构性失明。D53 补上这条只能由**数据的缺席**来表达的信号。
+
+#### 应用发布什么
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `med_qa_job_last_run_epoch_seconds{component}` | gauge | 最近一次**尝试**的墙钟秒。**每一种结局都会刷新它**，包括抢不到锁而让位的那些 |
+| `med_qa_job_last_success_epoch_seconds{component}` | gauge | 最近一次**真正跑完 passes** 的墙钟秒。只有 `COMPLETED` 刷新它 |
+| `med_qa_job_expected_interval_seconds{component}` | gauge | 该作业被装配时的 `check-interval`（秒）。**规则用它当阈值**，所以改配置不需要改规则 |
+| `med_qa_job_runs_total{component,outcome}` | counter | 按结局计数的运行次数，`outcome` ∈ `COMPLETED` / `SKIPPED_LOCK_HELD` / `FAILED` |
+
+`component` 的取值就是四个作业的告警 component：`session-retention`、`session-archive`、
+`session-purge`、`session-reclaim`。
+
+> **为什么标签叫 `component` 而不是 `job`**：Prometheus 把 `job` 与 `instance` 保留给抓取目标，
+> 在默认的 `honor_labels: false` 下，被采集指标里同名的标签会被改名为 `exported_job`，而目标自己的
+> `job="med-qa"` 覆盖它。于是一条写着 `job=~"session-.*"` 的规则会**解析成功、采集成功、永远不匹配任何
+> 数据**——正是 D53 要消灭的那类静默失效。复用 `component` 还让选择器与
+> `med_qa_alert_total{component=...}` 用同一套子系统命名，一块面板同时覆盖两者。
+> `AlertingStackConfigTest` 把两半都钉住：标签名，以及抓取配置**没有**打开 `honor_labels`。
+
+#### 两条规则，问的是两个不同的问题
+
+| 规则 | 级别 | 表达式（节选） | 回答的问题 |
+|---|---|---|---|
+| `MedQaBackgroundJobStalled` | warning | `time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*"} > 2.5 * med_qa_job_expected_interval_seconds{...} + 300`，`for: 15m` | **这个 Pod 的调度线程是不是停了**（按实例） |
+| `MedQaBackgroundJobNotCompleting` | **critical** | `time() - max by (component)(med_qa_job_last_success_epoch_seconds{...}) > 2.5 * max by (component)(med_qa_job_expected_interval_seconds{...}) + 300`，`for: 15m` | **有没有任何副本真的在干活**（按集群） |
+
+**为什么必须分开**：`last_run` 在 `SKIPPED_LOCK_HELD` 时也会刷新（抢不到锁是互斥在工作，不是实例停摆），
+所以一个**被泄漏的 `med:lock:session:*` 键**会让某个副本永久占着互斥，其余副本每轮都记
+`SKIPPED_LOCK_HELD`——`last_run` 看起来完全新鲜、四个作业却全部变成空转。只有
+`last_success` 的**集群最大值**能发现它。`MedQaBackgroundJobNotCompleting` 因此**page**：它是唯一一条
+由数据的缺席产生的信号，作业自己发出的任何告警都覆盖不了「作业什么都没发出」这种情况。
+
+**阈值为什么是 2.5 倍加 300 秒**：`@Scheduled(fixedDelay)` 从上一轮**结束**开始计时，所以两次成功之间
+的间隔约为 `interval + 运行耗时`；2.5 倍给慢轮次留了余量，`+300` 让「刚启动」不会误报。
+
+#### 现场处置
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| `MedQaBackgroundJobStalled` 只对某一个 `instance` 触发 | 那个 Pod 的调度线程没了（Bean 被摘掉、定时器没起来） | 重启该 Pod；若重启后仍不触发，检查该作业的 `enabled` 是否被改成了 `false`——**关闭的作业不发布任何序列，规则也不会触发**，两者外观不同 |
+| `MedQaBackgroundJobNotCompleting` 触发，`runs_total{outcome="FAILED"}` 在涨 | 每轮都抛异常 | 先看 `-failed` 告警与日志，多半是 MySQL / Redis 不可达 |
+| `MedQaBackgroundJobNotCompleting` 触发，`runs_total{outcome="skipped_lock_held"}` 在涨、`completed` 为 0 | 互斥被某个副本永久占着 | `redis-cli --scan --pattern 'med:lock:session:*'` 找出残留键；确认持有者进程是否已被强杀。确认无人在跑后可手工 `DEL` 该键，作业下一轮自动恢复 |
+| 两条都不触发、但业务上感觉作业没跑 | 大概率是**作业被关掉了** | `med.session.*.enabled=false` 时账本不发布序列，规则按设计不告警。用 `/actuator/info` 或配置核对，**不要**去改规则 |
+
+#### 这套机制看不见什么（边界，不是缺陷）
+
+- **重启频率高于阈值的 Pod 会重置自己的时钟**：两个时间戳在 `register` 那一刻起算（不是从 0 起算，
+  否则每次重启后的整个 `initial-delay` 都会误报），所以一个不断崩溃重启的 Pod 可以一直让时间戳保持新鲜。
+  这是**进程内心跳**的固有边界，由进程层面覆盖：崩溃重启的 Pod 会让 `up` 抖动，
+  `MedQaTargetDown` 抓得到。要一条**抗崩溃循环**的死信开关，只能把心跳落到进程之外（外部探针或持久化）。
+- **两个告警监控器（`MedStorageAlertMonitor` / `MedVectorIndexAlertMonitor`）不在范围内**：它们的存活
+  问题是个先有鸡还是先有蛋的问题——告警链无法报告自己的生产者已死——只能由 `MedQaTargetDown` 在进程层面
+  覆盖。这是**刻意的范围边界**，不是遗漏。
+- **账本自身没有任何开关**：它是「作业没跑」的唯一证据来源，能把它关掉等于一次性关掉四个作业的可观测性。
+  作业被关闭时它自然不发布序列，这就够了。
+- **不发布业务计数**（`candidates` / `archived` / `purged` 这类）：D53 只回答「作业还活着吗」，
+  把「作业干得怎么样」混进来会让两条规则的判据重新变得含混。业务计数仍在各自的报告里。
+
+#### 跨组件契约
+
+`MedJobRunLedgerTest`（注册幂等且**不重置**时间戳、两个时间戳在注册时都等于当前时刻——「重启后不误报」
+的可执行版本、`SKIPPED_LOCK_HELD` 只刷新 `last_run`、`FAILED` 只刷新 `last_run`、三种结局各自计数、
+未注册的作业 `record` 直接拒绝、两个作业的标签互不串扰）、`MedJobRunTest`、
+`MedJobObservabilityConfigTest`（**四个作业全关时账本仍在**）、四个 `*SchedulerTest`（三种结局分别记进
+账本，且抛异常时账本**先于**告警——用 `InOrder` 断言，因为告警链自己挂掉时不能再把「作业跑过」这条唯一
+证据一起丢掉）、四个 `*ConfigTest`（**账本发布的 `expected-interval` 与 `@Scheduled` 占位符读到的是同一个
+`check-interval`**，占位符的 `:1h` 字面回退一旦生效就会在这里变红）、`AlertingStackConfigTest`
+（规则里出现的每个 `med_qa_job_*` 名字都必须属于 `MedJobRunLedger` 的常量、三个 gauge 必须都被引用、
+选择器必须匹配四个作业的 `COMPONENT` 且**不匹配**两个监控器的 component、抓取配置不得打开
+`honor_labels`）。
+
+按项目惯例，本轮的新守卫**先被亲眼看过它变红**：把账本的 `record` 改成只在 `COMPLETED` 时刷新
+`last_run` → `MedJobRunLedgerTest` 的「被互斥挡下仍算一次尝试」用例变红；把 `register` 改成每次都重置
+时间戳 → 「幂等不重置」用例变红；把 `MetricsMedAlertSink` 的错误承诺还原 → 文档守卫变红。
 
 ---
 

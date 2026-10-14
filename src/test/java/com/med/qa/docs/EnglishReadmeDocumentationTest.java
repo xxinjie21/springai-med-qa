@@ -485,6 +485,29 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D53 job run ledger, the two rules and the reserved-label trap")
+    void apiChapterDocumentsTheD53JobLedger() {
+        // The English README is the only place an English-speaking operator learns that the four jobs'
+        // own alerts are structurally blind to the job being gone, and that the last-alert gauge was
+        // described as a dead-man's switch no rule ever read. Dropping either turns the chapter back into
+        // the false confidence D53 exists to remove.
+        assertThat(english).contains("D53");
+        // As in D52: a bare `contains("D53")` is satisfied by the roadmap row and `MedJobRunLedger` is a
+        // substring of `MedJobRunLedgerTest`, so the heading is asserted whole.
+        assertThat(english).contains("#### Background job run ledger and stall detection (D53)");
+        assertThat(english).contains("MedJobRunLedger");
+        assertThat(english).contains("med_qa_job_last_run_epoch_seconds");
+        assertThat(english).contains("med_qa_job_last_success_epoch_seconds");
+        assertThat(english).contains("med_qa_job_expected_interval_seconds");
+        assertThat(english).contains("med_qa_job_runs_total");
+        assertThat(english).contains("MedQaBackgroundJobStalled");
+        assertThat(english).contains("MedQaBackgroundJobNotCompleting");
+        assertThat(english).contains("SKIPPED_LOCK_HELD");
+        assertThat(english).contains("honor_labels");
+        assertThat(english).contains("MedJobRunLedgerTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

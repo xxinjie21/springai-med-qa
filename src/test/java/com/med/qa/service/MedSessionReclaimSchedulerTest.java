@@ -4,11 +4,19 @@ import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertSeverity;
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
+import com.med.qa.job.MedJobRun;
+import com.med.qa.job.MedJobRunLedger;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.ObjectProvider;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 
@@ -21,6 +29,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -34,14 +43,27 @@ import static org.mockito.Mockito.when;
  * run and a run that stepped aside for another replica do not, a run that threw says so, and — the case
  * that matters most — a run that reclaimed nine copies and refused one raises the refusal warning
  * <em>as well as</em> the completion notice, because the refusal is the part that needs a human.</p>
+ *
+ * <p>D53 adds the half of that contract no alert can carry: the same three outcomes are also pinned in the
+ * run ledger, whose staleness is what a dead job cannot suppress. The ledger is exercised for real over a
+ * {@code SimpleMeterRegistry} rather than mocked, because the assertion that matters is the meter a
+ * Prometheus scrape would read.</p>
  */
 class MedSessionReclaimSchedulerTest {
+
+    private static final Instant BOOT = Instant.parse("2026-10-14T09:00:00Z");
+
+    private static final long BOOT_EPOCH_SECONDS = BOOT.getEpochSecond();
 
     private MedSessionReclaimService reclaimService;
 
     private MedAlertNotifier notifier;
 
     private ObjectProvider<MedAlertNotifier> notifierProvider;
+
+    private SimpleMeterRegistry registry;
+
+    private MedJobRunLedger ledger;
 
     private MedSessionReclaimScheduler scheduler;
 
@@ -52,7 +74,10 @@ class MedSessionReclaimSchedulerTest {
         notifier = mock(MedAlertNotifier.class);
         notifierProvider = mock(ObjectProvider.class);
         when(notifierProvider.getIfAvailable()).thenReturn(notifier);
-        scheduler = new MedSessionReclaimScheduler(reclaimService, notifierProvider);
+        registry = new SimpleMeterRegistry();
+        ledger = new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC));
+        scheduler = new MedSessionReclaimScheduler(reclaimService, notifierProvider, ledger,
+                Duration.ofHours(12));
     }
 
     @Test
@@ -180,10 +205,75 @@ class MedSessionReclaimSchedulerTest {
     @Test
     @DisplayName("the constructor refuses a null collaborator")
     void constructorRejectsNulls() {
-        assertThatThrownBy(() -> new MedSessionReclaimScheduler(null, notifierProvider))
+        assertThatThrownBy(() -> new MedSessionReclaimScheduler(null, notifierProvider, ledger,
+                Duration.ofHours(12)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("reclaimService");
-        assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, null))
+        assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, null, ledger,
+                Duration.ofHours(12)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("notifier");
+        assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, notifierProvider, null,
+                Duration.ofHours(12)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("ledger");
+    }
+
+    // ------------------------------------------------------------------ the run ledger (D53)
+
+    @Test
+    @DisplayName("building the scheduler registers the job, so a job that never runs still has a series")
+    void buildingTheSchedulerRegistersTheJob() {
+        assertThat(ledger.registeredJobs()).containsExactly(MedSessionReclaimScheduler.COMPONENT);
+        assertThat(ledger.expectedIntervalSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isEqualTo(43_200d);
+        assertThat(ledger.lastRunEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isEqualTo(BOOT_EPOCH_SECONDS);
+    }
+
+    @Test
+    @DisplayName("a completed run advances both ledger timestamps")
+    void completedRunAdvancesBothTimestamps() {
+        when(reclaimService.reclaimOnce()).thenReturn(report(false, 3, 0, 0, 0, 0L));
+
+        scheduler.reclaimNow();
+
+        assertThat(ledger.lastRunEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isGreaterThan(BOOT_EPOCH_SECONDS);
+        assertThat(ledger.lastSuccessEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isEqualTo(ledger.lastRunEpochSeconds(MedSessionReclaimScheduler.COMPONENT));
+    }
+
+    @Test
+    @DisplayName("a run that stepped aside counts as an attempt but never as a success")
+    void skippedRunAdvancesOnlyTheAttempt() {
+        when(reclaimService.reclaimOnce()).thenReturn(SessionReclaimReport.skipped(3L));
+
+        scheduler.reclaimNow();
+
+        assertThat(ledger.lastRunEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isGreaterThan(BOOT_EPOCH_SECONDS);
+        assertThat(ledger.lastSuccessEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isEqualTo(BOOT_EPOCH_SECONDS);
+    }
+
+    @Test
+    @DisplayName("a failing run is recorded as failed before it is alerted")
+    void failingRunIsRecordedBeforeItIsAlerted() {
+        // The alert chain can be broken by the very incident that breaks the job (D43: every sink failing at
+        // once), and the attempt timestamp is then the only evidence left that the reclaim is still being
+        // attempted. Hence the order, asserted rather than commented.
+        MedJobRunLedger spiedLedger =
+                spy(new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC)));
+        MedSessionReclaimScheduler schedulerWithSpy =
+                new MedSessionReclaimScheduler(reclaimService, notifierProvider, spiedLedger,
+                        Duration.ofHours(12));
+        when(reclaimService.reclaimOnce()).thenThrow(new IllegalStateException("boom"));
+
+        assertThat(schedulerWithSpy.reclaimNow()).isEmpty();
+
+        InOrder order = inOrder(spiedLedger, notifier);
+        order.verify(spiedLedger).record(any(MedJobRun.class));
+        order.verify(notifier).raise(any(MedAlertSeverity.class), anyString(), anyString(), anyString());
+        assertThat(spiedLedger.lastSuccessEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
+                .isEqualTo(BOOT_EPOCH_SECONDS);
     }
 
     private static SessionReclaimReport report(boolean dryRun, int reclaimed, int skipped, int refused,

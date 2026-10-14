@@ -1,10 +1,12 @@
 package com.med.qa.config;
 
+import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.memory.cache.RedisMessageCache;
 import com.med.qa.memory.lock.SessionLockService;
 import com.med.qa.service.MedSessionRetentionScheduler;
 import com.med.qa.service.MedSessionRetentionService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -193,6 +195,20 @@ class MedSessionRetentionConfigTest {
         assertThat(MedSessionRetentionProperties.LOCK_KEY).isEqualTo("med:lock:session:retention");
     }
 
+    @Test
+    @DisplayName("the interval the ledger publishes is the bound check-interval, not the placeholder fallback")
+    void theLedgerPublishesTheBoundInterval() {
+        // The stall rule derives its threshold from the value the ledger publishes, so a drifted property
+        // key would be doubly wrong: the scheduler would fire on the annotation's literal fallback while the
+        // rule was tuned to something else. Passing an explicit value proves the ledger reads the bound
+        // property rather than its own default.
+        runner.withPropertyValues(PREFIX + ".enabled=true", PREFIX + ".check-interval=45m")
+                .run(context -> assertThat(
+                        context.getBean(MedJobRunLedger.class)
+                                .expectedIntervalSeconds(MedSessionRetentionScheduler.COMPONENT))
+                        .isEqualTo(2_700d));
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private static MedSessionRetentionProperties bind() {
@@ -242,6 +258,15 @@ class MedSessionRetentionConfigTest {
         @Bean
         RedissonClient redissonClient() {
             return mock(RedissonClient.class);
+        }
+
+        /**
+         * The D53 run ledger the scheduler records into. Built for real over a plain registry: what the
+         * wiring test asserts is the meter the ledger publishes, so a mock would assert nothing.
+         */
+        @Bean
+        MedJobRunLedger medJobRunLedger() {
+            return new MedJobRunLedger(new SimpleMeterRegistry());
         }
     }
 }

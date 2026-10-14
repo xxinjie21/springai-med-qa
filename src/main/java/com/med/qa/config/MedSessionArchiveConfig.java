@@ -1,6 +1,7 @@
 package com.med.qa.config;
 
 import com.med.qa.alert.MedAlertNotifier;
+import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
 import com.med.qa.mapper.SessionArchiveMapper;
@@ -86,14 +87,26 @@ public class MedSessionArchiveConfig {
      * <p>The notifier arrives as an {@link ObjectProvider} because {@code med.alert.enabled=false}
      * removes it; the scheduler then still exports and simply has nowhere to push.</p>
      *
+     * <p>The ledger arrives as a required dependency, and the {@code check-interval} is handed over
+     * explicitly. Both matter for the same reason: the {@code @Scheduled} placeholder carries a literal
+     * fallback ({@code :6h}), so a drifted property key would leave the scheduler firing on the fallback
+     * while the ledger published a different interval -- and the stall rule, which is derived from the
+     * published value, would then be tuned to a schedule the job does not actually run on. Passing the
+     * bound property in makes the two read the same source.</p>
+     *
      * @param exportService the export this scheduler drives
      * @param notifier      provider of the alert dispatcher
+     * @param ledger        the run ledger the scheduler records into
+     * @param properties    the {@code med.session.archive.*} policy, source of the check interval
      * @return the scheduler
      */
     @Bean(SCHEDULER)
     public MedSessionArchiveExportScheduler medSessionArchiveExportScheduler(
             MedSessionArchiveExportService exportService,
-            ObjectProvider<MedAlertNotifier> notifier) {
-        return new MedSessionArchiveExportScheduler(exportService, notifier);
+            ObjectProvider<MedAlertNotifier> notifier,
+            MedJobRunLedger ledger,
+            MedSessionArchiveProperties properties) {
+        return new MedSessionArchiveExportScheduler(exportService, notifier, ledger,
+                properties.getCheckInterval());
     }
 }

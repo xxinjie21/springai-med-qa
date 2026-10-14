@@ -385,6 +385,40 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D53 job run ledger, the two rules and how to triage a stall")
+    void backgroundJobLedgerIsDocumented() {
+        // The operator-facing half of D53. The chapter has to say what no earlier chapter could - that a
+        // stopped job and an idle hospital are byte-identical - and it has to separate the two rules an
+        // operator will otherwise collapse into one: a per-instance stall is a dead scheduler, while a
+        // cluster-wide stall with growing `skipped_lock_held` is a leaked `med:lock:session:*` key, and
+        // the two have opposite first responses. It also has to record the reserved-label trap, since a
+        // reader who "fixes" the selector back to `job=~"session-.*"` recreates the silent failure.
+        assertThat(handbook).contains("7.14");
+        assertThat(handbook).contains("（D53）");
+        // The heading is asserted whole, and the metric names separately: `7.14` appears elsewhere in the
+        // handbook, and `MedJobRunLedger` is a substring of the guard-test class name, so either alone
+        // would stay green with the chapter deleted.
+        assertThat(handbook).contains("### 7.14 后台作业的运行账本与停摆检测（D53）");
+        assertThat(handbook).contains("med_qa_job_last_run_epoch_seconds");
+        assertThat(handbook).contains("med_qa_job_last_success_epoch_seconds");
+        assertThat(handbook).contains("med_qa_job_expected_interval_seconds");
+        assertThat(handbook).contains("med_qa_job_runs_total");
+        assertThat(handbook).contains("MedQaBackgroundJobStalled");
+        assertThat(handbook).contains("MedQaBackgroundJobNotCompleting");
+        assertThat(handbook).contains("SKIPPED_LOCK_HELD");
+        assertThat(handbook).contains("honor_labels");
+        assertThat(handbook).contains("med:lock:session:");
+        assertThat(handbook).contains("MedJobRunLedger");
+        assertThat(handbook).contains("MedJobRunLedgerTest");
+        assertThat(handbook).contains("MedJobObservabilityConfigTest");
+        // The third false claim D53 retracts: §7.4 used to describe the last-alert gauge as a
+        // dead-man's switch, and no such rule ever existed. Pinned by the correction's own marker rather
+        // than a `doesNotContain` on the retracted sentence, because the correction necessarily quotes
+        // that sentence - a `doesNotContain` would fail on the correction itself.
+        assertThat(handbook).contains("它不是 dead-man's switch（D53 修正）");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

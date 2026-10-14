@@ -269,6 +269,63 @@ groups:
             exist.
           runbook: "docs/DEPLOYMENT.md#713-孤儿冷副本回收d52"
 
+      - alert: MedQaBackgroundJobStalled
+        # D53. Every other rule in this file is produced BY the component it watches, so none of them can
+        # report that the component stopped running: a maintenance job that never fires emits no failure
+        # alert and no completion notice, which is why "healthy and idle" and "dead since March" had
+        # identical observability for four iterations. This rule is the other kind of signal - it fires on
+        # the ABSENCE of data, which no dead job can suppress. med_qa_job_last_run_epoch_seconds advances on
+        # every attempt, including the ones that step aside for another replica, so it answers exactly one
+        # question: is this pod's scheduler still evaluating? The threshold is derived from
+        # med_qa_job_expected_interval_seconds, which the application publishes from the same check-interval
+        # it arms the job with, so slowing a job down does not mean editing this file. A job that is
+        # deliberately switched off publishes no series at all and can never reach this rule.
+        expr: >-
+          time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*"}
+          > 2.5 * med_qa_job_expected_interval_seconds{component=~"session-.*"} + 300
+        for: 15m
+        labels:
+          severity: warning
+          component: "{{ $labels.component }}"
+        annotations:
+          summary: "Background job {{ $labels.component }} is not being attempted on {{ $labels.instance }}"
+          description: >-
+            No attempt has been recorded for {{ $labels.component }} on this instance for more than 2.5
+            times its configured check-interval plus five minutes. The scheduler thread is gone, or the
+            timer never fired. This is per-instance and therefore a warning: on a multi-replica deployment
+            the work may still be happening elsewhere, and MedQaBackgroundJobNotCompleting is the rule that
+            pages when it is not. A pod that restarts more often than this threshold resets its own clock
+            and can hide behind it - pair this with an alert on the restart rate.
+          runbook: "docs/DEPLOYMENT.md#714-后台作业的运行账本与停摆检测d53"
+
+      - alert: MedQaBackgroundJobNotCompleting
+        # D53. A different question from the rule above: not "is this pod's scheduler alive" but "is anybody
+        # actually doing the work". last_run advances on every attempt, including the ones that lose the
+        # cluster mutex, so it stays perfectly fresh while a leaked med:lock:session:* key turns all four
+        # jobs into permanent no-ops - a failure mode no per-instance signal can see. last_success only
+        # advances when a run really performed its passes, and its cluster-wide maximum is therefore the
+        # only thing that catches that, or a job whose every run throws. This one pages rather than warns,
+        # precisely because it is produced by the absence of data: no alert the job itself emits can cover a
+        # job that emits nothing.
+        expr: >-
+          time() - max by (component) (med_qa_job_last_success_epoch_seconds{component=~"session-.*"})
+          > 2.5 * max by (component) (med_qa_job_expected_interval_seconds{component=~"session-.*"}) + 300
+        for: 15m
+        labels:
+          severity: critical
+          component: "{{ $labels.component }}"
+        annotations:
+          summary: "No replica has completed a run of {{ $labels.component }}"
+          description: >-
+            No replica has completed a run of {{ $labels.component }} for more than 2.5 times its configured
+            check-interval plus five minutes. Every run is failing, every run is losing the cluster mutex
+            (look for a med:lock:session:* key left behind by a replica that was killed while holding it),
+            or every replica's scheduler is down - MedQaBackgroundJobStalled tells those apart per instance.
+            Use med_qa_job_runs_total{component="{{ $labels.component }}"} to see which outcome dominates.
+            Nothing has been lost yet, but the guarantee this job exists for has stopped holding, and this
+            rule is the only thing that will say so.
+          runbook: "docs/DEPLOYMENT.md#714-后台作业的运行账本与停摆检测d53"
+
       - alert: MedQaAlertStorm
         # A burst of alerts is usually a symptom of a deeper problem (or of a mis-tuned rule) and
         # would otherwise drown the on-call engineer.

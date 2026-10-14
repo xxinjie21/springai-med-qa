@@ -700,6 +700,70 @@ dry-run 静默），以及 `MedStorageAndLockIntegrationTest` 在真实 MySQL + 
 （`candidateQueryRequiresEveryPredicate`、`countMatchesTheSelection`），其余 5 条全绿；两处还原后重跑全绿。
 新增的四个文档/告警守卫同样被看过变红：删掉三份文档里的小节标题、把配置前缀与告警名改名，四个套件各红一条。
 
+#### 后台作业的运行账本与停摆检测（D53）
+
+**补上的是一条结构性缺口，而不是一个功能。** D47 / D48 / D50 / D52 的四份文档都写着同一句话——「作业停了与医院没有
+可清理的会话外观完全一样」——但四个作业**没有任何东西能回答「它上一次运行是什么时候」**：告警只在**失败**时发
+（`-failed`），或在**真的做了事**时发（`-completed` INFO，安静的一夜什么都不发）。于是「作业健康且无事可做」与
+「作业在三个月前就死了」的可观测面完全相同：零告警、零指标、零日志。
+
+更根本的一条：**依赖作业运行才能产生的告警，永远无法发现作业没有运行**。四个 `-failed` 规则全部由作业自己发出，
+所以它们对「作业整个停了」这一类故障结构性失明。
+
+唯一沾边的既有信号是 `med_qa_alert_last_epoch_seconds`，而它的 javadoc、`docs/DEPLOYMENT.md` §7.4 与英文 README
+都写着它「可用于 dead-man's-switch 规则」——**但这条规则从来不存在**，而且这个 gauge 的语义也做不到：它度量的是
+「上次**告警**是什么时候」，而死信开关要回答的是「上次**评估**是什么时候」。一个运行正常的医院**不产生告警**，基于
+它的开关会为一次正确的部署永久误报。这是阶段 8–12 那类偏差的第 7 次出现（**注释承诺了代码没有的行为**），也是本
+项目第一次出现「**承诺的守卫在文件里连一行都没有**」的形态——前六次至少有一个写好了但没被调用的组件。三处错误承诺
+在 D53 一并修正。
+
+`MedJobRunLedger`（新包 `com.med.qa.job`）是四个作业共用的一份运行账本：每个作业在**装配时**注册一次（幂等），
+此后每次运行——**无论跑完、被互斥挡下还是抛异常**——都记一条。它发布四个 Micrometer 计量：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `med_qa_job_last_run_epoch_seconds{component}` | gauge | 最近一次**尝试**的墙钟秒；**每种结局都刷新**，包括抢不到锁而让位的那些 |
+| `med_qa_job_last_success_epoch_seconds{component}` | gauge | 最近一次**真正跑完 passes** 的墙钟秒；只有 `COMPLETED` 刷新 |
+| `med_qa_job_expected_interval_seconds{component}` | gauge | 该作业被装配时的 `check-interval`（秒）——**规则拿它当阈值**，所以改配置不需要改规则 |
+| `med_qa_job_runs_total{component,outcome}` | counter | 按结局计数的运行次数，`outcome` ∈ `COMPLETED` / `SKIPPED_LOCK_HELD` / `FAILED` |
+
+**两条规则问的是两个不同的问题**：`MedQaBackgroundJobStalled`（warning，**按实例**，`time() - last_run > 2.5 ×
+interval + 300`，`for: 15m`）回答「**这个 Pod 的调度线程是不是停了**」；`MedQaBackgroundJobNotCompleting`
+（**critical**，**按集群** `max by (component)`，同一阈值）回答「**有没有任何副本真的在干活**」。**为什么必须分开**：
+`last_run` 在 `SKIPPED_LOCK_HELD` 时也会刷新（抢不到锁是互斥在工作，不是实例停摆），所以一个**被泄漏的
+`med:lock:session:*` 键**会让某个副本永久占着互斥，其余副本每轮都记 `SKIPPED_LOCK_HELD`——`last_run` 看起来完全
+新鲜、四个作业却全部变成空转。只有 `last_success` 的**集群最大值**能发现它。`MedQaBackgroundJobNotCompleting` 因此
+page：它是唯一一条**由数据的缺席产生**的信号，作业自己发出的任何告警都覆盖不了「作业什么都没发出」这种情况。
+
+其余工程取舍：
+
+- **标签叫 `component` 而不是 `job`**。Prometheus 把 `job` / `instance` 保留给抓取目标，默认 `honor_labels: false`
+  下被采集指标里的同名标签会被改名成 `exported_job`，于是 `job=~"session-.*"` 的规则会**解析成功、采集成功、永远
+  不匹配任何数据**——正是 D53 要消灭的那类静默失效。复用 `component` 还让选择器与 `med_qa_alert_total` 用同一套
+  子系统命名，一块面板同时覆盖两者。
+- **两个时间戳从注册那一刻起算**（不是 0）：刚启动的实例还没跑过任何一次，从 0 起算会让每条比较 `time()` 的规则在
+  每次重启后的整个 `initial-delay` 里误报。代价是「一直没跑完」要等 2.5 个间隔才被报出来，与「调度器整个停了」
+  同一个阈值。
+- **注册的幂等是契约而不是优化**：第二次注册不得重置时间戳，否则「重新注册一次」就成了让停摆作业看起来活着的开关。
+- **作业被关掉时不发布任何序列**，规则落空、不告警：**「故意关闭」是运维决策，不该被 page**。
+- **账本自身没有任何开关**：它是「作业没跑」的唯一证据来源，能关掉它等于一次性关掉四个作业的可观测性。
+- **两个告警监控器（`MedStorageAlertMonitor` / `MedVectorIndexAlertMonitor`）不在范围内**：它们的存活是个先有鸡还是
+  先有蛋的问题——告警链无法报告自己的生产者已死——只能由 `MedQaTargetDown` 在进程层面覆盖。这是**刻意的范围边界**，
+  写进文档而不是留给读者猜。
+- **看不见重启频率高于阈值的 Pod**：进程内心跳的固有边界，由 `up` 抖动加 `MedQaTargetDown` 覆盖。要一条抗崩溃循环的
+  死信开关，只能把心跳落到进程之外。
+
+守护测试：`MedJobRunLedgerTest`（注册幂等且**不重置**时间戳、两个时间戳在注册时都等于当前时刻——「重启后不误报」的
+可执行版本、`SKIPPED_LOCK_HELD` 只刷新 `last_run`、`FAILED` 只刷新 `last_run`、三种结局各自计数、未注册的作业记录
+直接拒绝、两个作业的标签互不串扰）、`MedJobRunTest`、`MedJobObservabilityConfigTest`（**四个作业全关时账本仍在**）、
+四个 `*SchedulerTest`（三种结局分别记进账本，且抛异常时账本**先于**告警——用 `InOrder` 断言，因为告警链自己挂掉时不能
+再把「作业跑过」这条唯一证据一起丢掉）、四个 `*ConfigTest`（**账本发布的 `expected-interval` 与 `@Scheduled` 占位符
+读到的是同一个 `check-interval`**，占位符的字面回退一旦生效就会在这里变红）、`AlertingStackConfigTest`（规则里出现的
+每个 `med_qa_job_*` 名字都必须属于 `MedJobRunLedger` 的常量、三个 gauge 必须都被引用、选择器必须匹配四个作业的
+component 且**不匹配**两个监控器的、抓取配置不得打开 `honor_labels`）。按项目惯例，新守卫**先被亲眼看过它变红**：
+把账本改成只在 `COMPLETED` 时刷新 `last_run`、把注册改成每次都重置时间戳、把英文 README 的小节标题删掉，三处各让
+对应用例变红，还原后重跑全绿。
+
 ---
 
 ## 错误码

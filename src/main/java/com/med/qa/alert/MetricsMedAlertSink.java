@@ -18,9 +18,20 @@ import java.util.concurrent.atomic.AtomicLong;
  *       {@code increase(med_qa_alert_total{code="storage-down"}[5m])} while a dashboard can still
  *       break the same series down by component;</li>
  *   <li>{@value #LAST_ALERT_GAUGE} -- the epoch second of the most recent alert, which makes
- *       "how long has this instance been quiet?" a single query and lets a dead-man's-switch rule
- *       detect a pod that stopped evaluating entirely.</li>
+ *       "how long has this instance been quiet?" a single query.</li>
  * </ul>
+ *
+ * <h2>{@value #LAST_ALERT_GAUGE} is not a dead-man's switch</h2>
+ * <p>Until D53 this javadoc, {@code docs/DEPLOYMENT.md} and {@code README.en.md} all claimed the gauge
+ * was "usable for a dead-man's-switch rule". No such rule ever existed, and the claim was wrong on its
+ * merits as well: the gauge answers "when did this instance last <em>alert</em>", while a dead-man's
+ * switch has to answer "when did this instance last <em>evaluate</em>". A healthy hospital produces no
+ * alerts, so a switch built on this gauge would fire for the entire life of a correct deployment; and
+ * the four maintenance jobs deliberately stay silent when they have nothing to do, so an idle job and a
+ * dead one are indistinguishable here. The signal that can answer the second question is the
+ * <em>absence</em> of data rather than an event, and it lives in {@code com.med.qa.job.MedJobRunLedger}
+ * (D53), whose {@code med_qa_job_last_run_epoch_seconds} / {@code med_qa_job_last_success_epoch_seconds}
+ * gauges back the {@code MedQaBackgroundJobStalled} and {@code MedQaBackgroundJobNotCompleting} rules.</p>
  *
  * <p>The counter's cardinality is bounded by the number of distinct rules times the number of
  * components -- both are small, hand-written sets, not user input, so no label explosion is

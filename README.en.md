@@ -849,6 +849,89 @@ were restored and re-run green. The four new documentation and alert guards were
 way: deleting the chapter heading from each of the three documents and renaming the configuration prefix and
 the alert turned one case in each of the four suites red.
 
+#### Background job run ledger and stall detection (D53)
+
+**What this closes is a structural blind spot, not a missing feature.** The chapters for D47, D48, D50 and
+D52 all make the same argument -- "a job that stopped running looks exactly like a hospital with nothing to
+clean up" -- yet none of the four jobs could answer "when did it last run". Their alerts fire only on
+**failure** (`-failed`) or when they **actually did something** (`-completed` INFO, and a quiet night emits
+nothing at all), so "healthy and idle" and "dead since March" had identical observability: no alert, no
+metric, no log line.
+
+The deeper point: **an alert that depends on the job running can never detect that the job is not running.**
+All four `-failed` rules are produced by the job itself, which makes them structurally blind to the job
+being gone entirely.
+
+The only adjacent signal was `med_qa_alert_last_epoch_seconds`, and its javadoc, `docs/DEPLOYMENT.md` §7.4
+and this README all claimed it was "usable for a dead-man's-switch rule" -- **no such rule ever existed**,
+and the meter cannot do the job either: it measures "when did we last *alert*", while a dead-man's switch has
+to measure "when did the instance last *evaluate*". A healthy hospital produces no alerts, so a switch built
+on it would fire for the entire life of a correct deployment. This is the seventh instance of the D8-D12
+defect class (a comment promising behaviour no code provides), and the first where the promised guard did not
+exist in any form at all. All three false claims were corrected in D53.
+
+`MedJobRunLedger` (new package `com.med.qa.job`) is one ledger shared by all four jobs: each registers itself
+once at assembly time (idempotently) and records one entry per run -- **whether it completed, stepped aside
+for another replica or threw**. It publishes four Micrometer meters:
+
+| Meter | Type | Meaning |
+|---|---|---|
+| `med_qa_job_last_run_epoch_seconds{component}` | gauge | epoch second of the most recent **attempt**; refreshed for **every** outcome, including the ones that step aside for the mutex |
+| `med_qa_job_last_success_epoch_seconds{component}` | gauge | epoch second of the most recent run that **really performed its passes**; only `COMPLETED` refreshes it |
+| `med_qa_job_expected_interval_seconds{component}` | gauge | the `check-interval` the job was armed with, in seconds -- **the rules use it as their threshold**, so slowing a job down does not mean editing the rule file |
+| `med_qa_job_runs_total{component,outcome}` | counter | run count by outcome, `outcome` ∈ `COMPLETED` / `SKIPPED_LOCK_HELD` / `FAILED` |
+
+**The two rules ask two different questions.** `MedQaBackgroundJobStalled` (warning, **per instance**,
+`time() - last_run > 2.5 × interval + 300`, `for: 15m`) answers "**is this pod's scheduler still
+evaluating**"; `MedQaBackgroundJobNotCompleting` (**critical**, **cluster-wide** `max by (component)`, same
+threshold) answers "**is anybody actually doing the work**". They cannot be merged: `last_run` also advances
+on `SKIPPED_LOCK_HELD` (losing the mutex is the mutex working, not an instance being stalled), so a **leaked
+`med:lock:session:*` key** keeps one replica holding the lock forever while the others record
+`SKIPPED_LOCK_HELD` every cycle -- `last_run` stays perfectly fresh while all four jobs become permanent
+no-ops. Only the cluster-wide maximum of `last_success` catches that, which is why
+`MedQaBackgroundJobNotCompleting` pages: it is the one signal produced by the *absence* of data, and no alert
+a job emits can cover a job that emits nothing.
+
+Other engineering trade-offs:
+
+- **The label is `component`, not `job`.** Prometheus reserves `job` / `instance` for the scrape target, and
+  with the default `honor_labels: false` a scraped label with one of those names is renamed to
+  `exported_job` while the target's own value takes its place -- so a rule selecting `job=~"session-.*"`
+  would parse, scrape and match nothing at all, which is exactly the silent-failure shape D53 exists to
+  remove. Reusing `component` also gives the selector the same subsystem vocabulary as
+  `med_qa_alert_total`.
+- **Both timestamps start at the registration instant, not at zero.** A freshly started instance has not run
+  anything yet, and starting at the epoch would make every rule comparing against `time()` fire for the whole
+  `initial-delay` after every restart. The cost is that a job which never completes is reported after 2.5
+  intervals rather than immediately -- the same threshold a job whose scheduler never fires gets.
+- **Idempotent registration is a contract, not an optimisation**: a second registration must not re-seed the
+  timestamps, otherwise "register it again" would be a way to make a stalled job look alive.
+- **A job that is switched off publishes no series at all**, so the rules select nothing and never fire:
+  **"deliberately disabled" is an operator decision and must not be paged.**
+- **The ledger has no switch of its own**: it is the only evidence that a job did not run.
+- **The two alert monitors (`MedStorageAlertMonitor` / `MedVectorIndexAlertMonitor`) are out of scope.** Their
+  liveness is a chicken-and-egg problem -- the alert chain cannot report that its own producer died -- and the
+  process-level `MedQaTargetDown` rule covers it. That boundary is documented rather than left to a reader.
+- **A pod that restarts more often than the threshold is invisible here.** That is inherent to an in-process
+  heartbeat and is covered by `up` flapping plus `MedQaTargetDown`; a crash-loop-proof switch would need a
+  heartbeat that lives outside the process.
+
+Guard tests: `MedJobRunLedgerTest` (registration is idempotent and does **not** re-seed the timestamps, both
+timestamps equal the registration instant -- the executable form of "a restart does not page",
+`SKIPPED_LOCK_HELD` refreshes only `last_run`, `FAILED` refreshes only `last_run`, each outcome is counted,
+recording for an unregistered job is refused outright, and two jobs never bleed into each other's tags),
+`MedJobRunTest`, `MedJobObservabilityConfigTest` (**the ledger is still there with all four jobs switched
+off**), the four `*SchedulerTest` suites (each outcome reaches the ledger, and on a failure the ledger is
+written **before** the alert is raised, asserted with `InOrder` -- a broken alert chain must not take the
+only remaining evidence with it), the four `*ConfigTest` suites (**the interval the ledger publishes and the
+one the `@Scheduled` placeholder reads are the same `check-interval`**; a literal fallback taking over turns
+that red), and `AlertingStackConfigTest` (every `med_qa_job_*` name in the rules must be a `MedJobRunLedger`
+constant, all three gauges must be referenced, the selector must match the four jobs' components and **not**
+the two monitors', and the scrape config must not enable `honor_labels`). As the project's convention
+requires, the new guards were **watched to go red**: refreshing `last_run` only on `COMPLETED`, re-seeding
+the timestamps on every registration, and deleting this chapter's heading each turned the corresponding cases
+red, and all three were restored and re-run green.
+
 ---
 
 ## Error codes
@@ -1270,8 +1353,14 @@ docker compose --profile observability up -d
 > pushed to a phone.
 
 Custom meters: `med_qa_alert_total{severity,code,component}` (counter) and
-`med_qa_alert_last_epoch_seconds` (timestamp of the most recent alert, usable for a dead-man's-switch
-rule).
+`med_qa_alert_last_epoch_seconds` (timestamp of the most recent alert).
+
+> **That second meter is not a dead-man's switch (corrected in D53).** This paragraph used to say it was
+> "usable for a dead-man's-switch rule". No such rule ever existed, and the claim was wrong on its merits
+> too: the meter answers "when did this instance last *alert*", while a dead-man's switch has to answer
+> "when did this instance last *evaluate*". A healthy hospital produces no alerts, so a switch built on it
+> would fire for the entire life of a correct deployment, and the four maintenance jobs deliberately stay
+> silent when they have nothing to do. The real switch is described below.
 
 > **A profile replaces a list property, it does not merge it (D40).** Spring Boot overwrites a list
 > value wholesale when a profile re-declares it, and both the `Dockerfile` and `docker-compose.yml`

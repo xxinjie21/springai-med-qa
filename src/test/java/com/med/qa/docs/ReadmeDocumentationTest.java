@@ -528,6 +528,31 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D53 job run ledger, the two rules and the reserved-label trap")
+    void apiChapterDocumentsTheD53JobLedger() {
+        // The README has to name the structural blind spot D53 closes: every rule before it was emitted
+        // *by* the job, so a job that stopped running produced no alert, no metric and no log line - and
+        // the docs' own claim that a stopped job is indistinguishable from an idle hospital was, until
+        // D53, literally true. It also has to admit the second correction: the last-alert gauge was
+        // described as a dead-man's switch that no rule ever read. The `component`-not-`job` paragraph is
+        // the part a reader would otherwise re-break, so it is asserted directly.
+        assertThat(readme).contains("（D53）");
+        // The heading pins the iteration marker to the section itself: a bare "（D53）" would be satisfied
+        // by the roadmap row, so deleting the whole chapter would not turn this red.
+        assertThat(readme).contains("#### 后台作业的运行账本与停摆检测（D53）");
+        assertThat(readme).contains("MedJobRunLedger");
+        assertThat(readme).contains("med_qa_job_last_run_epoch_seconds");
+        assertThat(readme).contains("med_qa_job_last_success_epoch_seconds");
+        assertThat(readme).contains("med_qa_job_expected_interval_seconds");
+        assertThat(readme).contains("med_qa_job_runs_total");
+        assertThat(readme).contains("MedQaBackgroundJobStalled");
+        assertThat(readme).contains("MedQaBackgroundJobNotCompleting");
+        assertThat(readme).contains("SKIPPED_LOCK_HELD");
+        assertThat(readme).contains("honor_labels");
+        assertThat(readme).contains("MedJobRunLedgerTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

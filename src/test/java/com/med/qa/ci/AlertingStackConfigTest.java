@@ -1,5 +1,10 @@
 package com.med.qa.ci;
 
+import com.med.qa.job.MedJobRunLedger;
+import com.med.qa.service.MedSessionArchiveExportScheduler;
+import com.med.qa.service.MedSessionPurgeScheduler;
+import com.med.qa.service.MedSessionReclaimScheduler;
+import com.med.qa.service.MedSessionRetentionScheduler;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -11,6 +16,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -63,6 +70,27 @@ class AlertingStackConfigTest {
 
     private static String read(String relative) throws IOException {
         return Files.readString(root.resolve(relative));
+    }
+
+    /**
+     * Looks one rule up by alert name.
+     *
+     * <p>Asserting on the parsed rule rather than on a substring of the file is what keeps a guard from
+     * being satisfied by an unrelated rule: {@code contains("severity: critical")} would pass for any of the
+     * eight rules that page, which is exactly the "guard that cannot fail" shape this project keeps finding.
+     *
+     * @param alertName the {@code alert:} value to look for
+     * @return the rule mapping
+     * @throws AssertionError when no rule carries that name
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> rule(String alertName) {
+        List<Map<String, Object>> groups = (List<Map<String, Object>>) alertRules.get("groups");
+        return groups.stream()
+                .flatMap(group -> ((List<Map<String, Object>>) group.get("rules")).stream())
+                .filter(candidate -> alertName.equals(candidate.get("alert")))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no rule named " + alertName));
     }
 
     // ---------------------------------------------------------------- compose wiring
@@ -228,6 +256,8 @@ class AlertingStackConfigTest {
                 "MedQaSessionPurgeRefused",
                 "MedQaSessionReclaimFailed",
                 "MedQaSessionReclaimRefused",
+                "MedQaBackgroundJobStalled",
+                "MedQaBackgroundJobNotCompleting",
                 "MedQaAlertStorm",
                 "MedQaHighServerErrorRate",
                 "MedQaConsultationLatencyHigh",
@@ -486,6 +516,103 @@ class AlertingStackConfigTest {
         // would only postpone the release of space. The absence is the contract, so it is asserted.
         assertThat(applicationYml).doesNotContain("MED_SESSION_RECLAIM_MIN_ARCHIVED_AGE");
         assertThat(applicationYml).doesNotContain("MED_SESSION_RECLAIM_MIN_ORPHAN_AGE");
+    }
+
+    @Test
+    @DisplayName("the D53 job-liveness rules select exactly the meters the ledger publishes")
+    void jobLivenessRulesSelectTheLedgerMeters() throws IOException {
+        // The ledger and the rule file are two files that have to agree on a vocabulary of metric names. A
+        // drifted name leaves a rule that parses, scrapes and never fires -- and the failure it exists for (a
+        // job that stopped running) is precisely the one that produces no other symptom at all.
+        Set<String> referenced = new TreeSet<>();
+        Matcher matcher = Pattern.compile("med_qa_job_[a-z_]+").matcher(read(ALERT_RULES));
+        while (matcher.find()) {
+            referenced.add(matcher.group());
+        }
+        Set<String> published = Set.of(
+                MedJobRunLedger.LAST_RUN_GAUGE,
+                MedJobRunLedger.LAST_SUCCESS_GAUGE,
+                MedJobRunLedger.EXPECTED_INTERVAL_GAUGE,
+                MedJobRunLedger.RUNS_COUNTER);
+
+        assertThat(referenced)
+                .as("every med_qa_job_* name in the rules must be one the ledger really publishes")
+                .isSubsetOf(published);
+        assertThat(referenced)
+                .as("the two rules need all three gauges: the attempt, the completion, and the interval "
+                        + "that sizes the threshold")
+                .contains(MedJobRunLedger.LAST_RUN_GAUGE, MedJobRunLedger.LAST_SUCCESS_GAUGE,
+                        MedJobRunLedger.EXPECTED_INTERVAL_GAUGE);
+    }
+
+    @Test
+    @DisplayName("the job-liveness selector covers the four maintenance jobs and not the alert monitors")
+    void jobLivenessSelectorCoversTheMaintenanceJobs() throws IOException {
+        // D53 deliberately leaves the two alert monitors out: their liveness is a chicken-and-egg problem --
+        // the alert chain cannot report that its own producer died -- and MedQaTargetDown covers it at the
+        // process level. Asserting the selector keeps that boundary from being a comment nobody checks.
+        String selector = "session-.*";
+        assertThat(List.of(
+                MedSessionRetentionScheduler.COMPONENT,
+                MedSessionArchiveExportScheduler.COMPONENT,
+                MedSessionPurgeScheduler.COMPONENT,
+                MedSessionReclaimScheduler.COMPONENT))
+                .allSatisfy(component -> assertThat(Pattern.matches(selector, component)).isTrue());
+        assertThat(Pattern.matches(selector, "storage")).isFalse();
+        assertThat(Pattern.matches(selector, "vector-index")).isFalse();
+        assertThat(read(ALERT_RULES)).contains("component=~\"" + selector + "\"");
+    }
+
+    @Test
+    @DisplayName("the job-liveness selector avoids the label Prometheus reserves for the scrape target")
+    void jobLivenessSelectorAvoidsTheReservedJobLabel() throws IOException {
+        // With the default honor_labels: false a scraped label called `job` is renamed to exported_job and
+        // the target's own job name takes its place, so a rule selecting job=~"session-.*" would parse,
+        // scrape and match nothing at all -- the exact silent-failure shape D53 exists to remove. Both halves
+        // of that contract are pinned: the tag the ledger publishes, and the scrape config's label handling.
+        assertThat(MedJobRunLedger.COMPONENT_TAG).isEqualTo("component");
+        assertThat(read(PROMETHEUS_CONFIG)).doesNotContain("honor_labels");
+        assertThat(read(ALERT_RULES)).doesNotContain("job=~\"session-");
+    }
+
+    @Test
+    @DisplayName("the D53 rules split the per-instance question from the cluster-wide one, and only one pages")
+    @SuppressWarnings("unchecked")
+    void jobLivenessRulesAskTwoDifferentQuestions() {
+        Map<String, Object> stalled = rule("MedQaBackgroundJobStalled");
+        Map<String, Object> notCompleting = rule("MedQaBackgroundJobNotCompleting");
+
+        // Per instance, on the attempt stamp: "is this pod's scheduler still evaluating". It must not
+        // aggregate, or a single dead scheduler would be averaged away by its healthy peers.
+        assertThat((String) stalled.get("expr"))
+                .contains(MedJobRunLedger.LAST_RUN_GAUGE)
+                .contains(MedJobRunLedger.EXPECTED_INTERVAL_GAUGE)
+                .doesNotContain("max by");
+        assertThat((String) ((Map<String, Object>) stalled.get("labels")).get("severity"))
+                .as("a per-instance stall is a warning: on a multi-replica deployment the work may still "
+                        + "be happening elsewhere")
+                .isEqualTo("warning");
+
+        // Cluster wide, on the completion stamp: "is anybody actually doing the work". The aggregation is
+        // the whole point -- it is the only thing that catches a leaked cluster mutex, where last_run stays
+        // fresh on every replica while nothing ever completes.
+        assertThat((String) notCompleting.get("expr"))
+                .contains("max by (component)")
+                .contains(MedJobRunLedger.LAST_SUCCESS_GAUGE)
+                .contains(MedJobRunLedger.EXPECTED_INTERVAL_GAUGE);
+        assertThat((String) ((Map<String, Object>) notCompleting.get("labels")).get("severity"))
+                .as("this one is produced by the absence of data, so no alert the job emits can cover it")
+                .isEqualTo("critical");
+    }
+
+    @Test
+    @DisplayName("the ledger has no switch, so a deployment cannot switch off its own job observability")
+    void theLedgerHasNoSwitch() {
+        // Every other capability in this project is gated by a property; this one must not be, and the
+        // absence is the contract. MedJobObservabilityConfigTest proves the bean survives with all four jobs
+        // switched off.
+        assertThat(applicationYml).doesNotContain("MED_JOB_LEDGER_ENABLED");
+        assertThat(applicationYml).doesNotContain("med.job.enabled");
     }
 
     @Test
