@@ -508,6 +508,27 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D54 cold store gauges and the derivative-free rule")
+    void apiChapterDocumentsTheD54ColdStoreMetrics() {
+        // D53 answers "is the job alive"; D54 is where the English reader learns the job may be alive
+        // and still falling behind. The three separable claims are the two boundaries a reader would
+        // otherwise undo: only a run that was allowed to delete publishes the backlog (publishing a
+        // dry run's non-draining backlog would page the deployments that only measure), and the gauges
+        // are lazily registered with no switch (an eagerly registered zero reads as "the cold store is
+        // empty"). The heading is asserted whole: a bare "D54" is satisfied by the roadmap row.
+        assertThat(english).contains("D54");
+        assertThat(english).contains("#### Cold store size and age reporting (D54)");
+        assertThat(english).contains("med_qa_cold_store_rows");
+        assertThat(english).contains("med_qa_cold_store_oldest_row_age_seconds");
+        assertThat(english).contains("med_qa_cold_store_reclaim_backlog");
+        assertThat(english).contains("MedQaColdStoreBacklogGrowing");
+        assertThat(english).contains("min_over_time");
+        assertThat(english).contains("MedColdStoreMetrics");
+        assertThat(english).contains("MedColdStoreMetricsTest");
+        assertThat(english).contains("MedColdStoreMetricsConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

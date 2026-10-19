@@ -1,5 +1,6 @@
 package com.med.qa.ci;
 
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.service.MedSessionArchiveExportScheduler;
 import com.med.qa.service.MedSessionPurgeScheduler;
@@ -256,6 +257,7 @@ class AlertingStackConfigTest {
                 "MedQaSessionPurgeRefused",
                 "MedQaSessionReclaimFailed",
                 "MedQaSessionReclaimRefused",
+                "MedQaColdStoreBacklogGrowing",
                 "MedQaBackgroundJobStalled",
                 "MedQaBackgroundJobNotCompleting",
                 "MedQaAlertStorm",
@@ -543,6 +545,53 @@ class AlertingStackConfigTest {
                         + "that sizes the threshold")
                 .contains(MedJobRunLedger.LAST_RUN_GAUGE, MedJobRunLedger.LAST_SUCCESS_GAUGE,
                         MedJobRunLedger.EXPECTED_INTERVAL_GAUGE);
+    }
+
+    @Test
+    @DisplayName("the D54 cold-store rule selects exactly the gauges the publisher publishes")
+    void coldStoreRuleSelectsThePublishedGauges() throws IOException {
+        // Same drift trap as the job-liveness rules: a renamed gauge leaves a rule that parses, scrapes
+        // and never fires - and the failure it exists for (a cold store that quietly outgrows its reclaim)
+        // produces no other symptom at all. The names are cross-checked against the constants rather
+        // than against each other's literals.
+        Set<String> referenced = new TreeSet<>();
+        Matcher matcher = Pattern.compile("med_qa_cold_store_[a-z_]+").matcher(read(ALERT_RULES));
+        while (matcher.find()) {
+            referenced.add(matcher.group());
+        }
+        Set<String> published = Set.of(
+                MedColdStoreMetrics.ROWS_GAUGE,
+                MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE,
+                MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE);
+
+        assertThat(referenced)
+                .as("every med_qa_cold_store_* name in the rules must be one MedColdStoreMetrics "
+                        + "really publishes")
+                .isSubsetOf(published);
+        assertThat(referenced)
+                .as("the backlog rule is the only D54 rule, so it must consume the backlog gauge")
+                .contains(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE);
+        // Which series the rule consumes is the whole safety story: the backlog is published only by a
+        // run that was allowed to delete, so a dry-run deployment publishes no such series and cannot be
+        // paged for a backlog it is not allowed to drain.
+        assertThat(read(ALERT_RULES)).contains("med_qa_cold_store_reclaim_backlog[24h]");
+    }
+
+    @Test
+    @DisplayName("the D54 rule reads the backlog as 'never reached zero', not as a derivative")
+    void coldStoreBacklogRuleIsDerivativeFree() {
+        // A healthy drain reads 0 on every sample, and deriv over a step-wise, sparsely sampled gauge
+        // adds a failure mode (needs two points in the window, sensitive to spacing) without adding a
+        // question. min_over_time[24h] > 0 is exactly "the backlog existed the whole time and never
+        // cleared", and it degrades to "no data" rather than to a wrong verdict when samples are sparse.
+        Map<String, Object> rule = rule("MedQaColdStoreBacklogGrowing");
+        String expr = (String) rule.get("expr");
+
+        assertThat(expr).contains("min_over_time(").doesNotContain("deriv(");
+        assertThat(expr).contains(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE);
+        assertThat((String) ((Map<String, Object>) rule.get("labels")).get("component"))
+                .as("a stuck cold-store backlog is the reclaim's backlog, so it routes to its component")
+                .isEqualTo("session-reclaim");
     }
 
     @Test

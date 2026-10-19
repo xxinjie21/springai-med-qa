@@ -764,6 +764,40 @@ component 且**不匹配**两个监控器的、抓取配置不得打开 `honor_l
 把账本改成只在 `COMPLETED` 时刷新 `last_run`、把注册改成每次都重置时间戳、把英文 README 的小节标题删掉，三处各让
 对应用例变红，还原后重跑全绿。
 
+#### 冷库规模与年龄上报（D54）
+
+**D53 回答「作业还活着吗」，D54 回答「作业还跟得上吗」。** D47/D48/D50/D52 造出的冷热链路自此完整——
+归档、导出、清理、回收各有守卫——但**没有任何指标说 `med_message_archive` 现在有多大、最老的数据有多旧**：
+「回收在正常工作」与「回收追不上产生速度」的外观完全一样，安静一夜、零告警、零指标。D54 发布三个 gauge：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `med_qa_cold_store_rows` | gauge | 冷表当前行数（`COUNT(*)`） |
+| `med_qa_cold_store_oldest_row_age_seconds` | gauge | 冷表最老一行的年龄（秒，由 `MIN(created_at)` 推出；空表为 `0`） |
+| `med_qa_cold_store_reclaim_backlog` | gauge | 上一次**被允许删除**的回收运行留下的孤儿积压 |
+
+并配一条规则 `MedQaColdStoreBacklogGrowing`（warning，`min_over_time(med_qa_cold_store_reclaim_backlog[24h]) > 0`，
+`for: 6h`）：积压量**一整天从没降到过 0**。表达式刻意不用 `deriv()`——健康的排空每个采样点都读 `0`，对阶梯状
+gauge 求导只添故障模式，不添问题；`min_over_time` 在采样稀疏时退化成「没有数据」而不是错误结论。
+
+关键取舍：
+
+- **行数与年龄是数据的事实，不是动作的事实**：导出与回收在每一轮**持有集群互斥锁**的运行之后都刷新它们，
+  dry-run 也包括——只做测量的部署同样报告冷库有多大；让位的运行什么都不发，握着锁的那个副本在测。
+- **积压量只由被允许删除的运行发布**（复用回收报告自己的 `remaining`，不新写扫描）：dry-run 的积压不可能
+  下降，把它发出去会让规则永久误报那些**只测量**的部署。dry-run 回到 `true` 后 gauge 会保留上一次删除运行
+  的数值，这是写明的取舍。
+- **懒注册，没有开关**：三个 gauge 在**第一次测量时**才注册，作业全关的部署**一条序列都不发布**——预先导出
+  的 `0` 会被读成「冷库是空的」，而这是一个没人验证过的断言。能关掉它们的开关等于关掉冷库唯一的规模信号。
+- **只读元数据**：`COUNT(*)` 与 `MIN(created_at)`，不解码任何 Protobuf 正文，也不新增任何删除能力。
+- **冷表最老一行不等于最老的孤儿**：表里也有清单认证的证据行，`MIN(created_at)` 覆盖整张表——它回答「冷库里
+  最老的数据有多旧」，在孤儿占多数的表上就是「最老的孤儿待了多久」的元数据答案。
+
+守护测试：`MedColdStoreMetricsTest`、`MedColdStoreMetricsConfigTest`、两个 `*SchedulerTest`（dry-run 只刷新
+规模不发布积压——这条边界防的正是「只测量的部署被永久 page」）、`SessionReclaimMapperShardingTest`（两个聚合
+在真实 H2 + ShardingSphere 上跑通）、`AlertingStackConfigTest`（规则里的每个 `med_qa_cold_store_*` 名字都
+必须属于 `MedColdStoreMetrics` 的常量）。按项目惯例，新守卫**先被亲眼看过它变红**。
+
 ---
 
 ## 错误码

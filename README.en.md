@@ -932,6 +932,58 @@ requires, the new guards were **watched to go red**: refreshing `last_run` only 
 the timestamps on every registration, and deleting this chapter's heading each turned the corresponding cases
 red, and all three were restored and re-run green.
 
+#### Cold store size and age reporting (D54)
+
+**D53 answers "is the job still alive"; D54 answers "is the job still keeping up".** The cold/hot chain
+built up by D47-D52 is complete from here -- archive, export, purge and reclaim each carry their guards --
+but **nothing said how big `med_message_archive` had grown or how old its oldest content was**: "the reclaim
+is keeping up with the orphans the restores produce" and "the reclaim falls further behind every day" look
+exactly the same from the outside -- a quiet night, no alert, no metric. D54 publishes three gauges:
+
+| Meter | Type | Meaning |
+|---|---|---|
+| `med_qa_cold_store_rows` | gauge | rows the cold store currently holds (`COUNT(*)`) |
+| `med_qa_cold_store_oldest_row_age_seconds` | gauge | age of the cold store's oldest row in seconds (derived from `MIN(created_at)`; `0` when the store is empty) |
+| `med_qa_cold_store_reclaim_backlog` | gauge | orphaned cold copies left behind by the last reclaim run that was **allowed to delete** |
+
+and one rule, `MedQaColdStoreBacklogGrowing` (warning, `min_over_time(med_qa_cold_store_reclaim_backlog[24h])
+> 0`, `for: 6h`): the backlog **never reached zero for a full day**. The expression deliberately avoids
+`deriv()` -- a healthy drain reads `0` on every sample, and differentiating a step-wise gauge adds a failure
+mode without adding a question; `min_over_time` degrades to "no data" rather than to a wrong verdict when
+samples are sparse.
+
+Key trade-offs:
+
+- **Row count and age are facts about the data, not about an action.** The D48 export and the D52 reclaim
+  refresh them after every run that **held the cluster mutex**, dry-run runs included -- a deployment that
+  only measures still reports how big the cold store is. A run that stepped aside for another replica
+  publishes nothing: the replica holding the mutex is doing the measuring.
+- **Only a run that was allowed to delete publishes the backlog** (reusing the reclaim report's own
+  `remaining` figure, no second scan): a dry run's backlog cannot drain by construction, so publishing it
+  would page forever the deployments that only measure. A deployment that flips back to dry-run keeps the
+  last deleting run's figure on the gauge (Micrometer exports a gauge's last value until it is replaced) --
+  a documented trade-off, not an oversight.
+- **Lazily registered, with no switch.** The three gauges are registered on the **first measurement**, so a
+  deployment with every job switched off publishes **no cold-store series at all** -- a pre-exported `0`
+  would read as "the cold store is empty", which is a claim nobody verified. A switch that could turn them
+  off would be a switch that turns off the cold store's only size signal.
+- **Metadata only.** `COUNT(*)` and `MIN(created_at)`; no Protobuf payload is decoded and no deletion
+  capability is added.
+- **The oldest cold row is not the oldest orphan.** `med_message_archive` also holds manifest-certified
+  evidence rows, and `MIN(created_at)` covers the whole table -- it answers "how old is the coldest data in
+  the store", which on a table dominated by orphans is the metadata-only answer to "how long has the oldest
+  orphan been sitting there".
+
+Guard tests: `MedColdStoreMetricsTest`, `MedColdStoreMetricsConfigTest`, the two `*SchedulerTest` suites (a
+dry run refreshes the size but publishes no backlog -- the boundary that keeps "a deployment that only
+measures" from being paged forever), `SessionReclaimMapperShardingTest` (both aggregates run on a real H2 +
+ShardingSphere), and `AlertingStackConfigTest` (every `med_qa_cold_store_*` name in the rules must be one of
+`MedColdStoreMetrics`' constants). As the project's convention requires, the new guards were **watched to go
+red**: deleting the §7.15 heading from the handbook and the D54 chapter heading from both READMEs turned one
+case in each of the three documentation guards red, and dropping the dry-run boundary in
+`MedSessionReclaimScheduler` turned "a dry run publishes the size but no backlog" red. All were restored and
+re-run green.
+
 ---
 
 ## Error codes

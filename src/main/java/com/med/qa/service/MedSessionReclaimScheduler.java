@@ -3,6 +3,7 @@ package com.med.qa.service;
 import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertSeverity;
 import com.med.qa.common.exception.BizException;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRun;
 import com.med.qa.job.MedJobRunLedger;
 import org.slf4j.Logger;
@@ -58,6 +59,16 @@ import java.util.concurrent.atomic.AtomicReference;
  * with the ledger while it is being built and records one {@link MedJobRun} for every attempt -- whether
  * it reclaimed something, stepped aside for another replica or threw -- so the staleness of the published
  * timestamps becomes the signal a dead job cannot suppress.</p>
+ *
+ * <h2>The one thing the alerts and the ledger together still cannot say</h2>
+ * <p>Whether the reclaim is <em>keeping up</em>. The ledger says the job runs; the alerts say what each
+ * run did; neither compares two runs, and "the reclaim retires every orphan the restores produce" versus
+ * "the reclaim falls further behind every day" both look like a quiet, healthy job. So after every run
+ * that held the cluster mutex this scheduler also refreshes the cold store's size gauges, and after every
+ * run that was allowed to delete it publishes the backlog that run left behind, through
+ * {@link MedColdStoreMetrics} (D54) — the series {@code MedQaColdStoreBacklogGrowing} compares against
+ * itself. A run that stepped aside for another replica records nothing: its replica is doing the
+ * measuring, and a second, identical publication would only add noise.</p>
  */
 public class MedSessionReclaimScheduler {
 
@@ -81,6 +92,8 @@ public class MedSessionReclaimScheduler {
 
     private final MedJobRunLedger ledger;
 
+    private final MedColdStoreMetrics coldStoreMetrics;
+
     private final AtomicReference<SessionReclaimReport> lastReport = new AtomicReference<>();
 
     /**
@@ -94,6 +107,8 @@ public class MedSessionReclaimScheduler {
      * @param notifier         provider of the alert dispatcher; absent when alerting is switched off,
      *                         must not be {@code null}
      * @param ledger           the run ledger this scheduler records into, must not be {@code null}
+     * @param coldStoreMetrics the D54 publisher of the cold store's size and backlog gauges, must not be
+     *                         {@code null}
      * @param expectedInterval the {@code med.session.reclaim.check-interval} the deployment armed this job
      *                         with; published by the ledger so the stall rule follows the configuration
      *                         instead of hard-coding a threshold, must be positive
@@ -102,6 +117,7 @@ public class MedSessionReclaimScheduler {
     public MedSessionReclaimScheduler(MedSessionReclaimService reclaimService,
                                       ObjectProvider<MedAlertNotifier> notifier,
                                       MedJobRunLedger ledger,
+                                      MedColdStoreMetrics coldStoreMetrics,
                                       Duration expectedInterval) {
         if (reclaimService == null) {
             throw new IllegalArgumentException("reclaimService must not be null");
@@ -112,9 +128,13 @@ public class MedSessionReclaimScheduler {
         if (ledger == null) {
             throw new IllegalArgumentException("ledger must not be null");
         }
+        if (coldStoreMetrics == null) {
+            throw new IllegalArgumentException("coldStoreMetrics must not be null");
+        }
         this.reclaimService = reclaimService;
         this.notifier = notifier;
         this.ledger = ledger;
+        this.coldStoreMetrics = coldStoreMetrics;
         ledger.register(COMPONENT, expectedInterval);
     }
 
@@ -141,6 +161,11 @@ public class MedSessionReclaimScheduler {
      * attempt timestamp must not be lost along with it, because that timestamp is the only remaining
      * evidence that the reclaim is still being attempted.</p>
      *
+     * <p>After the ledger record, and only for a run that held the cluster mutex, the D54 cold-store
+     * gauges are refreshed (see the class javadoc). The size gauges are refreshed by every such run,
+     * dry-run runs included, because the size of the cold store is a fact about the data rather than
+     * about an action.</p>
+     *
      * @return the run report, or {@link Optional#empty()} when the reclaim threw; the failure has then
      *         already been logged and alerted
      */
@@ -164,6 +189,13 @@ public class MedSessionReclaimScheduler {
         if (steppedAside) {
             log.debug("orphaned cold copy reclaim skipped, another replica holds the lock");
             return Optional.of(report);
+        }
+        coldStoreMetrics.recordColdStoreSize();
+        if (!report.dryRun() && report.remaining() >= 0) {
+            // Only a run that was allowed to delete owns the backlog figure: a dry run's backlog cannot
+            // drain by construction, so publishing it would put a permanent value under a rule that asks
+            // "the job runs and the backlog still never drains".
+            coldStoreMetrics.recordReclaimBacklog(report.remaining());
         }
         if (report.sawRefusal()) {
             // Raised before the completion notice, and independently of it: a run can retire a hundred

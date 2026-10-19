@@ -1,6 +1,7 @@
 package com.med.qa.config;
 
 import com.med.qa.alert.MedAlertNotifier;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
@@ -89,10 +90,15 @@ public class MedSessionReclaimConfig {
      * published value, would then be tuned to a schedule the job does not actually run on. Passing the
      * bound property in makes the two read the same source.</p>
      *
-     * @param reclaimService the reclaim this scheduler drives
-     * @param notifier       provider of the alert dispatcher
-     * @param ledger         the run ledger the scheduler records into
-     * @param properties     the {@code med.session.reclaim.*} policy, source of the check interval
+     * <p>The D54 cold-store metrics arrive as a required dependency too: the reclaim is the only job that
+     * can publish the backlog figure, so a replica that cannot reach the publisher would silently drop
+     * the one series {@code MedQaColdStoreBacklogGrowing} is written against.</p>
+     *
+     * @param reclaimService   the reclaim this scheduler drives
+     * @param notifier         provider of the alert dispatcher
+     * @param ledger           the run ledger the scheduler records into
+     * @param coldStoreMetrics the publisher of the cold store's size and backlog gauges
+     * @param properties       the {@code med.session.reclaim.*} policy, source of the check interval
      * @return the scheduler
      */
     @Bean(SCHEDULER)
@@ -100,8 +106,9 @@ public class MedSessionReclaimConfig {
             MedSessionReclaimService reclaimService,
             ObjectProvider<MedAlertNotifier> notifier,
             MedJobRunLedger ledger,
+            MedColdStoreMetrics coldStoreMetrics,
             MedSessionReclaimProperties properties) {
-        return new MedSessionReclaimScheduler(reclaimService, notifier, ledger,
+        return new MedSessionReclaimScheduler(reclaimService, notifier, ledger, coldStoreMetrics,
                 properties.getCheckInterval());
     }
 }

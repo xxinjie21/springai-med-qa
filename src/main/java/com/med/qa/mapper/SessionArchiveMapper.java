@@ -243,4 +243,37 @@ public interface SessionArchiveMapper {
      * @return the number of deleted rows; {@code 0} when another run got there first
      */
     int deleteColdCopy(@Param("sessionId") String sessionId);
+
+    /**
+     * Counts every row the cold transcript store currently holds (D54).
+     *
+     * <p>A pure {@code COUNT(*)} over {@code med_message_archive}: metadata only, no payload is read and
+     * no row is changed. This is the figure that answers "how big is the cold store now", which until D54
+     * no metric could say — the reclaim report counts <em>orphans</em>, not rows, and a growing archive is
+     * otherwise indistinguishable from a reclaim that is keeping up.</p>
+     *
+     * <p>It lives on this mapper rather than being derived from a service report because it is a fact
+     * about the store, not about one job's run: both the export (which fills the table) and the reclaim
+     * (which empties the orphaned part of it) refresh it after every run they actually perform.</p>
+     *
+     * @return the number of archived message rows, never negative
+     */
+    long countArchivedMessages();
+
+    /**
+     * Reads the creation instant of the oldest row in the cold transcript store (D54).
+     *
+     * <p>A pure {@code COALESCE(MIN(created_at), 0)} over {@code med_message_archive}: metadata only, no
+     * payload is read. {@code created_at} is carried over from the original message when the export copies
+     * it, so the minimum is the moment the oldest archived turn was spoken — the age derived from it
+     * answers "how old is the coldest data in the store", which for a table dominated by orphaned copies
+     * is the metadata-only answer to "how long has the oldest orphan been sitting there".</p>
+     *
+     * <p>The {@code 0} rather than a null marker is what lets the caller turn the value into an age
+     * without a second branch: an empty cold store has no oldest row, and its age is defined as zero
+     * rather than as "now", which would read as ancient data that does not exist.</p>
+     *
+     * @return epoch milliseconds of the oldest archived row, or {@code 0} when the cold store is empty
+     */
+    long oldestArchivedMessageCreatedAt();
 }

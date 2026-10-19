@@ -4,8 +4,10 @@ import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertSeverity;
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRun;
 import com.med.qa.job.MedJobRunLedger;
+import com.med.qa.mapper.SessionArchiveMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -48,6 +50,12 @@ import static org.mockito.Mockito.when;
  * run ledger, whose staleness is what a dead job cannot suppress. The ledger is exercised for real over a
  * {@code SimpleMeterRegistry} rather than mocked, because the assertion that matters is the meter a
  * Prometheus scrape would read.</p>
+ *
+ * <p>D54 adds the third half, which the ledger cannot carry either: the ledger says the job runs, the
+ * alerts say what a run did, and neither compares two runs. After a run that held the cluster mutex the
+ * scheduler refreshes the cold store's size gauges; after a run that was <em>allowed to delete</em> it
+ * also publishes the backlog that run left behind. The dry-run boundary is the case that matters: a
+ * backlog that cannot drain by construction must not land under a rule asking why it never drains.</p>
  */
 class MedSessionReclaimSchedulerTest {
 
@@ -65,6 +73,10 @@ class MedSessionReclaimSchedulerTest {
 
     private MedJobRunLedger ledger;
 
+    private SessionArchiveMapper archiveMapper;
+
+    private MedColdStoreMetrics coldStoreMetrics;
+
     private MedSessionReclaimScheduler scheduler;
 
     @SuppressWarnings("unchecked")
@@ -76,8 +88,16 @@ class MedSessionReclaimSchedulerTest {
         when(notifierProvider.getIfAvailable()).thenReturn(notifier);
         registry = new SimpleMeterRegistry();
         ledger = new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC));
+        // The cold-store publisher is exercised for real over the same registry, for the same reason as
+        // the ledger: what is asserted is the meter a Prometheus scrape would read.
+        archiveMapper = mock(SessionArchiveMapper.class);
+        when(archiveMapper.countArchivedMessages()).thenReturn(4_242L);
+        when(archiveMapper.oldestArchivedMessageCreatedAt())
+                .thenReturn(BOOT.toEpochMilli() - 3_600_000L);
+        coldStoreMetrics =
+                new MedColdStoreMetrics(archiveMapper, registry, Clock.fixed(BOOT, ZoneOffset.UTC));
         scheduler = new MedSessionReclaimScheduler(reclaimService, notifierProvider, ledger,
-                Duration.ofHours(12));
+                coldStoreMetrics, Duration.ofHours(12));
     }
 
     @Test
@@ -206,14 +226,17 @@ class MedSessionReclaimSchedulerTest {
     @DisplayName("the constructor refuses a null collaborator")
     void constructorRejectsNulls() {
         assertThatThrownBy(() -> new MedSessionReclaimScheduler(null, notifierProvider, ledger,
-                Duration.ofHours(12)))
+                coldStoreMetrics, Duration.ofHours(12)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("reclaimService");
         assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, null, ledger,
-                Duration.ofHours(12)))
+                coldStoreMetrics, Duration.ofHours(12)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("notifier");
         assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, notifierProvider, null,
-                Duration.ofHours(12)))
+                coldStoreMetrics, Duration.ofHours(12)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("ledger");
+        assertThatThrownBy(() -> new MedSessionReclaimScheduler(reclaimService, notifierProvider, ledger,
+                null, Duration.ofHours(12)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("coldStoreMetrics");
     }
 
     // ------------------------------------------------------------------ the run ledger (D53)
@@ -264,7 +287,7 @@ class MedSessionReclaimSchedulerTest {
                 spy(new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC)));
         MedSessionReclaimScheduler schedulerWithSpy =
                 new MedSessionReclaimScheduler(reclaimService, notifierProvider, spiedLedger,
-                        Duration.ofHours(12));
+                        coldStoreMetrics, Duration.ofHours(12));
         when(reclaimService.reclaimOnce()).thenThrow(new IllegalStateException("boom"));
 
         assertThat(schedulerWithSpy.reclaimNow()).isEmpty();
@@ -274,6 +297,78 @@ class MedSessionReclaimSchedulerTest {
         order.verify(notifier).raise(any(MedAlertSeverity.class), anyString(), anyString(), anyString());
         assertThat(spiedLedger.lastSuccessEpochSeconds(MedSessionReclaimScheduler.COMPONENT))
                 .isEqualTo(BOOT_EPOCH_SECONDS);
+    }
+
+    // ------------------------------------------------------------------ the cold store (D54)
+
+    @Test
+    @DisplayName("a deleting run publishes the cold store's size and the backlog it left behind")
+    void deletingRunPublishesSizeAndBacklog() {
+        when(reclaimService.reclaimOnce()).thenReturn(report(false, 3, 0, 0, 0, 7L));
+
+        scheduler.reclaimNow();
+
+        assertThat(gauge(MedColdStoreMetrics.ROWS_GAUGE)).isEqualTo(4_242d);
+        assertThat(gauge(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE)).isEqualTo(3_600d);
+        assertThat(gauge(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE)).isEqualTo(7d);
+    }
+
+    @Test
+    @DisplayName("a dry run publishes the size but no backlog, because its backlog cannot drain")
+    void dryRunPublishesSizeButNoBacklog() {
+        // The whole point of the boundary: a deployment that only measures would page forever if its
+        // non-draining backlog were published under MedQaColdStoreBacklogGrowing. The size gauges are
+        // facts about the data, so they are refreshed regardless.
+        when(reclaimService.reclaimOnce()).thenReturn(report(true, 5, 0, 0, 0, 12L));
+
+        scheduler.reclaimNow();
+
+        assertThat(gauge(MedColdStoreMetrics.ROWS_GAUGE)).isEqualTo(4_242d);
+        assertThat(gauge(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE)).isEqualTo(3_600d);
+        assertThat(registry.find(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE).gauge())
+                .as("a backlog that no deleting run ever measured must not be published as zero")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("a run that stepped aside publishes nothing: the replica holding the mutex measures")
+    void skippedRunPublishesNothing() {
+        when(reclaimService.reclaimOnce()).thenReturn(SessionReclaimReport.skipped(5));
+
+        scheduler.reclaimNow();
+
+        assertThat(registry.find(MedColdStoreMetrics.ROWS_GAUGE).gauge()).isNull();
+        assertThat(registry.find(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE).gauge()).isNull();
+        assertThat(registry.find(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE).gauge()).isNull();
+    }
+
+    @Test
+    @DisplayName("a failed run publishes nothing, so a stale gauge cannot look like a fresh measurement")
+    void failedRunPublishesNothing() {
+        when(reclaimService.reclaimOnce())
+                .thenThrow(new BizException(ErrorCode.STORAGE_ERROR, "mysql went away"));
+
+        assertThat(scheduler.reclaimNow()).isEmpty();
+
+        assertThat(registry.find(MedColdStoreMetrics.ROWS_GAUGE).gauge()).isNull();
+        assertThat(registry.find(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE).gauge()).isNull();
+    }
+
+    @Test
+    @DisplayName("a backlog measured as unknown (-1) is not published, so the last real value survives")
+    void unmeasuredBacklogIsNotPublished() {
+        when(reclaimService.reclaimOnce()).thenReturn(report(false, 1, 0, 0, 0, -1L));
+
+        scheduler.reclaimNow();
+
+        assertThat(registry.find(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE).gauge()).isNull();
+    }
+
+    /** Reads one gauge out of the test registry, the way a Prometheus scrape would. */
+    private double gauge(String name) {
+        var gauge = registry.find(name).gauge();
+        assertThat(gauge).as("gauge %s must be registered", name).isNotNull();
+        return gauge.value();
     }
 
     private static SessionReclaimReport report(boolean dryRun, int reclaimed, int skipped, int refused,

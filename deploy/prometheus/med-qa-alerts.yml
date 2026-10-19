@@ -269,6 +269,35 @@ groups:
             exist.
           runbook: "docs/DEPLOYMENT.md#713-孤儿冷副本回收d52"
 
+      - alert: MedQaColdStoreBacklogGrowing
+        # D54. The reclaim is the only thing that retires an orphaned cold copy, and until D54 nothing
+        # said how big med_message_archive had grown or how old its oldest content was: "the reclaim is
+        # keeping up with the orphans the restores produce" and "the reclaim falls further behind every
+        # day" looked exactly the same from the outside. The gauge is refreshed by the reclaim itself
+        # after every run it was allowed to delete, so a switched-off job and a deployment that only
+        # measures (dry-run) publish no series at all and cannot reach this rule. The expression is
+        # "never reached zero for a full day" rather than a derivative, because a healthy drain reads 0
+        # on every sample and a derivative over a step-wise gauge adds a failure mode without adding a
+        # question: min_over_time[24h] > 0 is exactly "the backlog existed the whole time and never
+        # cleared".
+        expr: min_over_time(med_qa_cold_store_reclaim_backlog[24h]) > 0
+        for: 6h
+        labels:
+          severity: warning
+          component: session-reclaim
+        annotations:
+          summary: "The orphaned cold copy backlog is not draining"
+          description: >-
+            med_qa_cold_store_reclaim_backlog has stayed above zero for a full day: the reclaim runs
+            (med.session.reclaim.enabled=true, dry-run=false) but never drains the orphaned cold
+            copies, so med_message_archive keeps growing. Either the restores are producing orphans
+            faster than the run retires them (raise med.session.reclaim.max-batches or batch-size) or
+            the copies are being refused (look for MedQaSessionReclaimRefused; a refused copy stays a
+            candidate forever). A run that drains the backlog to zero resolves this on its own.
+            med_qa_cold_store_rows and med_qa_cold_store_oldest_row_age_seconds show the size and the
+            age of the table itself.
+          runbook: "docs/DEPLOYMENT.md#715-冷库规模与年龄上报d54"
+
       - alert: MedQaBackgroundJobStalled
         # D53. Every other rule in this file is produced BY the component it watches, so none of them can
         # report that the component stopped running: a maintenance job that never fires emits no failure

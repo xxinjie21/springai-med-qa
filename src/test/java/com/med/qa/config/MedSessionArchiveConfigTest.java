@@ -1,5 +1,6 @@
 package com.med.qa.config;
 
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
@@ -280,6 +281,16 @@ class MedSessionArchiveConfigTest {
         @Bean
         MedJobRunLedger medJobRunLedger() {
             return new MedJobRunLedger(new SimpleMeterRegistry());
+        }
+
+        /**
+         * The D54 cold-store publisher the export refreshes its size gauges through. Built for real over a
+         * plain registry for the same reason as the ledger, and lazy on the first measurement, so it
+         * publishes nothing in a context where no run ever happens.
+         */
+        @Bean
+        MedColdStoreMetrics medColdStoreMetrics(SessionArchiveMapper sessionArchiveMapper) {
+            return new MedColdStoreMetrics(sessionArchiveMapper, new SimpleMeterRegistry());
         }
     }
 }

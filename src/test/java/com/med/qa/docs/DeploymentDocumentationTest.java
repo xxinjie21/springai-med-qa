@@ -419,6 +419,32 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D54 cold store gauges, the rule and the dry-run boundary")
+    void coldStoreMetricsAreDocumented() {
+        // The operator-facing half of D54. The chapter has to carry the two boundaries that keep the rule
+        // honest: the backlog is published only by a run that was allowed to delete (so a deployment that
+        // only measures is never paged for a backlog it cannot drain), and the gauges are registered on
+        // the first measurement with no switch (so a switched-off deployment publishes nothing rather
+        // than a zero that reads as "the cold store is empty"). It also has to say the expression is
+        // "never reached zero for a day" rather than a derivative, because a reader who "simplifies" it to
+        // deriv() reintroduces a step-wise-gauge failure mode.
+        assertThat(handbook).contains("7.15");
+        assertThat(handbook).contains("（D54）");
+        // The heading is asserted whole, and the metric names separately: `7.15` appears elsewhere in
+        // the handbook and `MedColdStoreMetrics` is a substring of the guard-test class names, so either
+        // alone would stay green with the chapter deleted.
+        assertThat(handbook).contains("### 7.15 冷库规模与年龄上报（D54）");
+        assertThat(handbook).contains("med_qa_cold_store_rows");
+        assertThat(handbook).contains("med_qa_cold_store_oldest_row_age_seconds");
+        assertThat(handbook).contains("med_qa_cold_store_reclaim_backlog");
+        assertThat(handbook).contains("MedQaColdStoreBacklogGrowing");
+        assertThat(handbook).contains("min_over_time");
+        assertThat(handbook).contains("MedColdStoreMetrics");
+        assertThat(handbook).contains("MedColdStoreMetricsTest");
+        assertThat(handbook).contains("MedColdStoreMetricsConfigTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(

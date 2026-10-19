@@ -219,4 +219,22 @@
         WHERE session_id = #{sessionId}
     </delete>
 
+    <!--
+      Cold-store size and age (D54). Both statements are aggregates over med_message_archive and read
+      metadata only: COUNT(*) is the store's row count, COALESCE(MIN(created_at), 0) is the creation
+      instant of its oldest row (0 when the table is empty, which is what lets the caller derive "age 0"
+      instead of "age = now"). They are published as the med_qa_cold_store_* gauges by
+      com.med.qa.job.MedColdStoreMetrics, refreshed by the D48 export and the D52 reclaim after every run
+      they actually perform. Not sharded, so ShardingSphere routes them through the SINGLE rule.
+    -->
+    <select id="countArchivedMessages" resultType="long">
+        SELECT COUNT(*)
+        FROM med_message_archive
+    </select>
+
+    <select id="oldestArchivedMessageCreatedAt" resultType="long">
+        SELECT COALESCE(MIN(created_at), 0)
+        FROM med_message_archive
+    </select>
+
 </mapper>

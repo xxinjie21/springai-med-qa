@@ -3,6 +3,7 @@ package com.med.qa.service;
 import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertSeverity;
 import com.med.qa.common.exception.BizException;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRun;
 import com.med.qa.job.MedJobRunLedger;
 import org.slf4j.Logger;
@@ -56,6 +57,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * with the ledger while it is being built and records one {@link MedJobRun} for every attempt -- whether
  * it certified something, stepped aside for another replica or threw -- so the staleness of the published
  * timestamps becomes the signal a dead job cannot suppress.</p>
+ *
+ * <h2>The export's share of the cold store's observability</h2>
+ * <p>The ledger says this job runs and the alerts say what each run did; neither says how big the table
+ * the export <em>fills</em> has become. Since the reclaim is the only job that empties it, a cold store
+ * whose growth outpaces the reclaim was invisible from the export's side — and the export runs more often
+ * than the reclaim, so it is the better refresher. After every run that held the cluster mutex, dry-run
+ * runs included, this scheduler therefore refreshes {@link MedColdStoreMetrics}' size gauges (D54). A run
+ * that stepped aside for another replica records nothing: the replica that held the mutex is doing the
+ * measuring.</p>
  */
 public class MedSessionArchiveExportScheduler {
 
@@ -79,6 +89,8 @@ public class MedSessionArchiveExportScheduler {
 
     private final MedJobRunLedger ledger;
 
+    private final MedColdStoreMetrics coldStoreMetrics;
+
     private final AtomicReference<SessionArchiveExportReport> lastReport = new AtomicReference<>();
 
     /**
@@ -92,6 +104,8 @@ public class MedSessionArchiveExportScheduler {
      * @param notifier         provider of the alert dispatcher; absent when alerting is switched off,
      *                         must not be {@code null}
      * @param ledger           the run ledger this scheduler records into, must not be {@code null}
+     * @param coldStoreMetrics the D54 publisher of the cold store's size gauges, must not be
+     *                         {@code null}
      * @param expectedInterval the {@code med.session.archive.check-interval} the deployment armed this job
      *                         with; published by the ledger so the stall rule follows the configuration
      *                         instead of hard-coding a threshold, must be positive
@@ -100,6 +114,7 @@ public class MedSessionArchiveExportScheduler {
     public MedSessionArchiveExportScheduler(MedSessionArchiveExportService exportService,
                                             ObjectProvider<MedAlertNotifier> notifier,
                                             MedJobRunLedger ledger,
+                                            MedColdStoreMetrics coldStoreMetrics,
                                             Duration expectedInterval) {
         if (exportService == null) {
             throw new IllegalArgumentException("exportService must not be null");
@@ -110,9 +125,13 @@ public class MedSessionArchiveExportScheduler {
         if (ledger == null) {
             throw new IllegalArgumentException("ledger must not be null");
         }
+        if (coldStoreMetrics == null) {
+            throw new IllegalArgumentException("coldStoreMetrics must not be null");
+        }
         this.exportService = exportService;
         this.notifier = notifier;
         this.ledger = ledger;
+        this.coldStoreMetrics = coldStoreMetrics;
         ledger.register(COMPONENT, expectedInterval);
     }
 
@@ -139,6 +158,10 @@ public class MedSessionArchiveExportScheduler {
      * attempt timestamp must not be lost along with it, because that timestamp is the only remaining
      * evidence that the export is still being attempted.</p>
      *
+     * <p>After the ledger record, and only for a run that held the cluster mutex, the D54 cold-store size
+     * gauges are refreshed — dry-run runs included, because the size of the cold store is a fact about
+     * the data rather than about an action (see the class javadoc).</p>
+     *
      * @return the run report, or {@link Optional#empty()} when the export threw; the failure has then
      *         already been logged and alerted
      */
@@ -163,6 +186,7 @@ public class MedSessionArchiveExportScheduler {
             log.debug("cold archive export skipped, another replica holds the lock");
             return Optional.of(report);
         }
+        coldStoreMetrics.recordColdStoreSize();
         if (report.sawMismatch()) {
             // Raised before the completion notice, and independently of it: a run can export a hundred
             // sessions and still have refused one, and the refusal is the part that needs attention.

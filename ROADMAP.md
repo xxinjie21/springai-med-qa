@@ -391,10 +391,22 @@ springai-med-qa/
 | D53 | 后台作业运行账本与停摆检测 | `MedJobRunLedger`（新包 `com.med.qa.job`）是四个后台作业**共用**的一份运行账本：每个作业在装配时 `register(job, expectedInterval)` 一次（**幂等**），此后每次运行——**无论跑完、被互斥挡下还是抛异常**——都 `record(MedJobRun)` 一次。它只发布四个 Micrometer 计量，全部用 `job` 标签区分：`med_qa_job_last_run_epoch_seconds{job}`（最近一次**尝试**的墙钟秒）、`med_qa_job_last_success_epoch_seconds{job}`（最近一次**真正跑完 passes** 的墙钟秒）、`med_qa_job_expected_interval_seconds{job}`（**把 `check-interval` 本身发布成指标**）与 `med_qa_job_runs_total{job,outcome}`（`outcome` ∈ `COMPLETED` / `SKIPPED_LOCK_HELD` / `FAILED`）。**为什么把配置发布成指标**：死信开关的阈值必须随部署配置走——一个把 `check-interval` 设成 `7d` 的部署若被硬编码成「2 小时没跑就告警」，规则会永久误报；把 `check-interval` 发成指标后，规则写成 `time() - … > 2.5 * med_qa_job_expected_interval_seconds + 300` 就**自动跟随配置**，改配置不需要改规则。**两个时间戳都从 `register` 那一刻起算**（不是 0）：刚启动的实例还没跑过任何一次，从 0 起算会让每条比较 `time()` 的规则在每次重启后的整个 `initial-delay` 里误报；代价是「一直没跑完」的作业要等 2.5 个间隔才被报出来，与「调度器整个停了」同一个阈值，该取舍写进 javadoc。**`register` 的幂等是契约而不是优化**：第二次注册不得重置时间戳，否则「重新注册一次」就成了让停摆作业看起来活着的开关。**两条规则，各自消费一个 gauge，互不冗余**：`MedQaBackgroundJobStalled`（warning，**按实例**，`time() - last_run > 2.5 * interval + 300`，`for: 15m`）回答「**这个 Pod 的调度线程停了**」；`MedQaBackgroundJobNotCompleting`（critical，**按集群** `max by (job)`，`time() - max by (job)(last_success) > 2.5 * interval + 300`，`for: 15m`）回答「**没有任何副本真正跑完过**」——它是唯一能抓住「集群互斥键被某个副本永久占着」（此时 `last_run` 照常刷新、`SKIPPED_LOCK_HELD` 照常计数，四个作业却全部变成空转）与「每一轮都抛异常」这两类故障的信号，而且它**由数据的缺席产生**，因此不可能被作业自己发出的告警覆盖。`last_run` **刻意在 `SKIPPED_LOCK_HELD` 时也刷新**：抢不到锁是互斥在工作、不是实例停摆，所以「本实例还在评估」必须与「本实例真的干了活」分开成两个 gauge——合并成一个会同时丢掉两条结论。**作业被开关关掉时不发布任何序列**（`@ConditionalOnProperty` 让 Bean 根本不存在），于是 `job=~"session-.*"` 选择器落空、规则不出数据、不告警：**「故意关闭」是运维决策，不该被 page**，这条边界写进 javadoc 与手册。**账本自身没有任何开关**（`MedJobObservabilityConfig` 无条件装配）：它是「作业没跑」的**唯一**证据来源，用一个开关把它关掉等于把四个作业的可观测性一起关掉。**两个告警监控器（`MedStorageAlertMonitor` / `MedVectorIndexAlertMonitor`）刻意不在范围内**：它们的存活问题是个先有鸡还是先有蛋的问题（告警链无法报告自己的生产者已死），只能由 `MedQaTargetDown` 在进程层面覆盖，这个边界同样写进文档而不是留给读者猜。**修正既有的错误承诺**：`MetricsMedAlertSink` 的 javadoc、`docs/DEPLOYMENT.md` §7.4 与 `README.en.md` 里「`med_qa_alert_last_epoch_seconds` 可用于 dead-man's-switch 规则」三处一并改成「它回答的是『上次**告警**是什么时候』，与『实例上次**评估**是什么时候』是两件事，因此不能用作死信开关，真正的死信开关见 `MedJobRunLedger`」。**告警与账本的先后顺序**：抛异常时**先记账本、后发告警**——告警链自己挂掉时（D43 的场景）不能再把「作业跑过」这条唯一的证据一起丢掉。守护测试：`MedJobRunLedgerTest`（注册幂等且**不重置**时间戳、两个时间戳在注册时都等于当前时刻——**这条就是「重启后不误报」的可执行版本**、`SKIPPED_LOCK_HELD` 只刷新 `last_run`、`FAILED` 只刷新 `last_run`、三种结局各自计数、未注册的作业 `record` 直接拒绝、两个作业的标签互不串扰）、`MedJobRunTest`（记录校验与工厂方法）、`MedJobObservabilityConfigTest`（**四个作业全关时账本仍在**）、四个 `*SchedulerTest` 各补用例（三种结局分别记进账本，且抛异常时账本**先于**告警——用 `InOrder` 断言）、四个 `*ConfigTest` 各补一条（**账本发布的 `expected-interval` 与 `@Scheduled` 占位符读到的是同一个 `check-interval`**，占位符的 `:1h` 字面回退一旦生效就会在这里变红）、`AlertingStackConfigTest` 新增（① 规则里出现的每个 `med_qa_job_*` 名字都必须属于 `MedJobRunLedger` 的常量集合，且三个 gauge 必须都被引用——多一个少一个都红；② `job=~"session-.*"` 必须匹配四个作业的 `COMPONENT` 常量、且**不匹配**两个监控器的 component——把「监控器不在范围内」从注释变成断言） | `feat(jobs): add a background job run ledger with stall detection` |
 | D54 | 冷副本的规模与年龄上报 | D52 只是让孤儿不再无限增长，**没有任何指标说 `med_message_archive` 现在有多大、最老的孤儿多久了**——「回收在正常工作」与「回收追不上产生速度」在外观上仍然一样。本日把两件事做成可观测：① 每次回收/导出运行后记录冷表的**行数与最老候选的年龄**（复用既有报告而不是新写扫描：`selectReclaimableOrphans` 已经知道候选、`countReclaimableOrphans` 已经给出积压量），发布为 `med_qa_cold_store_*` gauge；② 为「积压量持续不降」配一条规则 `MedQaColdStoreBacklogGrowing`。**仍然只读元数据**：行数用 `COUNT(*)`、年龄用 `MIN(created_at)`，不读任何消息正文，也不新增删除能力。 | `feat(session): report cold store size and age` |
 
+> 阶段 13 进度：**D53 / D54 全部完成，阶段 13 收尾**。D53 让「作业还活着吗」第一次有证据
+> （运行账本 + 两条停摆规则），D54 让「作业还跟得上吗」第一次有证据（`med_qa_cold_store_*` 三个
+> gauge + `MedQaColdStoreBacklogGrowing`）；两者的分工写在各文档里：**依赖作业运行才能产生的告警，
+> 永远无法发现作业没有运行**，停摆信号只能由**数据的缺席**表达；而「活着」与「跟得上」是两个问题，
+> 前者按实例、后者看积压。
+>
+> D54 的三个关键取舍：**行数与年龄是数据的事实而非动作的事实**（导出与回收每轮持有集群互斥锁的
+> 运行之后都刷新，dry-run 也包括）；**积压量只由被允许删除的运行发布**（复用回收报告自己的
+> `remaining`，dry-run 的积压不可能排空，发出去会让只测量的部署被永久 page）；**懒注册且无开关**
+> （作业全关的部署一条序列都不发布——「故意关闭」是运维决策，不是 0）。
+>
 > **阶段 13 之后没有 D55**：下次运行必须先扩写本路线图（新增阶段 14）再实现，不得自造迭代编号。
 > D53 **刻意没有**给账本加开关、也**刻意没有**把两个告警监控器纳入范围（理由见上表）；
 > D53 **刻意没有**发布运行耗时与业务计数（`candidates` / `archived` 这类），因为 D53 只回答
 > 「作业还活着吗」这一个问题，把「作业干得怎么样」混进来会让两条规则的判据重新变得含混。
+> D54 **刻意没有**发布清单数、导出积压等其它冷库维度，也**刻意没有**新增任何删除能力：只读元数据。
 
 ---
 

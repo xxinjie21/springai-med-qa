@@ -553,6 +553,24 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D54 cold store gauges and the derivative-free rule")
+    void apiChapterDocumentsTheD54ColdStoreMetrics() {
+        // D53 回答「作业还活着吗」，D54 是读者第一次知道「活着也可能追不上」的地方。要钉住的是两条
+        // 读者最容易撤销的边界：积压量只由被允许删除的运行发布（dry-run 的积压不可能下降，发出去会让
+        // 只测量的部署被永久 page），以及三个 gauge 懒注册且没有开关（预先导出的 0 会被读成「冷库是
+        // 空的」）。小节标题整行断言：裸「（D54）」会被路线图进度行满足。
+        assertThat(readme).contains("（D54）");
+        assertThat(readme).contains("#### 冷库规模与年龄上报（D54）");
+        assertThat(readme).contains("med_qa_cold_store_rows");
+        assertThat(readme).contains("med_qa_cold_store_oldest_row_age_seconds");
+        assertThat(readme).contains("med_qa_cold_store_reclaim_backlog");
+        assertThat(readme).contains("MedQaColdStoreBacklogGrowing");
+        assertThat(readme).contains("MedColdStoreMetrics");
+        assertThat(readme).contains("MedColdStoreMetricsTest");
+        assertThat(readme).contains("MedColdStoreMetricsConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

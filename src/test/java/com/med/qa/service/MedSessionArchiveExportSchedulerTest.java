@@ -4,8 +4,10 @@ import com.med.qa.alert.MedAlertNotifier;
 import com.med.qa.alert.MedAlertSeverity;
 import com.med.qa.common.exception.BizException;
 import com.med.qa.common.exception.ErrorCode;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRun;
 import com.med.qa.job.MedJobRunLedger;
+import com.med.qa.mapper.SessionArchiveMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -47,6 +49,12 @@ import static org.mockito.Mockito.when;
  * run ledger, whose staleness is what a dead job cannot suppress. The ledger is exercised for real over a
  * {@code SimpleMeterRegistry} rather than mocked, because the assertion that matters is the meter a
  * Prometheus scrape would read.</p>
+ *
+ * <p>D54 adds the export's share of the cold store's observability: the export runs more often than the
+ * reclaim, so after every run that held the cluster mutex — dry-run runs included, because the size of
+ * the cold store is a fact about the data rather than about an action — it refreshes the
+ * {@code med_qa_cold_store_*} size gauges. A run that stepped aside for another replica records nothing:
+ * the replica that held the mutex is doing the measuring.</p>
  */
 class MedSessionArchiveExportSchedulerTest {
 
@@ -64,6 +72,10 @@ class MedSessionArchiveExportSchedulerTest {
 
     private MedJobRunLedger ledger;
 
+    private SessionArchiveMapper archiveMapper;
+
+    private MedColdStoreMetrics coldStoreMetrics;
+
     private MedSessionArchiveExportScheduler scheduler;
 
     @SuppressWarnings("unchecked")
@@ -75,8 +87,16 @@ class MedSessionArchiveExportSchedulerTest {
         when(notifierProvider.getIfAvailable()).thenReturn(notifier);
         registry = new SimpleMeterRegistry();
         ledger = new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC));
+        // The cold-store publisher is exercised for real over the same registry, for the same reason as
+        // the ledger: what is asserted is the meter a Prometheus scrape would read.
+        archiveMapper = mock(SessionArchiveMapper.class);
+        when(archiveMapper.countArchivedMessages()).thenReturn(9_001L);
+        when(archiveMapper.oldestArchivedMessageCreatedAt())
+                .thenReturn(BOOT.toEpochMilli() - 7_200_000L);
+        coldStoreMetrics =
+                new MedColdStoreMetrics(archiveMapper, registry, Clock.fixed(BOOT, ZoneOffset.UTC));
         scheduler = new MedSessionArchiveExportScheduler(exportService, notifierProvider, ledger,
-                Duration.ofHours(6));
+                coldStoreMetrics, Duration.ofHours(6));
     }
 
     @Test
@@ -213,17 +233,21 @@ class MedSessionArchiveExportSchedulerTest {
     @DisplayName("no collaborator may be null")
     void collaboratorsMustNotBeNull() {
         assertThatThrownBy(() -> new MedSessionArchiveExportScheduler(null, notifierProvider, ledger,
-                Duration.ofHours(6)))
+                coldStoreMetrics, Duration.ofHours(6)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("exportService must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportScheduler(exportService, null, ledger,
-                Duration.ofHours(6)))
+                coldStoreMetrics, Duration.ofHours(6)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("notifier must not be null");
         assertThatThrownBy(() -> new MedSessionArchiveExportScheduler(exportService, notifierProvider,
-                null, Duration.ofHours(6)))
+                null, coldStoreMetrics, Duration.ofHours(6)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("ledger must not be null");
+        assertThatThrownBy(() -> new MedSessionArchiveExportScheduler(exportService, notifierProvider,
+                ledger, null, Duration.ofHours(6)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("coldStoreMetrics must not be null");
     }
 
     // ------------------------------------------------------------------ the run ledger (D53)
@@ -275,7 +299,7 @@ class MedSessionArchiveExportSchedulerTest {
                 spy(new MedJobRunLedger(registry, Clock.fixed(BOOT, ZoneOffset.UTC)));
         MedSessionArchiveExportScheduler schedulerWithSpy =
                 new MedSessionArchiveExportScheduler(exportService, notifierProvider, spiedLedger,
-                        Duration.ofHours(6));
+                        coldStoreMetrics, Duration.ofHours(6));
         when(exportService.exportOnce()).thenThrow(new IllegalStateException("boom"));
 
         assertThat(schedulerWithSpy.exportNow()).isEmpty();
@@ -285,6 +309,66 @@ class MedSessionArchiveExportSchedulerTest {
         order.verify(notifier).raise(any(MedAlertSeverity.class), anyString(), anyString(), anyString());
         assertThat(spiedLedger.lastSuccessEpochSeconds(MedSessionArchiveExportScheduler.COMPONENT))
                 .isEqualTo(BOOT_EPOCH_SECONDS);
+    }
+
+    // ------------------------------------------------------------------ the cold store (D54)
+
+    @Test
+    @DisplayName("a completed run refreshes the cold store's size gauges, dry run included")
+    void completedRunRefreshesTheSizeGauges() {
+        when(exportService.exportOnce()).thenReturn(report(3, 0, 0, 1, 0L));
+
+        scheduler.exportNow();
+
+        assertThat(gauge(MedColdStoreMetrics.ROWS_GAUGE)).isEqualTo(9_001d);
+        assertThat(gauge(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE)).isEqualTo(7_200d);
+        // The export never owns the reclaim backlog: publishing it here would attribute a number to a
+        // job that did not measure it.
+        assertThat(registry.find(MedColdStoreMetrics.RECLAIM_BACKLOG_GAUGE).gauge()).isNull();
+    }
+
+    @Test
+    @DisplayName("a dry run refreshes the size gauges too, because size is a fact about the data")
+    void dryRunRefreshesTheSizeGauges() {
+        when(exportService.exportOnce())
+                .thenReturn(new SessionArchiveExportReport(
+                        SessionArchiveExportReport.Outcome.COMPLETED, true, 5, 0, 0, 0, 0, 1, 5L, 2L,
+                        List.of()));
+
+        scheduler.exportNow();
+
+        assertThat(gauge(MedColdStoreMetrics.ROWS_GAUGE)).isEqualTo(9_001d);
+        assertThat(gauge(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE)).isEqualTo(7_200d);
+    }
+
+    @Test
+    @DisplayName("a run that stepped aside publishes nothing: the replica holding the mutex measures")
+    void skippedRunPublishesNothing() {
+        when(exportService.exportOnce()).thenReturn(SessionArchiveExportReport.skipped(3L));
+
+        scheduler.exportNow();
+
+        assertThat(registry.find(MedColdStoreMetrics.ROWS_GAUGE).gauge()).isNull();
+        assertThat(registry.find(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE).gauge()).isNull();
+    }
+
+    @Test
+    @DisplayName("a failed run publishes nothing, so a stale gauge cannot look like a fresh measurement")
+    void failedRunPublishesNothing() {
+        when(exportService.exportOnce())
+                .thenThrow(new BizException(ErrorCode.STORAGE_ERROR, "mysql down"));
+
+        assertThat(scheduler.exportNow()).isEmpty();
+
+        assertThat(registry.find(MedColdStoreMetrics.ROWS_GAUGE).gauge()).isNull();
+        assertThat(registry.find(MedColdStoreMetrics.OLDEST_ROW_AGE_GAUGE).gauge()).isNull();
+    }
+
+    /** Reads one gauge out of the test registry, the way a Prometheus scrape would. */
+    private double gauge(String name) {
+        var gauge = registry.find(name).gauge();
+        assertThat(gauge).as("gauge %s must be registered", name).isNotNull();
+        return gauge.value();
     }
 
     private static SessionArchiveExportReport report(int exported, int mismatched, int failed,

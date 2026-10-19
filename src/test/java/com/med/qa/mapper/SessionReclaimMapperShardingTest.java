@@ -272,6 +272,52 @@ class SessionReclaimMapperShardingTest {
         assertEquals(0, countArchivedRows(sessionId));
     }
 
+    // ------------------------------------------------------------------ the cold-store aggregates (D54)
+
+    @Test
+    @DisplayName("the row count covers the whole cold table and only the cold table")
+    void countsEveryColdRowAndNothingElse() {
+        insertArchived("a", "m-1");
+        insertArchived("a", "m-2");
+        insertArchived("b", "m-1");
+        // A hot shard row and a session row are not the cold store: counting them would make the
+        // published size a number no operator can reason about.
+        insert(session("live", SessionStatus.ACTIVE));
+        insertMessage("live");
+
+        long coldRows = inArchive(mapper -> mapper.countArchivedMessages());
+        assertEquals(3L, coldRows);
+    }
+
+    @Test
+    @DisplayName("the row count shrinks when the reclaim retires a copy, which is what the rule watches")
+    void countFollowsTheReclaim() {
+        insertArchived("a", "m-1");
+        insertArchived("a", "m-2");
+        insertArchived("b", "m-1");
+
+        inArchive(mapper -> mapper.deleteColdCopy("a"));
+
+        long coldRows = inArchive(mapper -> mapper.countArchivedMessages());
+        assertEquals(1L, coldRows);
+    }
+
+    @Test
+    @DisplayName("the oldest row's creation instant is the minimum, and an empty store reports zero")
+    void oldestColdRowIsTheMinimum() {
+        // Empty first: COALESCE is what keeps "no rows at all" from turning into "age = now" downstream.
+        long empty = inArchive(mapper -> mapper.oldestArchivedMessageCreatedAt());
+        assertEquals(0L, empty);
+
+        inArchive(mapper -> mapper.insertIfAbsent(new ArchivedMessageDO("a", "m-1", TENANT, DEPT,
+                "patient-1", TOUCHED_AT + 1_000, TOUCHED_AT, new byte[] {1})));
+        inArchive(mapper -> mapper.insertIfAbsent(new ArchivedMessageDO("a", "m-2", TENANT, DEPT,
+                "patient-1", TOUCHED_AT - 1_000, TOUCHED_AT, new byte[] {2})));
+
+        long oldest = inArchive(mapper -> mapper.oldestArchivedMessageCreatedAt());
+        assertEquals(TOUCHED_AT - 1_000, oldest);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private static void insert(ChatSessionDO session) {

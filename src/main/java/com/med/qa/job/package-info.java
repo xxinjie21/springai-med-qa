@@ -15,6 +15,14 @@
  * <em>staleness</em> of those timestamps, which is the only kind of signal that survives the job
  * itself being gone.</p>
  *
+ * <p>{@link com.med.qa.job.MedColdStoreMetrics} (D54) answers the question the ledger cannot: not
+ * "is the job alive" but "is the job keeping up". The ledger and every job-specific alert describe one
+ * run at a time, so a reclaim that falls further behind every day looks exactly like one that retires
+ * every orphan. The cold store's row count, the age of its oldest row and the orphan backlog the last
+ * deleting run left behind are published as the {@code med_qa_cold_store_*} gauges, and
+ * {@code MedQaColdStoreBacklogGrowing} compares the backlog against itself. Both components read
+ * metadata only — aggregates over the cold table, never a payload.</p>
+ *
  * <p>Two boundaries are deliberate and documented rather than accidental:</p>
  *
  * <ul>
@@ -22,8 +30,10 @@
  *       are <em>not</em> registered. Their liveness is a chicken-and-egg problem -- the alert chain
  *       cannot report that its own producer died -- and the process-level
  *       {@code MedQaTargetDown} rule is what covers it;</li>
- *   <li>the ledger has no on/off switch. It is the only evidence that a job did not run, so a switch
- *       that removed it would remove the observability of all four jobs at once.</li>
+ *   <li>neither component has an on/off switch. The ledger is the only evidence that a job did not
+ *       run, and the cold-store gauges are registered lazily on the first measurement, so a deployment
+ *       whose jobs are all switched off publishes nothing rather than a zero -- "deliberately disabled"
+ *       is an operator decision, not a page.</li>
  * </ul>
  *
  * <p>Everything is built on maintained components: Micrometer for the meters, {@code java.time} for

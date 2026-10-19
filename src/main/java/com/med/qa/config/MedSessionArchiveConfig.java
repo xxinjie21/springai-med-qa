@@ -1,6 +1,7 @@
 package com.med.qa.config;
 
 import com.med.qa.alert.MedAlertNotifier;
+import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRunLedger;
 import com.med.qa.mapper.ChatMessageMapper;
 import com.med.qa.mapper.ChatSessionMapper;
@@ -94,10 +95,16 @@ public class MedSessionArchiveConfig {
      * published value, would then be tuned to a schedule the job does not actually run on. Passing the
      * bound property in makes the two read the same source.</p>
      *
-     * @param exportService the export this scheduler drives
-     * @param notifier      provider of the alert dispatcher
-     * @param ledger        the run ledger the scheduler records into
-     * @param properties    the {@code med.session.archive.*} policy, source of the check interval
+     * <p>The D54 cold-store metrics arrive as a required dependency for the same reason: the export runs
+     * more often than the reclaim, so it is the better refresher of the cold store's size gauges, and a
+     * replica that could not reach the publisher would silently stop reporting how big the table it
+     * fills has become.</p>
+     *
+     * @param exportService    the export this scheduler drives
+     * @param notifier         provider of the alert dispatcher
+     * @param ledger           the run ledger the scheduler records into
+     * @param coldStoreMetrics the publisher of the cold store's size gauges
+     * @param properties       the {@code med.session.archive.*} policy, source of the check interval
      * @return the scheduler
      */
     @Bean(SCHEDULER)
@@ -105,8 +112,9 @@ public class MedSessionArchiveConfig {
             MedSessionArchiveExportService exportService,
             ObjectProvider<MedAlertNotifier> notifier,
             MedJobRunLedger ledger,
+            MedColdStoreMetrics coldStoreMetrics,
             MedSessionArchiveProperties properties) {
-        return new MedSessionArchiveExportScheduler(exportService, notifier, ledger,
+        return new MedSessionArchiveExportScheduler(exportService, notifier, ledger, coldStoreMetrics,
                 properties.getCheckInterval());
     }
 }
