@@ -2,6 +2,7 @@ package com.med.qa.ci;
 
 import com.med.qa.job.MedColdStoreMetrics;
 import com.med.qa.job.MedJobRunLedger;
+import com.med.qa.service.MedAuditLogRetentionScheduler;
 import com.med.qa.service.MedSessionArchiveExportScheduler;
 import com.med.qa.service.MedSessionPurgeScheduler;
 import com.med.qa.service.MedSessionReclaimScheduler;
@@ -521,6 +522,48 @@ class AlertingStackConfigTest {
     }
 
     @Test
+    @DisplayName("the D55 retention rule selects the code the scheduler actually exports")
+    void auditLogRetentionRuleMatchesTheExportedCode() throws IOException {
+        // Same two-literals trap as every earlier job rule: the code string in the rule file and the
+        // constant the scheduler raises live in different files and must agree. A drifted one leaves a
+        // rule that parses, scrapes and never fires - and the failure it exists for (a trim that stopped
+        // running) is invisible otherwise, because a failed run loses nothing by itself.
+        String scheduler =
+                read("src/main/java/com/med/qa/service/MedAuditLogRetentionScheduler.java");
+        assertThat(scheduler).contains(MedAuditLogRetentionScheduler.AUDIT_LOG_RETENTION_FAILED);
+        assertThat(read(ALERT_RULES))
+                .contains("code=\"" + MedAuditLogRetentionScheduler.AUDIT_LOG_RETENTION_FAILED + "\"");
+        assertThat(read(ALERT_RULES)).contains("MedQaAuditLogRetentionFailed");
+        // The trim deletes rows that exist nowhere else, but a failed run removes nothing: the cost is
+        // an audit trail that stops shrinking, so this warns rather than pages.
+        assertThat(read(ALERT_RULES)).contains("component: audit-log-retention");
+        assertThat(read(ALERT_RULES)).contains("severity: warning");
+    }
+
+    @Test
+    @DisplayName("the audit retention switches are declared in application.yml and default to off and dry")
+    void auditLogRetentionPropertiesAreDeclared() {
+        List<String> variables = List.of(
+                "MED_AUDIT_LOG_RETENTION_ENABLED",
+                "MED_AUDIT_LOG_RETENTION_DRY_RUN",
+                "MED_AUDIT_LOG_RETENTION_DAYS",
+                "MED_AUDIT_LOG_RETENTION_BATCH_SIZE",
+                "MED_AUDIT_LOG_RETENTION_MAX_BATCHES",
+                "MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL",
+                "MED_AUDIT_LOG_RETENTION_INITIAL_DELAY");
+
+        variables.forEach(variable -> assertThat(applicationYml)
+                .as("%s must be a real placeholder", variable)
+                .contains(variable));
+        // The first job in the project whose deletions have no second copy keeps the same two
+        // conservative defaults as the session jobs, and adds a floor under the retention window that
+        // the properties class enforces at binding time (a misconfigured window fails the context
+        // instead of trimming the compliance record).
+        assertThat(applicationYml).contains("MED_AUDIT_LOG_RETENTION_ENABLED:false");
+        assertThat(applicationYml).contains("MED_AUDIT_LOG_RETENTION_DRY_RUN:true");
+    }
+
+    @Test
     @DisplayName("the D53 job-liveness rules select exactly the meters the ledger publishes")
     void jobLivenessRulesSelectTheLedgerMeters() throws IOException {
         // The ledger and the rule file are two files that have to agree on a vocabulary of metric names. A
@@ -595,17 +638,23 @@ class AlertingStackConfigTest {
     }
 
     @Test
-    @DisplayName("the job-liveness selector covers the four maintenance jobs and not the alert monitors")
+    @DisplayName("the job-liveness selector covers the five maintenance jobs and not the alert monitors")
     void jobLivenessSelectorCoversTheMaintenanceJobs() throws IOException {
         // D53 deliberately leaves the two alert monitors out: their liveness is a chicken-and-egg problem --
         // the alert chain cannot report that its own producer died -- and MedQaTargetDown covers it at the
         // process level. Asserting the selector keeps that boundary from being a comment nobody checks.
-        String selector = "session-.*";
+        //
+        // D55 widened the selector to its fifth job. Widening it is the whole point: a selector left at
+        // `session-.*` parses, scrapes and never matches the audit-log trim, which is exactly the silent
+        // failure D53 exists to remove - so the widened selector is asserted literally, together with the
+        // fact that every maintenance component really matches it and the monitors still do not.
+        String selector = "session-.*|audit-log-retention";
         assertThat(List.of(
                 MedSessionRetentionScheduler.COMPONENT,
                 MedSessionArchiveExportScheduler.COMPONENT,
                 MedSessionPurgeScheduler.COMPONENT,
-                MedSessionReclaimScheduler.COMPONENT))
+                MedSessionReclaimScheduler.COMPONENT,
+                MedAuditLogRetentionScheduler.COMPONENT))
                 .allSatisfy(component -> assertThat(Pattern.matches(selector, component)).isTrue());
         assertThat(Pattern.matches(selector, "storage")).isFalse();
         assertThat(Pattern.matches(selector, "vector-index")).isFalse();

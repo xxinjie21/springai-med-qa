@@ -71,4 +71,19 @@
         <include refid="filterConditions"/>
     </select>
 
+    <!-- Retention trim (D55). The only delete in this mapper, and the only pair of statements that
+         reads the table without a tenant dimension; V7's idx_med_audit_log_retention exists for
+         them. LIMIT without ORDER BY is deliberate: see the mapper javadoc. -->
+    <select id="countAuditLogsCreatedBefore" resultType="long">
+        SELECT COUNT(*)
+        FROM med_audit_log
+        WHERE created_at &lt; #{createdBefore}
+    </select>
+
+    <delete id="deleteAuditLogsCreatedBefore">
+        DELETE FROM med_audit_log
+        WHERE created_at &lt; #{createdBefore}
+        LIMIT #{limit}
+    </delete>
+
 </mapper>

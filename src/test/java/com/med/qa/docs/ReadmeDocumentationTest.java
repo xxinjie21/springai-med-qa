@@ -571,6 +571,24 @@ class ReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the README documents the D55 audit trim, the floor and the no-cold-export decision")
+    void apiChapterDocumentsTheD55AuditLogRetention() {
+        // D53/D54 之后，最后一张只增不减的表是审计轨迹。要钉住的是读者最容易撤销的三条边界：保留
+        // 窗口本身就是守卫（审计行没有第二份副本，D50/D52 那套删前证明在这里不存在）、下限 90 天把
+        // 误配变成启动失败、以及刻意不建冷库（V3 自己的论证）。小节标题整行断言：裸「（D55）」会被
+        // 路线图进度行满足。
+        assertThat(readme).contains("（D55）");
+        assertThat(readme).contains("#### 审计日志的保留裁剪（D55）");
+        assertThat(readme).contains("MedAuditLogRetentionService");
+        assertThat(readme).contains("MED_AUDIT_LOG_RETENTION_ENABLED");
+        assertThat(readme).contains("med:lock:audit-log:retention");
+        assertThat(readme).contains("audit-log-retention-completed");
+        assertThat(readme).contains("MedQaAuditLogRetentionFailed");
+        assertThat(readme).contains("AuditLogRetentionMapperShardingTest");
+        assertThat(readme).contains("MedAuditLogRetentionConfigTest");
+    }
+
+    @Test
     @DisplayName("the README links the deployment handbook and the linked file exists")
     void deploymentHandbookIsLinkedAndPresent() {
         assertThat(readme).contains("./docs/DEPLOYMENT.md");

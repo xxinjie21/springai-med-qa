@@ -529,6 +529,26 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D55 audit trim, the floor and the no-cold-export decision")
+    void apiChapterDocumentsTheD55AuditLogRetention() {
+        // After D53/D54, the last append-only table is the audit trail. The three boundaries a reader
+        // would otherwise undo: the retention window itself is the guard (an audit row has no second
+        // copy, so D50/D52's prove-it-exists-elsewhere pattern is unavailable), the 90-day floor turns a
+        // misconfiguration into a startup failure, and no cold store is built - which is V3's own
+        // argument applied to itself. The heading is asserted whole: a bare "D55" is satisfied by the
+        // roadmap row.
+        assertThat(english).contains("D55");
+        assertThat(english).contains("#### Trimming the audit trail after its retention window (D55)");
+        assertThat(english).contains("MedAuditLogRetentionService");
+        assertThat(english).contains("MED_AUDIT_LOG_RETENTION_ENABLED");
+        assertThat(english).contains("med:lock:audit-log:retention");
+        assertThat(english).contains("audit-log-retention-completed");
+        assertThat(english).contains("MedQaAuditLogRetentionFailed");
+        assertThat(english).contains("AuditLogRetentionMapperShardingTest");
+        assertThat(english).contains("MedAuditLogRetentionConfigTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));

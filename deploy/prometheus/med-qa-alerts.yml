@@ -298,6 +298,30 @@ groups:
             age of the table itself.
           runbook: "docs/DEPLOYMENT.md#715-冷库规模与年龄上报d54"
 
+      - alert: MedQaAuditLogRetentionFailed
+        # D55. The audit trail is append-only by design and its retention trim is the only delete
+        # against it. A failed run loses nothing on its own, but the trail stops shrinking - and,
+        # unlike the session jobs, this one deletes rows that exist nowhere else, so an operator
+        # reading this alert wants to know immediately whether the run armed itself correctly
+        # (dry-run deployments never fail on the delete path, they only count) before looking at
+        # MySQL. Liveness itself is covered by the two D53 stall rules, whose selector this job's
+        # component was added to: a trim that stopped running emits no failed alert at all.
+        expr: increase(med_qa_alert_total{code="audit-log-retention-failed"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: audit-log-retention
+        annotations:
+          summary: "The audit log retention trim is failing"
+          description: >-
+            MedAuditLogRetentionScheduler reported a failed run, so med_audit_log keeps rows past the
+            retention window. Check MySQL reachability and Redis (the run takes the cluster-wide mutex
+            med:lock:audit-log:retention before touching any row), then review med.audit-log.retention.* -
+            a dry-run deployment counts and reports without deleting anything, which is not a failure.
+            Nothing is lost by the failed run itself: the trim only ever removes rows already past the
+            cutoff, so the next successful run resumes exactly where this one stopped.
+          runbook: "docs/DEPLOYMENT.md#716-审计日志的保留裁剪d55"
+
       - alert: MedQaBackgroundJobStalled
         # D53. Every other rule in this file is produced BY the component it watches, so none of them can
         # report that the component stopped running: a maintenance job that never fires emits no failure
@@ -310,8 +334,8 @@ groups:
         # it arms the job with, so slowing a job down does not mean editing this file. A job that is
         # deliberately switched off publishes no series at all and can never reach this rule.
         expr: >-
-          time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*"}
-          > 2.5 * med_qa_job_expected_interval_seconds{component=~"session-.*"} + 300
+          time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*|audit-log-retention"}
+          > 2.5 * med_qa_job_expected_interval_seconds{component=~"session-.*|audit-log-retention"} + 300
         for: 15m
         labels:
           severity: warning
@@ -337,8 +361,8 @@ groups:
         # precisely because it is produced by the absence of data: no alert the job itself emits can cover a
         # job that emits nothing.
         expr: >-
-          time() - max by (component) (med_qa_job_last_success_epoch_seconds{component=~"session-.*"})
-          > 2.5 * max by (component) (med_qa_job_expected_interval_seconds{component=~"session-.*"}) + 300
+          time() - max by (component) (med_qa_job_last_success_epoch_seconds{component=~"session-.*|audit-log-retention"})
+          > 2.5 * max by (component) (med_qa_job_expected_interval_seconds{component=~"session-.*|audit-log-retention"}) + 300
         for: 15m
         labels:
           severity: critical

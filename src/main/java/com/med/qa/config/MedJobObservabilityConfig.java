@@ -9,12 +9,13 @@ import org.springframework.context.annotation.Configuration;
  * Contributes the background job run ledger (D53).
  *
  * <h2>Why this configuration has no switch</h2>
- * <p>Every other capability in this project is gated by a property, and the four maintenance jobs are
+ * <p>Every other capability in this project is gated by a property, and the maintenance jobs are
  * gated twice ({@code enabled=false} and {@code dry-run=true}). This one deliberately is not. The
  * ledger is the only artefact in the system that can say "the retention sweep has not run since March",
  * and the situation it exists for is precisely the one where a job produces nothing at all -- no alert,
  * no log, no metric. An operator who could switch the ledger off would be switching off the
- * observability of all four jobs at once, and the deployment would look healthy while doing it. The
+ * observability of every job at once (five since D55), and the deployment would look healthy while
+ * doing it. The
  * Prometheus rules are scoped by the {@code job} label instead, so a job that is switched off simply
  * stops publishing its series and stops being paged.</p>
  *

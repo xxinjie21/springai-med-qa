@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Runtime accounting for every background maintenance job in this application.
  *
  * <h2>Why this exists</h2>
- * <p>Each of the four maintenance jobs documents the same sentence: a job that stopped running looks
+ * <p>Each of the maintenance jobs documents the same sentence: a job that stopped running looks
  * exactly like a hospital with nothing to clean up. Every one of them answered it with an alert that
  * fires <em>from inside the job</em>, so the sentence remained true -- a job that never runs produces
  * no failure alert and no completion notice, which means "healthy and idle" and "dead since March"
@@ -23,13 +23,13 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>This ledger publishes the only kind of signal that survives that: <em>the absence of data</em>.
  * A stale timestamp cannot be produced by a job that is not running, and it cannot be suppressed by a
- * broken alert chain either. That is why the four jobs record into it and why the Prometheus rules in
+ * broken alert chain either. That is why every job records into it and why the Prometheus rules in
  * {@code deploy/prometheus/med-qa-alerts.yml} page on the staleness rather than on an event.</p>
  *
  * <h2>Two timestamps, not one</h2>
  * <ul>
  *   <li>{@value #LAST_RUN_GAUGE} -- when this instance last <em>attempted</em> the job. It advances for
- *       every outcome, including {@link MedJobOutcome#SKIPPED_LOCK_HELD}. That is deliberate: the four
+ *       every outcome, including {@link MedJobOutcome#SKIPPED_LOCK_HELD}. That is deliberate: the
  *       jobs share a cluster-wide mutex, so on a multi-replica deployment every replica but one steps
  *       aside on every cycle. Folding "stepped aside" into "did not run" would make this series report
  *       a healthy cluster as dead.</li>
@@ -67,7 +67,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The two alert monitors are not registered. "Is the alert producer alive" is a chicken-and-egg
  * question that no alert chain can answer about itself, so it stays with the process-level rule. And
  * there is no switch on this class: it is the only evidence that a job did not run, so an operator who
- * could switch it off would be switching off the observability of all four jobs at once.</p>
+ * could switch it off would be switching off the observability of every job at once.</p>
  */
 public class MedJobRunLedger {
 

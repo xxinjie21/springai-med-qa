@@ -318,6 +318,24 @@ med:
     max-resource-type-length: ${MED_AUDIT_MAX_RESOURCE_TYPE_LENGTH:32}
     max-resource-id-length: ${MED_AUDIT_MAX_RESOURCE_ID_LENGTH:128}
     max-message-length: ${MED_AUDIT_MAX_MESSAGE_LENGTH:500}
+  # Audit trail retention trim (D55): the database-level job AuditLogMapper's javadoc has promised
+  # since D23. It is the only delete against med_audit_log, it has no request-path caller, and it
+  # deletes rows that exist nowhere else - hence the two switches (both default to the conservative
+  # side) and the floor under retention-days (a window below med.audit-log.retention.retention-days
+  # of less than 90 days fails the context at startup instead of trimming recent compliance
+  # records). Runs on a fixed delay and reports through the same channels as the D47/D48/D50/D52
+  # session jobs, including the D53 run ledger.
+  audit-log:
+    retention:
+      enabled: ${MED_AUDIT_LOG_RETENTION_ENABLED:false}
+      dry-run: ${MED_AUDIT_LOG_RETENTION_DRY_RUN:true}
+      retention-days: ${MED_AUDIT_LOG_RETENTION_DAYS:365}
+      batch-size: ${MED_AUDIT_LOG_RETENTION_BATCH_SIZE:500}
+      max-batches: ${MED_AUDIT_LOG_RETENTION_MAX_BATCHES:5}
+      check-interval: ${MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL:24h}
+      initial-delay: ${MED_AUDIT_LOG_RETENTION_INITIAL_DELAY:15m}
+      lock-wait-time: ${MED_AUDIT_LOG_RETENTION_LOCK_WAIT:5s}
+      lock-lease-time: ${MED_AUDIT_LOG_RETENTION_LOCK_LEASE:5m}
   # Annotation-driven rate limiting (D25): per-caller, per-endpoint buckets backed by Redisson's
   # distributed RRateLimiter. enabled defaults to true; the offline test suite and local dev set
   # MED_RATE_LIMIT_ENABLED=false so the @RateLimit advice becomes a pass-through and never touches Redis.

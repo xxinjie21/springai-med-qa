@@ -870,7 +870,7 @@ on it would fire for the entire life of a correct deployment. This is the sevent
 defect class (a comment promising behaviour no code provides), and the first where the promised guard did not
 exist in any form at all. All three false claims were corrected in D53.
 
-`MedJobRunLedger` (new package `com.med.qa.job`) is one ledger shared by all four jobs: each registers itself
+`MedJobRunLedger` (new package `com.med.qa.job`) is one ledger shared by every background job (five since D55): each registers itself
 once at assembly time (idempotently) and records one entry per run -- **whether it completed, stepped aside
 for another replica or threw**. It publishes four Micrometer meters:
 
@@ -920,13 +920,13 @@ Guard tests: `MedJobRunLedgerTest` (registration is idempotent and does **not** 
 timestamps equal the registration instant -- the executable form of "a restart does not page",
 `SKIPPED_LOCK_HELD` refreshes only `last_run`, `FAILED` refreshes only `last_run`, each outcome is counted,
 recording for an unregistered job is refused outright, and two jobs never bleed into each other's tags),
-`MedJobRunTest`, `MedJobObservabilityConfigTest` (**the ledger is still there with all four jobs switched
+`MedJobRunTest`, `MedJobObservabilityConfigTest` (**the ledger is still there with every job switched
 off**), the four `*SchedulerTest` suites (each outcome reaches the ledger, and on a failure the ledger is
 written **before** the alert is raised, asserted with `InOrder` -- a broken alert chain must not take the
 only remaining evidence with it), the four `*ConfigTest` suites (**the interval the ledger publishes and the
 one the `@Scheduled` placeholder reads are the same `check-interval`**; a literal fallback taking over turns
 that red), and `AlertingStackConfigTest` (every `med_qa_job_*` name in the rules must be a `MedJobRunLedger`
-constant, all three gauges must be referenced, the selector must match the four jobs' components and **not**
+constant, all three gauges must be referenced, the selector must match every job's components and **not**
 the two monitors', and the scrape config must not enable `honor_labels`). As the project's convention
 requires, the new guards were **watched to go red**: refreshing `last_run` only on `COMPLETED`, re-seeding
 the timestamps on every registration, and deleting this chapter's heading each turned the corresponding cases
@@ -984,6 +984,48 @@ case in each of the three documentation guards red, and dropping the dry-run bou
 `MedSessionReclaimScheduler` turned "a dry run publishes the size but no backlog" red. All were restored and
 re-run green.
 
+#### Trimming the audit trail after its retention window (D55)
+
+**After D53/D54, the last append-only table is the audit trail.** `AuditLogMapper`'s javadoc has said since
+D23 that the trail is append-only and that "retention trimming belongs to a database-level job with its own
+authorization, not to the request path that produced the entry" -- **but that job never existed**. So
+`med_audit_log` gains a row with every audited medical operation and no code ever removed one: a hospital
+running a few thousand consultations a day grows its audit table without bound, with no retention policy and
+no metric saying how big it is. This is the eighth appearance of the same deviation class from stages 8-13
+(**a comment promising behaviour the code does not have**), shaped like D53 -- the promised background
+capability did not exist in a single line of code.
+
+`MedAuditLogRetentionService` builds that job, in the same shape as the four session jobs:
+
+| Dimension | Decision |
+|---|---|
+| Who may delete | **Only the timer.** No HTTP endpoint can trigger a trim -- that is exactly the request-path delete the mapper's javadoc rules out |
+| What is deleted | rows whose `created_at` is before `now - retention-days`, across every tenant; `DELETE ... WHERE created_at < ? LIMIT ?`, at most `max-batches` such statements per run |
+| On what authority | **the retention window itself is the guard.** An audit row has no second copy, so the "prove it still exists elsewhere" guards of D50/D52 are unavailable here and impossible in principle; `retention-days` therefore has a **floor of 90 days**, and a window below it is a **startup failure**, not a silent trim |
+| Why no cold export | Migration V3 argues the audit table deliberately carries no clinical payload -- "duplicating protected health information into a second store with its own retention rules is a liability". A cold archive for audit rows would be precisely that |
+| Mutex | Redisson `RLock`, key `med:lock:audit-log:retention` (not configurable); losing the race records `skipped-lock-held` without reading a single row; Redis unreachable propagates |
+| Defaults | `enabled=false` **and** `dry-run=true`; a dry run deletes nothing but reports an **exact simulation** of `deleted` (per batch `min(remaining expired, batch-size)`), so an operator can compute how many runs arming the switch would take |
+| Failure semantics | **a failed batch ends the run** (deliberately unlike the four session jobs, where one candidate's failure never aborts the run): a batch that cannot be deleted usually means MySQL is unhappy, and a partial report would only understate the loss |
+| V7 migration | `idx_med_audit_log_retention (created_at)` -- the retention scan is the repository's second query without a tenant dimension, and all three existing composite indexes lead with `tenant_id`, so none can serve `created_at < ?` |
+
+Alerting and observability: `audit-log-retention-completed` (INFO, only when rows were really deleted and the
+run was not a dry run) and `audit-log-retention-failed` (warning, rule `MedQaAuditLogRetentionFailed`). The job
+registers with the run ledger as its **fifth job** (`component="audit-log-retention"`), so the two D53 stall
+rules' selector was widened from `session-.*` to `session-.*|audit-log-retention` -- not widening it is exactly
+the silent failure D53 exists to remove: the rule parses, scrapes and never matches the new job. **No audit
+table size gauge is published on purpose**: the table is *supposed* to grow by design, "is it keeping up" is
+answered by each run's `remaining` figure and by the ledger, and a gauge no rule consumes is unverified
+surface.
+
+Guard tests: `MedAuditLogRetentionServiceTest` (lock held means MySQL is never touched, a dry run deletes
+nothing and simulates exactly, the retention floor is rejected, a failed batch fails the whole run, only rows
+before the cutoff are deleted), `AuditLogRetentionMapperShardingTest` (both new statements on a real H2 +
+Flyway + ShardingSphere), `MedAuditLogRetentionPropertiesTest`, `MedAuditLogRetentionConfigTest`,
+`MedAuditLogRetentionSchedulerTest` (three outcomes recorded in the ledger, the ledger written **before** the
+alert on the failure path, no completion notice for a dry run), `AuditLogRetentionReportTest`, the three
+documentation guards, and `MedProductionStartupIntegrationTest`'s V7 assertion. As the project's convention
+requires, the new guards were **watched to go red**.
+
 ---
 
 ## Error codes
@@ -1036,6 +1078,10 @@ re-run green.
 | `MED_SESSION_RECLAIM_ENABLED` / `MED_SESSION_RECLAIM_DRY_RUN` | `false` / `true` | Reclaim of orphaned cold copies (off and report-only by default, and **deliberately with no cooling-off window**: it destroys no capability, see D52) |
 | `MED_SESSION_RETENTION_IDLE_THRESHOLD` / `MED_SESSION_RETENTION_BATCH_SIZE` / `MED_SESSION_RETENTION_MAX_BATCHES` | `24h` / `100` / `10` | Staleness window and per-run batch bounds |
 | `MED_SESSION_RETENTION_CHECK_INTERVAL` / `MED_SESSION_RETENTION_INITIAL_DELAY` | `1h` / `5m` | Retention sweep period and startup grace period |
+| `MED_AUDIT_LOG_RETENTION_ENABLED` / `MED_AUDIT_LOG_RETENTION_DRY_RUN` | `false` / `true` | Audit log retention trim (off and report-only by default, see D55) |
+| `MED_AUDIT_LOG_RETENTION_DAYS` | `365` | Retention window in days, **floored at 90 days**; below the floor the context fails to start |
+| `MED_AUDIT_LOG_RETENTION_BATCH_SIZE` / `MED_AUDIT_LOG_RETENTION_MAX_BATCHES` | `500` / `5` | Rows per delete statement and statements per run |
+| `MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL` / `MED_AUDIT_LOG_RETENTION_INITIAL_DELAY` | `24h` / `15m` | Trim period and startup grace period |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | Retrieval parameters |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | Ingestion limits |

@@ -15,7 +15,10 @@ import java.util.List;
  * <p>The trail is append-only by design: it exposes an insert and read paths, but no update and no
  * delete. An audit row that can be rewritten from the application is not evidence, and retention
  * trimming belongs to a database-level job with its own authorization, not to the request path that
- * produced the entry.</p>
+ * produced the entry. The two retention statements below are that job's only data access: they are
+ * deliberately the <em>only</em> delete this interface exposes, they take an age cutoff rather than
+ * any tenant/operator coordinate, and they exist so that no request-path caller ever has to build
+ * one (see {@code MedAuditLogRetentionService}).</p>
  *
  * <p>Like {@code med_session}, the table stays unsharded: audit reviews filter by
  * tenant/department/operator/action over a time window, which is an index-backed range scan on one
@@ -79,4 +82,38 @@ public interface AuditLogMapper {
                           @Param("operatorId") @Nullable String operatorId,
                           @Param("action") @Nullable String action,
                           @Param("outcome") @Nullable AuditOutcome outcome);
+
+    /**
+     * Counts the audit entries already past a retention cutoff, across every tenant and department.
+     *
+     * <p>Serves {@code med_audit_log}'s retention trim (D55) only. It is the second query in the
+     * repository without a tenant dimension (the first is the D47 session sweep), which is why
+     * migration V7 adds {@code idx_med_audit_log_retention}: without it this count is a full table
+     * scan of the whole trail on every run.</p>
+     *
+     * @param createdBefore exclusive upper bound on {@code created_at} (epoch milliseconds); rows
+     *                      stamped at or after it are inside the retention window and are never
+     *                      counted
+     * @return the number of expired entries, never negative
+     */
+    long countAuditLogsCreatedBefore(@Param("createdBefore") long createdBefore);
+
+    /**
+     * Deletes at most {@code limit} audit entries past a retention cutoff, across every tenant and
+     * department.
+     *
+     * <p>The predicate and the bound are one statement ({@code DELETE … WHERE created_at < ? LIMIT ?})
+     * so a run can never remove more than one batch in one transaction. There is deliberately no
+     * {@code ORDER BY}: every expired row is equally outside the window, so ordering would only add
+     * work — and H2's {@code DELETE} does not support it, while the statement has to run unchanged
+     * against both backends (MySQL in production, H2 in MySQL compatibility mode in tests).</p>
+     *
+     * @param createdBefore exclusive upper bound on {@code created_at} (epoch milliseconds)
+     * @param limit         maximum number of rows this statement may delete, must be strictly
+     *                      positive
+     * @return the number of deleted rows; fewer than {@code limit} means the expired backlog is
+     *         drained
+     */
+    int deleteAuditLogsCreatedBefore(@Param("createdBefore") long createdBefore,
+                                     @Param("limit") int limit);
 }

@@ -123,7 +123,7 @@ class MedProductionStartupIntegrationTest {
                         .contains("med_message_" + shard);
             }
             assertThat(tables).contains("flyway_schema_history");
-            assertThat(appliedMigrationCount()).as("V1 to V6 must all be applied").isEqualTo(6);
+            assertThat(appliedMigrationCount()).as("V1 to V7 must all be applied").isEqualTo(7);
             // V4 exists for the D47 retention sweep, whose query is the only one in the repository
             // without a tenant dimension. Asserted against the real server because the index is what
             // keeps that sweep off a full table scan: H2 accepting the DDL does not prove MySQL does.
@@ -153,6 +153,14 @@ class MedProductionStartupIntegrationTest {
             assertThat(nullableColumns(MIGRATED_SCHEMA, "med_session"))
                     .as("a session that was never purged must be able to hold NULL")
                     .contains("purged_at");
+            // V7 indexes the D55 audit trim. Asserted against the real server for the same reason as
+            // V4: the retention scan is the repository's second query without a tenant dimension, and
+            // the three pre-existing composite indexes all lead with tenant_id, so without this index
+            // every trim run is a full table scan of the whole audit trail - and H2 accepting the DDL
+            // does not prove MySQL does.
+            assertThat(indexColumns(MIGRATED_SCHEMA, "med_audit_log", "idx_med_audit_log_retention"))
+                    .as("migration V7 must create the retention index on the real server")
+                    .containsExactly("created_at");
         }
     }
 

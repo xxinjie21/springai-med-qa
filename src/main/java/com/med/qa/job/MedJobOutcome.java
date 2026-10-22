@@ -9,7 +9,7 @@ package com.med.qa.job;
  * and is not published here -- mixing "is the job alive" with "how well is the job doing" is what
  * makes an alert rule impossible to state precisely.</p>
  *
- * <p>{@link #SKIPPED_LOCK_HELD} is an outcome and not a failure: the four jobs share a cluster-wide
+ * <p>{@link #SKIPPED_LOCK_HELD} is an outcome and not a failure: the jobs share a cluster-wide
  * Redisson mutex with their peers, so on a multi-replica deployment every replica but one steps aside
  * on every cycle. Treating that as "did not run" would make the liveness signal useless exactly in
  * the deployment shape it matters most for.</p>

@@ -428,6 +428,15 @@ livenessProbe:
 | `MED_SESSION_RECLAIM_INITIAL_DELAY` | `15m` | 启动后首次运行的延迟 |
 | `MED_SESSION_RECLAIM_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
 | `MED_SESSION_RECLAIM_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
+| `MED_AUDIT_LOG_RETENTION_ENABLED` | `false` | 审计日志保留裁剪总开关（见 7.16） |
+| `MED_AUDIT_LOG_RETENTION_DRY_RUN` | `true` | 开启后只计数与报告，一行不删 |
+| `MED_AUDIT_LOG_RETENTION_DAYS` | `365` | 保留窗口（天）；**下限 90 天**，低于下限上下文直接启动失败（见 7.16） |
+| `MED_AUDIT_LOG_RETENTION_BATCH_SIZE` | `500` | 单条删除语句最多删多少行 |
+| `MED_AUDIT_LOG_RETENTION_MAX_BATCHES` | `5` | 单次运行最多几条删除语句 |
+| `MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL` | `24h` | 两次运行之间的固定延迟 |
+| `MED_AUDIT_LOG_RETENTION_INITIAL_DELAY` | `15m` | 启动后首次运行的延迟 |
+| `MED_AUDIT_LOG_RETENTION_LOCK_WAIT` | `5s` | 抢占集群互斥锁的等待时间 |
+| `MED_AUDIT_LOG_RETENTION_LOCK_LEASE` | `5m` | 互斥锁租约；`0` = 看门狗续期 |
 
 ### 5.5 RAG
 
@@ -459,7 +468,7 @@ livenessProbe:
 | 层次 | 归属 | 内容 |
 |---|---|---|
 | 数据库 + 账号 | `docker/mysql/init/01-create-db.sql`（Compose 首次启动执行一次，幂等） | 建 `med_qa` 库（utf8mb4）、建 `med_qa@%` / `med_qa@localhost` 账号并授权 |
-| 表结构 | Flyway V1–V6（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8）；V5：冷归档表 `med_message_archive` + `med_session_archive`（D48，见 7.9）；V6：`med_session` 的清理标记 `purged_at`（D50，见 7.11） |
+| 表结构 | Flyway V1–V7（应用启动时执行，**直连物理 MySQL**） | V1：`med_message_{0..15}` 16 张分表；V2：`med_session`；V3：`med_audit_log`；V4：`med_session` 的保留策略索引 `idx_med_session_retention (status, updated_at)`（D47，见 7.8）；V5：冷归档表 `med_message_archive` + `med_session_archive`（D48，见 7.9）；V6：`med_session` 的清理标记 `purged_at`（D50，见 7.11）；V7：`med_audit_log` 的保留裁剪索引 `idx_med_audit_log_retention (created_at)`（D55，见 7.16） |
 | 向量索引 | Spring AI `RedisVectorStore`（`initialize-schema=true`） | RediSearch 索引 `med-doc-index`，TAG 字段 `tenant_id` / `dept_id` / `patient_id` |
 
 分片规则见 `src/main/resources/sharding/med-sharding.yaml`：
@@ -1232,8 +1241,8 @@ D47 / D48 / D50 / D52 的四份文档都写着同一句话——**「作业停�
 | `med_qa_job_expected_interval_seconds{component}` | gauge | 该作业被装配时的 `check-interval`（秒）。**规则用它当阈值**，所以改配置不需要改规则 |
 | `med_qa_job_runs_total{component,outcome}` | counter | 按结局计数的运行次数，`outcome` ∈ `COMPLETED` / `SKIPPED_LOCK_HELD` / `FAILED` |
 
-`component` 的取值就是四个作业的告警 component：`session-retention`、`session-archive`、
-`session-purge`、`session-reclaim`。
+`component` 的取值就是各作业的告警 component：`session-retention`、`session-archive`、
+`session-purge`、`session-reclaim`（D55 起再加一个 `audit-log-retention`，见 7.16）。
 
 > **为什么标签叫 `component` 而不是 `job`**：Prometheus 把 `job` 与 `instance` 保留给抓取目标，
 > 在默认的 `honor_labels: false` 下，被采集指标里同名的标签会被改名为 `exported_job`，而目标自己的
@@ -1246,8 +1255,13 @@ D47 / D48 / D50 / D52 的四份文档都写着同一句话——**「作业停�
 
 | 规则 | 级别 | 表达式（节选） | 回答的问题 |
 |---|---|---|---|
-| `MedQaBackgroundJobStalled` | warning | `time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*"} > 2.5 * med_qa_job_expected_interval_seconds{...} + 300`，`for: 15m` | **这个 Pod 的调度线程是不是停了**（按实例） |
+| `MedQaBackgroundJobStalled` | warning | `time() - med_qa_job_last_run_epoch_seconds{component=~"session-.*|audit-log-retention"} > 2.5 * med_qa_job_expected_interval_seconds{...} + 300`，`for: 15m` | **这个 Pod 的调度线程是不是停了**（按实例） |
 | `MedQaBackgroundJobNotCompleting` | **critical** | `time() - max by (component)(med_qa_job_last_success_epoch_seconds{...}) > 2.5 * max by (component)(med_qa_job_expected_interval_seconds{...}) + 300`，`for: 15m` | **有没有任何副本真的在干活**（按集群） |
+
+> **D55 把选择器从 `session-.*` 扩成 `session-.*|audit-log-retention`**：账本的第五个作业
+> （审计日志保留裁剪）与四个会话作业共用这两条停摆规则，选择器不跟着扩的后果正是 D53 要消灭的
+> 那一类静默失效——规则解析成功、采集成功、永不匹配新作业。`AlertingStackConfigTest` 现在断言
+> 选择器覆盖**全部五个**作业的 `COMPONENT` 且不匹配两个监控器。
 
 **为什么必须分开**：`last_run` 在 `SKIPPED_LOCK_HELD` 时也会刷新（抢不到锁是互斥在工作，不是实例停摆），
 所以一个**被泄漏的 `med:lock:session:*` 键**会让某个副本永久占着互斥，其余副本每轮都记
@@ -1276,8 +1290,8 @@ D47 / D48 / D50 / D52 的四份文档都写着同一句话——**「作业停�
 - **两个告警监控器（`MedStorageAlertMonitor` / `MedVectorIndexAlertMonitor`）不在范围内**：它们的存活
   问题是个先有鸡还是先有蛋的问题——告警链无法报告自己的生产者已死——只能由 `MedQaTargetDown` 在进程层面
   覆盖。这是**刻意的范围边界**，不是遗漏。
-- **账本自身没有任何开关**：它是「作业没跑」的唯一证据来源，能把它关掉等于一次性关掉四个作业的可观测性。
-  作业被关闭时它自然不发布序列，这就够了。
+- **账本自身没有任何开关**：它是「作业没跑」的唯一证据来源，能把它关掉等于一次性关掉所有已注册作业的
+  可观测性。作业被关闭时它自然不发布序列，这就够了。
 - **不发布业务计数**（`candidates` / `archived` / `purged` 这类）：D53 只回答「作业还活着吗」，
   把「作业干得怎么样」混进来会让两条规则的判据重新变得含混。业务计数仍在各自的报告里。
 
@@ -1286,12 +1300,12 @@ D47 / D48 / D50 / D52 的四份文档都写着同一句话——**「作业停�
 `MedJobRunLedgerTest`（注册幂等且**不重置**时间戳、两个时间戳在注册时都等于当前时刻——「重启后不误报」
 的可执行版本、`SKIPPED_LOCK_HELD` 只刷新 `last_run`、`FAILED` 只刷新 `last_run`、三种结局各自计数、
 未注册的作业 `record` 直接拒绝、两个作业的标签互不串扰）、`MedJobRunTest`、
-`MedJobObservabilityConfigTest`（**四个作业全关时账本仍在**）、四个 `*SchedulerTest`（三种结局分别记进
+`MedJobObservabilityConfigTest`（**所有作业全关时账本仍在**）、五个 `*SchedulerTest`（三种结局分别记进
 账本，且抛异常时账本**先于**告警——用 `InOrder` 断言，因为告警链自己挂掉时不能再把「作业跑过」这条唯一
-证据一起丢掉）、四个 `*ConfigTest`（**账本发布的 `expected-interval` 与 `@Scheduled` 占位符读到的是同一个
+证据一起丢掉）、五个 `*ConfigTest`（**账本发布的 `expected-interval` 与 `@Scheduled` 占位符读到的是同一个
 `check-interval`**，占位符的 `:1h` 字面回退一旦生效就会在这里变红）、`AlertingStackConfigTest`
 （规则里出现的每个 `med_qa_job_*` 名字都必须属于 `MedJobRunLedger` 的常量、三个 gauge 必须都被引用、
-选择器必须匹配四个作业的 `COMPONENT` 且**不匹配**两个监控器的 component、抓取配置不得打开
+选择器必须匹配五个作业的 `COMPONENT` 且**不匹配**两个监控器的 component、抓取配置不得打开
 `honor_labels`）。
 
 按项目惯例，本轮的新守卫**先被亲眼看过它变红**：把账本的 `record` 改成只在 `COMPLETED` 时刷新
@@ -1371,6 +1385,80 @@ gauge 求导只会新增故障模式（窗口里要凑够两个点、对采样�
 按项目惯例，本轮的新守卫**先被亲眼看过它变红**：删掉 DEPLOYMENT.md 的 §7.15 标题与两份 README 的 D54
 小节标题 → 三个文档守卫各红一条；把 `MedSessionReclaimScheduler` 的 dry-run 边界去掉 →
 "a dry run publishes the size but no backlog" 变红。两处还原后重跑全绿。
+
+---
+
+### 7.16 审计日志的保留裁剪（D55）
+
+`AuditLogMapper` 的 javadoc 从 D23 起就写着这条轨迹**只增不减**，并说明「保留裁剪属于一个有自己的授权、
+与产生它的请求路径无关的数据库级作业」——**但这个作业从来不存在**。于是 `med_audit_log` 每一被审计一次
+医疗操作就追加一行，从来没有任何代码删过一行：一个每天几千次问诊的医院，审计表只增不减，既没有保留
+策略，也没有任何指标说它现在有多大。D55 把这个作业补上。
+
+#### 这个作业删的是什么、凭什么删
+
+| 问题 | 答案 |
+|---|---|
+| 删什么 | `created_at` 早于 `now - retention-days` 的审计行，跨全部租户与科室 |
+| 怎么删 | `DELETE FROM med_audit_log WHERE created_at < ? LIMIT ?`，单次运行最多 `max-batches` 条这样的语句；某一条删掉的行数小于 `batch-size` 即视为积压排空，提前收尾 |
+| 凭什么删 | **保留窗口本身就是守卫**：审计行没有任何第二份副本，D50/D52 那套「删前证明别处还有」在这里不存在也不可能存在，所以 `retention-days` 有**下限 90 天**（`MedAuditLogRetentionProperties.MIN_RETENTION_DAYS`），配低了是**启动失败**而不是静默裁剪 |
+| 为什么不搬冷库 | V3 的注释论证过审计表刻意不含临床载荷——「把受保护信息复制进第二个有自己保留规则的存储是负债」。给审计行建冷库正是它反对的那件事，所以只删不搬 |
+| 谁能触发 | 只有定时器。**没有任何 HTTP 端点**能触发裁剪——那正是 Mapper javadoc 排除的「请求路径删除」 |
+
+#### 开关与默认值
+
+`med.audit-log.retention.*` 默认 `enabled=false` **且** `dry-run=true`，与 D38/D47/D48/D50/D52 的两道
+开关同源（见 §5.4 的完整变量表）。dry-run 一行不删，但报告的 `deleted` 是**精确的模拟值**：服务按
+`min(剩余过期行, batch-size)` 逐批推算真实循环会删掉多少，不是候选数的近似——运维拿它就能算出
+「打开开关后要跑几轮才能把积压排空」。
+
+集群互斥是 Redisson `RLock`，键 `med:lock:audit-log:retention`（**不可配置**，与四个会话作业同一
+`med:lock:` 家族）；抢不到锁记 `skipped-lock-held`，一碰 MySQL 都不碰；Redis 不可达**向上抛**
+`STORAGE_ERROR`，不降级成无锁运行。
+
+#### 告警与可观测
+
+| 信号 | 级别 | 什么时候发 |
+|---|---|---|
+| `audit-log-retention-completed` | INFO | 真的删了东西且不是 dry-run |
+| `audit-log-retention-failed`（规则 `MedQaAuditLogRetentionFailed`） | warning | 整轮抛异常（批删失败即整轮失败，与四个会话作业「单候选失败不中断」刻意不同） |
+| `med_qa_job_last_run_epoch_seconds{component="audit-log-retention"}` | gauge | 每次尝试都刷新，由 §7.14 的两条停摆规则消费 |
+
+> **选择器为它扩过了**：§7.14 两条停摆规则的选择器从 `session-.*` 扩成
+> `session-.*|audit-log-retention`。不扩的后果是 D53 要消灭的那类静默失效——规则解析成功、采集成功、
+> 永不匹配第五个作业。
+
+#### V7 迁移为什么必须存在
+
+保留扫描是仓库里**第二条没有租户维度的查询**（第一条是 D47 的会话扫描，由 V4 的
+`idx_med_session_retention` 服务）。`med_audit_log` 的三条既有复合索引全部以 `tenant_id` 打头——
+它们为评审查询服务，而评审永远带租户/科室维度——服务不了 `created_at < ?`。没有 V7 的
+`idx_med_audit_log_retention (created_at)`，每一轮保留扫描都是对整条审计轨迹的全表扫描，正是无人值守
+后台作业最不该做的无界工作。`MedProductionStartupIntegrationTest` 在真实 MySQL 上断言该索引存在。
+
+#### 现场处置
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| `MedQaAuditLogRetentionFailed` 触发 | 某批删除或计数抛异常 | 先看 MySQL / Redis 连通性，再核 `med.audit-log.retention.*`；dry-run 部署只计数，不走删除路径 |
+| 想确认打开开关后会发生什么 | 保持 `dry-run=true` 跑几轮 | 报告的 `expired` / `deleted` / `remaining` 就是答案；`deleted` 是精确模拟值 |
+| 上下文启动失败，提示 `retention-days must be at least 90` | 保留窗口配到了下限以下 | 提高 `MED_AUDIT_LOG_RETENTION_DAYS`；下限是防误配的护栏，不是策略——按所在司法辖区的要求上调 |
+| 审计表增长符合预期 | **设计如此** | 审计表按设计就该增长；D55 刻意**没有**发布规模 gauge——「是否跟得上」由每轮报告的 `remaining` 与 §7.14 的账本回答，一个没有规则消费的 gauge 是未验证的面 |
+
+#### 跨组件契约
+
+`MedAuditLogRetentionServiceTest`（锁被占时不碰 MySQL、dry-run 零删除且模拟值精确、保留期下限在
+服务构造/属性绑定两侧都拒、批失败整轮失败并转译成 `STORAGE_ERROR`、`skipped-lock-held` 不读库、
+只删早于截止线的行）、`AuditLogRetentionMapperShardingTest`（H2 + Flyway + ShardingSphere 真跑两条
+新语句：`<` 谓词不误伤窗口内行、`LIMIT` 边界、删除不影响新行）、`MedAuditLogRetentionPropertiesTest`
+（`retention-days` 下限、批大小/批数/间隔/租约的边界值）、`MedAuditLogRetentionConfigTest`（开关关闭时
+两个 Bean 都不存在、开启时账本与通知器的装配、`expected-interval` 与 `@Scheduled` 占位符同源）、
+`MedAuditLogRetentionSchedulerTest`（三种结局分别记进账本、抛异常时账本**先于**告警、dry-run 不发
+completed、让位只记日志）、`AuditLogRetentionReportTest`（计数器校验、`skipped` 工厂方法、摘要行）、
+`DeploymentDocumentationTest`（V7 迁移被手册点名、`Flyway V1–V7`、新环境变量在 application.yml 里有
+真实占位符）、`ReadmeDocumentationTest` / `EnglishReadmeDocumentationTest`（D55 小节、开关、锁键、
+告警码）、`AlertingStackConfigTest`（新规则选择 scheduler 真实导出的码、停摆选择器覆盖第五个作业）、
+`MedProductionStartupIntegrationTest`（真实 MySQL 上 V7 索引建成）。
 
 ---
 

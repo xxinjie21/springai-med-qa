@@ -408,6 +408,29 @@ springai-med-qa/
 > 「作业还活着吗」这一个问题，把「作业干得怎么样」混进来会让两条规则的判据重新变得含混。
 > D54 **刻意没有**发布清单数、导出积压等其它冷库维度，也**刻意没有**新增任何删除能力：只读元数据。
 
+### 阶段 14：审计数据的生命周期治理（D55）
+
+> 阶段 14 的出发点：`AuditLogMapper` 的 javadoc 从 D23 起就写着这条轨迹**只增不减**——「一条能从
+> 产生它的请求路径上被改写的审计行不是证据，保留裁剪属于一个有自己的授权、与请求路径无关的
+> 数据库级作业」——**但这个作业从来不存在**。于是 `med_audit_log` 每被审计一次医疗操作就追加一行，
+> 而**从来没有任何代码删过一行**：一个每天几千次问诊的医院，审计表只增不减，既没有保留策略、
+> 也没有任何指标说它现在有多大。这是阶段 8–13 那类偏差（**注释承诺了代码没有的行为**）的第 8 次
+> 出现，形态与 D53 相邻——被承诺的后台能力连一行代码都没有；而它的代价已经悄悄支付：
+> 审计表的无界增长不会让任何测试变红，只会在某次磁盘告警时才被发现。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D55 | 审计日志的保留裁剪 | 把「超过保留期的审计行自动裁剪」做成一次受控的后台扫描，与 D47/D48/D50/D52 同形：**不能出现在请求路径上**（Mapper javadoc 自己的论证：能从请求路径删除审计行的表不是证据），因此 `MedAuditLogRetentionService`（`com.med.qa.service`，无 `@Service`，由 `MedAuditLogRetentionConfig` 在 `@ConditionalOnProperty` 后声明）是唯一的删除者。**谓词与批量在同一条语句里**：新增 `AuditLogMapper#countAuditLogsCreatedBefore(createdBefore)` 与 `#deleteAuditLogsCreatedBefore(createdBefore, limit)`，删除形如 `DELETE FROM med_audit_log WHERE created_at < ? LIMIT ?`——无 `ORDER BY`（H2 的 DELETE 不支持它，而 MySQL 不需要它：所有过期行等价，阈值才是判据），`LIMIT` 让单次删除有界，避免一次千万行的大事务；该 SQL 已实测在 H2（MySQL 兼容模式）与 MySQL 同形。**为什么裁剪不需要摘要或包含守卫**：D50/D52 删的是「别处还有一份」的数据，所以删前必须证明副本仍在；审计行没有任何第二份副本，删掉即消失，因此守卫是**保留期本身**——`retention-days` 设下限 `MIN_RETENTION_DAYS = 90`（绑定期校验，零/负/过短一律拒绝启动，与 D50 拒绝零冷静期同源），把「误配成 1 天就删掉三个月合规记录」这类事故变成启动失败而不是静默数据丢失。**刻意不导出冷存**：V3 迁移的注释论证过审计表刻意不含临床载荷，「把受保护信息复制进第二个有自己保留规则的存储是负债」——给审计行建冷库正好是它反对的那件事，所以只删不搬，这条取舍写进 javadoc。V7 迁移补 `idx_med_audit_log_retention (created_at)`：这是仓库里**第二条没有租户维度的扫描**（第一条是 D47 的 `idx_med_session_retention`，V4），三条既有复合索引全部以 `tenant_id` 打头，都服务不了 `created_at < ?`，没有它每一轮保留扫描都是全表扫描。集群内互斥用 Redisson `RLock`（键 `med:lock:audit-log:retention`，**不可配置**，与四个会话作业同家族），`tryLock` 失败即 `skipped-lock-held` 且不碰 MySQL；Redis 不可达**向上抛**（`STORAGE_ERROR`），不降级成无锁运行。`med.audit-log.retention.*` 默认 `enabled=false` **且** `dry-run=true`（两道开关与 D38/D47/D48/D50/D52 同源），`dry-run` 下扫完一批即停——什么都没删，再扫一批只会拿到同一批行；dry-run 的 `deleted` 是**精确的模拟值**（按 `min(剩余过期行, batch-size)` 逐批推算，不是候选数的近似）。`AuditLogRetentionReport` 给出 `completed`/`skipped-lock-held` 与 `dryRun`/`retentionDays`/`expired`/`deleted`/`remaining`/`batches`/`durationMillis`（**没有 failures 列表**：批失败即整轮失败并向上抛，与四个会话作业「单候选失败不中断」刻意不同——一批删不动通常意味着 MySQL 不舒服，部分报告只会少报损失）。`MedAuditLogRetentionScheduler` 按 `check-interval` 固定延迟驱动，注册为运行账本的**第 5 个作业**（`audit-log-retention`），复用既有 `MedAlertNotifier` 链路（`audit-log-retention-completed` INFO 只在真的删了东西且非 dry-run 时发、`audit-log-retention-failed` WARNING），Prometheus 规则 `MedQaAuditLogRetentionFailed`；`MedAuditLogRetentionConfig` 单独声明 `@EnableScheduling`。守护测试：`MedAuditLogRetentionServiceTest`（锁被占时不碰 MySQL、dry-run 零删除且模拟值精确、保留期下限被拒、批失败整轮失败、`skipped-lock-held` 不读库）、`AuditLogRetentionMapperShardingTest`（H2 + Flyway + ShardingSphere 真跑两条新语句，钉住 `<` 谓词、`LIMIT` 边界与「不动比阈值新的行」）、`MedAuditLogRetentionPropertiesTest`、`MedAuditLogRetentionConfigTest`、`MedAuditLogRetentionSchedulerTest`（spy + InOrder 钉住「先 record(failed) 再 raise」）、`AuditLogRetentionReportTest`，以及文档三件套与 `DeploymentDocumentationTest` 的 V7 断言 | `feat(audit): trim the audit trail after its retention window` |
+
+> 阶段 14 进度：**D55 完成，阶段 14 收尾**。D55 让「审计轨迹只增不减」第一次有了边界，
+> 并且让被承诺的保留作业从 javadoc 变成代码：按年龄谓词批量裁剪、保留期下限防误配、
+> 两道开关默认全关、dry-run 给出精确的模拟删除量。
+>
+> **阶段 14 之后没有 D56**：下次运行必须先扩写本路线图（新增阶段 15）再实现，不得自造迭代编号。
+> D55 **刻意没有**给审计行建冷库（V3 的论证正好反对它）、**刻意没有**在报告里放 failures 列表
+> （批失败即整轮失败，见上表）、也**刻意没有**发布审计表规模 gauge：审计表按设计就该增长，
+> 「是否跟得上」由每轮报告的 `remaining` 与运行账本回答，一个没有规则消费的 gauge 是未验证的面。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

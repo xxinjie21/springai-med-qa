@@ -445,6 +445,37 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D55 audit trim, its floor and why there is no cold export")
+    void auditLogRetentionIsDocumented() {
+        // The operator-facing half of D55. Three boundaries a reader would otherwise undo: the retention
+        // window is the only guard this job has (an audit row exists nowhere else, so D50/D52's "prove it
+        // still exists elsewhere" pattern is unavailable), the floor under it turns a misconfiguration
+        // into a startup failure rather than a silent trim, and the job deliberately builds no cold
+        // store - which is V3's own argument applied to itself.
+        assertThat(handbook).contains("7.16");
+        assertThat(handbook).contains("（D55）");
+        // The heading is asserted whole: `7.16` appears elsewhere in the handbook and the trim's class
+        // names are substrings of the guard-test class names, so either alone would stay green with the
+        // chapter deleted.
+        assertThat(handbook).contains("### 7.16 审计日志的保留裁剪（D55）");
+        assertThat(handbook).contains("med.audit-log.retention");
+        assertThat(handbook).contains("MIN_RETENTION_DAYS");
+        assertThat(handbook).contains("med:lock:audit-log:retention");
+        assertThat(handbook).contains("audit-log-retention-completed");
+        assertThat(handbook).contains("audit-log-retention-failed");
+        assertThat(handbook).contains("MedQaAuditLogRetentionFailed");
+        assertThat(handbook).contains("AuditLogRetentionMapperShardingTest");
+        assertThat(handbook).contains("MedAuditLogRetentionServiceTest");
+        assertThat(handbook).contains("MedAuditLogRetentionConfigTest");
+        assertThat(handbook).contains("MedAuditLogRetentionSchedulerTest");
+        assertThat(handbook).contains("MedAuditLogRetentionPropertiesTest");
+        assertThat(handbook).contains("AuditLogRetentionReportTest");
+        // The D53 stall rules' selector was widened for the fifth job; not widening it is the exact
+        // silent failure D53 exists to remove, so the widened selector is pinned here as well.
+        assertThat(handbook).contains("session-.*|audit-log-retention");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
@@ -478,7 +509,14 @@ class DeploymentDocumentationTest {
                 "MED_RAG_KEY_PREFIX",
                 "MED_RAG_VECTOR_ALGORITHM",
                 "MED_RAG_TOP_K",
-                "MED_RAG_ADVISOR_ORDER");
+                "MED_RAG_ADVISOR_ORDER",
+                "MED_AUDIT_LOG_RETENTION_ENABLED",
+                "MED_AUDIT_LOG_RETENTION_DRY_RUN",
+                "MED_AUDIT_LOG_RETENTION_DAYS",
+                "MED_AUDIT_LOG_RETENTION_BATCH_SIZE",
+                "MED_AUDIT_LOG_RETENTION_MAX_BATCHES",
+                "MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL",
+                "MED_AUDIT_LOG_RETENTION_INITIAL_DELAY");
 
         String configuration = applicationYml + compose + sharding;
         variables.forEach(variable -> {
@@ -495,11 +533,11 @@ class DeploymentDocumentationTest {
         assertThat(handbook).contains("docker/mysql/init/01-create-db.sql");
         assertThat(Path.of(System.getProperty("user.dir"), "docker/mysql/init/01-create-db.sql")).exists();
 
-        assertThat(handbook).contains("Flyway V1–V6");
+        assertThat(handbook).contains("Flyway V1–V7");
         Path migrationDir = Path.of(System.getProperty("user.dir"), "src/main/resources/db/migration");
         try (var stream = Files.list(migrationDir)) {
             List<String> migrations = stream.map(p -> p.getFileName().toString()).sorted().toList();
-            assertThat(migrations).hasSize(6);
+            assertThat(migrations).hasSize(7);
             assertThat(migrations.get(0)).startsWith("V1__");
             assertThat(migrations.get(1)).startsWith("V2__");
             assertThat(migrations.get(2)).startsWith("V3__");
@@ -515,7 +553,12 @@ class DeploymentDocumentationTest {
             // quietest migration there is: nothing fails if it is missing, the candidate query just
             // re-selects the same sessions forever, so the handbook must name it.
             assertThat(migrations.get(5)).startsWith("V6__");
+            // V7 indexes the D55 audit trim. Same shape as V4 and the same reason: the retention scan
+            // is the repository's second query without a tenant dimension, and the three existing
+            // composite indexes all lead with tenant_id, so without it every trim is a full table scan.
+            assertThat(migrations.get(6)).startsWith("V7__");
             assertThat(handbook).contains("idx_med_session_retention");
+            assertThat(handbook).contains("idx_med_audit_log_retention");
             assertThat(handbook).contains("med_message_archive");
             assertThat(handbook).contains("med_session_archive");
             assertThat(handbook).contains("purged_at");

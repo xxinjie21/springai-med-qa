@@ -1,0 +1,23 @@
+-- Flyway migration: index the retention trim of med_audit_log (D55).
+--
+-- The trim is the second query in the application that reads a table without a tenant/department
+-- scope (the first is the D47 session retention sweep, indexed by V4's
+-- idx_med_session_retention): it has to find the audit rows of every hospital that fell out of the
+-- retention window, i.e.
+--
+--   SELECT COUNT(*) FROM med_audit_log WHERE created_at < ?
+--   DELETE FROM med_audit_log WHERE created_at < ? LIMIT ?
+--
+-- The three existing indexes (idx_med_audit_log_scope, idx_med_audit_log_operator,
+-- idx_med_audit_log_action) all lead with tenant_id - they exist for the review queries, which
+-- always filter by tenant/department - so none of them can serve an age-only predicate: MySQL
+-- would fall back to a full table scan of the whole audit trail on every run, which is exactly
+-- the kind of unbounded work an unattended background job must not do. This index leads with the
+-- one column the predicate filters on, and it also serves the delete (the same WHERE clause).
+--
+-- Plain CREATE INDEX rather than `CREATE INDEX IF NOT EXISTS` (MySQL does not support the latter);
+-- Flyway runs each migration exactly once, so idempotency is not needed. The statement is
+-- backend-agnostic and runs unchanged against MySQL and against the in-memory H2 schema (MySQL
+-- compatibility mode) used by the tests.
+
+CREATE INDEX idx_med_audit_log_retention ON med_audit_log (created_at);
