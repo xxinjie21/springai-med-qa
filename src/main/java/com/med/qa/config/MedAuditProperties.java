@@ -7,10 +7,10 @@ import org.springframework.util.Assert;
  * Tuning of the {@code @MedAudit} audit trail.
  *
  * <p>Only the knobs the code cannot infer are configurable: the master switch, the advice order of
- * the aspect, and the truncation limits that keep an over-long action code or failure message from
- * turning a completed medical operation into a failed insert. The limits are capped by the physical
- * column widths of {@code med_audit_log}, so a misconfiguration is rejected at startup rather than
- * discovered by MySQL at 3 a.m.</p>
+ * the aspect, the truncation limits that keep an over-long action code or failure message from
+ * turning a completed medical operation into a failed insert, and the page-size bounds of the audit
+ * review endpoint (D56). The limits are capped by the physical column widths of {@code med_audit_log},
+ * so a misconfiguration is rejected at startup rather than discovered by MySQL at 3 a.m.</p>
  *
  * <p>{@code enabled} exists for local development and for the offline test suite, not as an operating
  * lever: switching the trail off in a hospital deployment removes the evidence that an access was
@@ -51,6 +51,12 @@ public class MedAuditProperties {
 
     /** Largest persisted description/failure message length in characters. */
     private int maxMessageLength = MESSAGE_COLUMN_LENGTH;
+
+    /** Page size applied to review requests without an explicit size. */
+    private int defaultPageSize = 20;
+
+    /** Largest page size a review request may ask for. */
+    private int maxPageSize = 100;
 
     /**
      * Creates the properties with their safe defaults.
@@ -186,5 +192,45 @@ public class MedAuditProperties {
         Assert.isTrue(maxMessageLength <= MESSAGE_COLUMN_LENGTH,
                 "maxMessageLength must not exceed the " + MESSAGE_COLUMN_LENGTH + " character column");
         this.maxMessageLength = maxMessageLength;
+    }
+
+    /**
+     * Returns the page size applied to audit review requests without an explicit size.
+     *
+     * @return default page size, always positive
+     */
+    public int getDefaultPageSize() {
+        return defaultPageSize;
+    }
+
+    /**
+     * Sets the page size applied to review requests without an explicit size.
+     *
+     * @param defaultPageSize default page size, must be positive
+     * @throws IllegalArgumentException when the value is not positive
+     */
+    public void setDefaultPageSize(int defaultPageSize) {
+        Assert.isTrue(defaultPageSize > 0, "defaultPageSize must be positive");
+        this.defaultPageSize = defaultPageSize;
+    }
+
+    /**
+     * Returns the largest page size a review request may ask for.
+     *
+     * @return maximum page size, always positive
+     */
+    public int getMaxPageSize() {
+        return maxPageSize;
+    }
+
+    /**
+     * Sets the largest page size a review request may ask for.
+     *
+     * @param maxPageSize maximum page size, must be positive
+     * @throws IllegalArgumentException when the value is not positive
+     */
+    public void setMaxPageSize(int maxPageSize) {
+        Assert.isTrue(maxPageSize > 0, "maxPageSize must be positive");
+        this.maxPageSize = maxPageSize;
     }
 }

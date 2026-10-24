@@ -37,6 +37,14 @@
         <if test="outcome != null">
             AND outcome = #{outcome, typeHandler=com.med.qa.mapper.typehandler.AuditOutcomeTypeHandler}
         </if>
+        <!-- Time window (D56): half-inclusive, matching the exclusive retention cutoff. Both bounds
+             are optional; the V3 composite indexes end with created_at so the window is a range scan. -->
+        <if test="createdFrom != null">
+            AND created_at &gt;= #{createdFrom}
+        </if>
+        <if test="createdTo != null">
+            AND created_at &lt; #{createdTo}
+        </if>
     </sql>
 
     <insert id="insert" parameterType="com.med.qa.domain.entity.AuditLogDO" useGeneratedKeys="false">

@@ -310,7 +310,9 @@ med:
   # recorded latency covers the whole call. The max-* limits are truncation guards bounded by the
   # physical column widths of med_audit_log: an over-long failure message must never turn a completed
   # medical operation into a failed insert. The trail stores identifiers and outcomes only - never
-  # question text, model answers or retrieved documents.
+  # question text, model answers or retrieved documents. The page-size bounds (D56) govern the
+  # staff-only review endpoint GET /api/audit/logs: default-page-size applies when a request omits
+  # `size`, and a larger requested size is a 400 rather than an unbounded scan.
   audit:
     enabled: ${MED_AUDIT_ENABLED:true}
     order: ${MED_AUDIT_ORDER:100}
@@ -318,6 +320,8 @@ med:
     max-resource-type-length: ${MED_AUDIT_MAX_RESOURCE_TYPE_LENGTH:32}
     max-resource-id-length: ${MED_AUDIT_MAX_RESOURCE_ID_LENGTH:128}
     max-message-length: ${MED_AUDIT_MAX_MESSAGE_LENGTH:500}
+    default-page-size: ${MED_AUDIT_DEFAULT_PAGE_SIZE:20}
+    max-page-size: ${MED_AUDIT_MAX_PAGE_SIZE:100}
   # Audit trail retention trim (D55): the database-level job AuditLogMapper's javadoc has promised
   # since D23. It is the only delete against med_audit_log, it has no request-path caller, and it
   # deletes rows that exist nowhere else - hence the two switches (both default to the conservative

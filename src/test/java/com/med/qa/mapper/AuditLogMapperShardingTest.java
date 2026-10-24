@@ -170,22 +170,54 @@ class AuditLogMapperShardingTest {
         }
         try (SqlSession sql = sqlSessionFactory.openSession(true)) {
             AuditLogMapper mapper = sql.getMapper(AuditLogMapper.class);
-            List<AuditLogDO> firstPage = mapper.selectPage(tenant, dept, null, null, null, 0, 2);
+            List<AuditLogDO> firstPage = mapper.selectPage(tenant, dept, null, null, null, null, null, 0, 2);
             assertEquals(2, firstPage.size());
             assertEquals(1_700_000_000_005L, firstPage.get(0).getCreatedAt());
 
-            List<AuditLogDO> secondPage = mapper.selectPage(tenant, dept, null, null, null, 2, 2);
+            List<AuditLogDO> secondPage = mapper.selectPage(tenant, dept, null, null, null, null, null, 2, 2);
             assertEquals(2, secondPage.size());
             assertEquals(1_700_000_000_003L, secondPage.get(0).getCreatedAt());
 
-            List<AuditLogDO> operatorA = mapper.selectPage(tenant, dept, "op-A", null, null, 0, 10);
+            List<AuditLogDO> operatorA = mapper.selectPage(tenant, dept, "op-A", null, null, null, null, 0, 10);
             assertEquals(3, operatorA.size());
 
-            List<AuditLogDO> failures = mapper.selectPage(tenant, dept, null, null, AuditOutcome.FAILURE, 0, 10);
+            List<AuditLogDO> failures = mapper.selectPage(tenant, dept, null, null, AuditOutcome.FAILURE,
+                    null, null, 0, 10);
             assertEquals(2, failures.size());
             for (AuditLogDO failure : failures) {
                 assertEquals(AuditOutcome.FAILURE, failure.getOutcome());
             }
+        }
+    }
+
+    @Test
+    @DisplayName("selectPage and countByCondition honour the half-inclusive [createdFrom, createdTo) window")
+    void timeWindowIsHalfInclusive() {
+        String tenant = "t-window";
+        String dept = "d-window";
+        // Five rows one second apart; the window [2000, 4000) must keep exactly the middle two.
+        for (long ts = 1_000L; ts <= 5_000L; ts += 1_000L) {
+            AuditLogDO row = sample(tenant, dept, "opW", "SESSION_VIEW", AuditOutcome.SUCCESS, ts);
+            try (SqlSession sql = sqlSessionFactory.openSession(true)) {
+                sql.getMapper(AuditLogMapper.class).insert(row);
+            }
+        }
+        try (SqlSession sql = sqlSessionFactory.openSession(true)) {
+            AuditLogMapper mapper = sql.getMapper(AuditLogMapper.class);
+
+            assertEquals(2, mapper.countByCondition(tenant, dept, null, null, null, 2_000L, 4_000L));
+            List<AuditLogDO> window = mapper.selectPage(tenant, dept, null, null, null, 2_000L, 4_000L, 0, 10);
+            assertEquals(2, window.size());
+            // Newest first, and the exclusive upper bound keeps 4000 out.
+            assertEquals(3_000L, window.get(0).getCreatedAt());
+            assertEquals(2_000L, window.get(1).getCreatedAt());
+
+            // Only a lower bound: 4000 is in (inclusive), 5000 too.
+            assertEquals(2, mapper.countByCondition(tenant, dept, null, null, null, 4_000L, null));
+            // Only an upper bound: 1000 is in, 2000 is out (exclusive).
+            assertEquals(1, mapper.countByCondition(tenant, dept, null, null, null, null, 2_000L));
+            // No bounds at all: the whole department.
+            assertEquals(5, mapper.countByCondition(tenant, dept, null, null, null, null, null));
         }
     }
 
@@ -203,10 +235,10 @@ class AuditLogMapperShardingTest {
         }
         try (SqlSession sql = sqlSessionFactory.openSession(true)) {
             AuditLogMapper mapper = sql.getMapper(AuditLogMapper.class);
-            assertEquals(2, mapper.countByCondition(tenant, dept, null, null, null));
-            assertEquals(1, mapper.countByCondition(tenant, dept, "opA", null, null));
-            assertEquals(1, mapper.countByCondition(tenant, dept, null, null, AuditOutcome.FAILURE));
-            assertEquals(0, mapper.countByCondition(tenant, dept, "opA", null, AuditOutcome.FAILURE));
+            assertEquals(2, mapper.countByCondition(tenant, dept, null, null, null, null, null));
+            assertEquals(1, mapper.countByCondition(tenant, dept, "opA", null, null, null, null));
+            assertEquals(1, mapper.countByCondition(tenant, dept, null, null, AuditOutcome.FAILURE, null, null));
+            assertEquals(0, mapper.countByCondition(tenant, dept, "opA", null, AuditOutcome.FAILURE, null, null));
         }
     }
 }

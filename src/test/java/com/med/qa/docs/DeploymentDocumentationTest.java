@@ -476,6 +476,26 @@ class DeploymentDocumentationTest {
     }
 
     @Test
+    @DisplayName("the handbook documents the D56 audit review endpoint, its staff-only scope and the window")
+    void auditReviewEndpointIsDocumented() {
+        // The operator-facing half of D56. Three boundaries a reader would otherwise undo: the
+        // endpoint is staff-only (a patient key is a 403, not a filtered page), the time window is
+        // half-inclusive like the D55 retention cutoff, and reading the trail is itself audited.
+        assertThat(handbook).contains("7.17");
+        assertThat(handbook).contains("（D56）");
+        // The heading is asserted whole: `7.17` and the class names are substrings of other lines,
+        // so either alone would stay green with the chapter deleted.
+        assertThat(handbook).contains("### 7.17 审计查阅端点（D56）");
+        assertThat(handbook).contains("/api/audit/logs");
+        assertThat(handbook).contains("AuditLogPageQuery");
+        assertThat(handbook).contains("AUDIT_LOG_LIST");
+        assertThat(handbook).contains("MED_AUDIT_DEFAULT_PAGE_SIZE");
+        assertThat(handbook).contains("MED_AUDIT_MAX_PAGE_SIZE");
+        assertThat(handbook).contains("AuditLogServiceTest");
+        assertThat(handbook).contains("AuditLogPageQueryTest");
+    }
+
+    @Test
     @DisplayName("documented environment variables resolve to real placeholders and cover the secrets")
     void documentedEnvironmentVariablesResolveToConfiguration() {
         List<String> variables = List.of(
@@ -500,6 +520,8 @@ class DeploymentDocumentationTest {
                 "MED_RATE_LIMIT_DEFAULT_RATE",
                 "MED_RATE_LIMIT_DEFAULT_DURATION",
                 "MED_AUDIT_ENABLED",
+                "MED_AUDIT_DEFAULT_PAGE_SIZE",
+                "MED_AUDIT_MAX_PAGE_SIZE",
                 "MED_CACHE_TTL",
                 "MED_CHAT_STREAM_HEARTBEAT",
                 "MED_CHAT_STREAM_TIMEOUT",

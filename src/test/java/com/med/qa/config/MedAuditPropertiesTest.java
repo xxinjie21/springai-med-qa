@@ -9,8 +9,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Unit tests for {@link MedAuditProperties}: safe defaults, the master switch, and the fail-fast
- * truncation limits that must stay within the physical column widths.
+ * Unit tests for {@link MedAuditProperties}: safe defaults, the master switch, the fail-fast
+ * truncation limits that must stay within the physical column widths, and the page-size bounds of
+ * the D56 review endpoint.
  */
 class MedAuditPropertiesTest {
 
@@ -24,6 +25,8 @@ class MedAuditPropertiesTest {
         assertEquals(MedAuditProperties.RESOURCE_TYPE_COLUMN_LENGTH, properties.getMaxResourceTypeLength());
         assertEquals(MedAuditProperties.RESOURCE_ID_COLUMN_LENGTH, properties.getMaxResourceIdLength());
         assertEquals(MedAuditProperties.MESSAGE_COLUMN_LENGTH, properties.getMaxMessageLength());
+        assertEquals(20, properties.getDefaultPageSize());
+        assertEquals(100, properties.getMaxPageSize());
     }
 
     @Test
@@ -88,5 +91,21 @@ class MedAuditPropertiesTest {
         assertThrows(IllegalArgumentException.class, () -> properties.setMaxMessageLength(0));
         assertThrows(IllegalArgumentException.class,
                 () -> properties.setMaxMessageLength(MedAuditProperties.MESSAGE_COLUMN_LENGTH + 1));
+    }
+
+    @Test
+    @DisplayName("page-size bounds accept positive values and reject zero / negative")
+    void pageSizeBoundaries() {
+        MedAuditProperties properties = new MedAuditProperties();
+        properties.setDefaultPageSize(50);
+        properties.setMaxPageSize(200);
+        assertEquals(50, properties.getDefaultPageSize());
+        assertEquals(200, properties.getMaxPageSize());
+        // A zero or negative bound would turn the review endpoint into either an empty page or an
+        // unbounded scan, so it fails at bind time like every other limit here.
+        assertThrows(IllegalArgumentException.class, () -> properties.setDefaultPageSize(0));
+        assertThrows(IllegalArgumentException.class, () -> properties.setDefaultPageSize(-1));
+        assertThrows(IllegalArgumentException.class, () -> properties.setMaxPageSize(0));
+        assertThrows(IllegalArgumentException.class, () -> properties.setMaxPageSize(-1));
     }
 }

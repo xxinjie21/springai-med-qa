@@ -47,15 +47,24 @@ public interface AuditLogMapper {
 
     /**
      * Lists one page of audit entries of a tenant/department, newest first, optionally narrowed to
-     * one operator, one action and/or one outcome.
+     * one operator, one action, one outcome and/or a creation-time window.
      *
-     * @param tenantId   hospital/tenant id, required
-     * @param deptId     department id, required
-     * @param operatorId acting subject id, or {@code null} to list every operator
-     * @param action     action code, or {@code null} to list every action
-     * @param outcome    outcome filter, or {@code null} to list successes and failures alike
-     * @param offset     zero-based row offset, must not be negative
-     * @param limit      maximum number of rows, must be strictly positive
+     * <p>The time window is half-inclusive: {@code createdFrom} is included, {@code createdTo} is
+     * excluded, matching the exclusive cutoff the retention trim uses. Both bounds are optional, and
+     * the V3 composite indexes ({@code (tenant_id, dept_id, created_at)} and its operator/action
+     * variants) exist so the window stays a range scan instead of a full-trail page-through.</p>
+     *
+     * @param tenantId    hospital/tenant id, required
+     * @param deptId      department id, required
+     * @param operatorId  acting subject id, or {@code null} to list every operator
+     * @param action      action code, or {@code null} to list every action
+     * @param outcome     outcome filter, or {@code null} to list successes and failures alike
+     * @param createdFrom inclusive lower bound on {@code created_at} (epoch milliseconds), or
+     *                    {@code null} for no lower bound
+     * @param createdTo   exclusive upper bound on {@code created_at} (epoch milliseconds), or
+     *                    {@code null} for no upper bound
+     * @param offset      zero-based row offset, must not be negative
+     * @param limit       maximum number of rows, must be strictly positive
      * @return the page content ordered by {@code created_at} descending, possibly empty
      */
     List<AuditLogDO> selectPage(@Param("tenantId") String tenantId,
@@ -63,25 +72,33 @@ public interface AuditLogMapper {
                                 @Param("operatorId") @Nullable String operatorId,
                                 @Param("action") @Nullable String action,
                                 @Param("outcome") @Nullable AuditOutcome outcome,
+                                @Param("createdFrom") @Nullable Long createdFrom,
+                                @Param("createdTo") @Nullable Long createdTo,
                                 @Param("offset") long offset,
                                 @Param("limit") int limit);
 
     /**
      * Counts the audit entries matching the same filter as
-     * {@link #selectPage(String, String, String, String, AuditOutcome, long, int)}.
+     * {@link #selectPage(String, String, String, String, AuditOutcome, Long, Long, long, int)}.
      *
-     * @param tenantId   hospital/tenant id, required
-     * @param deptId     department id, required
-     * @param operatorId acting subject id, or {@code null} to count every operator
-     * @param action     action code, or {@code null} to count every action
-     * @param outcome    outcome filter, or {@code null} to count successes and failures alike
+     * @param tenantId    hospital/tenant id, required
+     * @param deptId      department id, required
+     * @param operatorId  acting subject id, or {@code null} to count every operator
+     * @param action      action code, or {@code null} to count every action
+     * @param outcome     outcome filter, or {@code null} to count successes and failures alike
+     * @param createdFrom inclusive lower bound on {@code created_at} (epoch milliseconds), or
+     *                    {@code null} for no lower bound
+     * @param createdTo   exclusive upper bound on {@code created_at} (epoch milliseconds), or
+     *                    {@code null} for no upper bound
      * @return the total number of matching entries, never negative
      */
     long countByCondition(@Param("tenantId") String tenantId,
                           @Param("deptId") String deptId,
                           @Param("operatorId") @Nullable String operatorId,
                           @Param("action") @Nullable String action,
-                          @Param("outcome") @Nullable AuditOutcome outcome);
+                          @Param("outcome") @Nullable AuditOutcome outcome,
+                          @Param("createdFrom") @Nullable Long createdFrom,
+                          @Param("createdTo") @Nullable Long createdTo);
 
     /**
      * Counts the audit entries already past a retention cutoff, across every tenant and department.

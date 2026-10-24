@@ -206,6 +206,7 @@ Swagger UI: `http://localhost:8080/swagger-ui.html`. OpenAPI document: `/v3/api-
 | `POST` | `/api/rag/documents/ingest` | Batch ingestion of medical documents | `@RateLimit`, staff only, identity taken from the API key (D42) |
 | `POST` | `/api/rag/documents/delete` | Delete by isolation scope | Staff only; a department-wide delete needs `confirmDepartmentWide=true` (D42) |
 | `POST` | `/api/rag/documents/search` | Tag-scoped retrieval preview | Staff only; forwards `topK`, `threshold` and `includeShared` (D42) |
+| `GET` | `/api/audit/logs` | Paged review of the audit trail | Staff only; optional `operatorId` / `action` / `outcome` and a half-inclusive `[createdFrom, createdTo)` window; reading the trail is itself audited (D56) |
 | `POST` | `/api/rag/documents/search` | Tag-scoped retrieval preview | Passes through `topK`, `threshold`, `includeShared` |
 | `GET` | `/actuator/health` | Health check | Container and orchestrator probes |
 | `GET` | `/actuator/prometheus` | Prometheus metrics | Scrape endpoint of the monitoring stack |
@@ -1026,6 +1027,39 @@ alert on the failure path, no completion notice for a dry run), `AuditLogRetenti
 documentation guards, and `MedProductionStartupIntegrationTest`'s V7 assertion. As the project's convention
 requires, the new guards were **watched to go red**.
 
+#### Reading the audit trail through a scoped review endpoint (D56)
+
+**After D55, the audit trail could be written, trimmed — and never read.** `AuditLogMapper#selectPage` /
+`#countByCondition` have existed since D23 together with their XML, and both the mapper javadoc and the V3
+migration comment describe them as the data access of an audit review — "audit reviews filter by
+tenant/department/operator/action **over a time window**" — with V3's three composite indexes
+(`(tenant_id, dept_id, created_at)` and its operator/action variants) built for exactly that time-window
+range scan. **Yet nothing ever called them**: a hospital could not answer "who touched this session last
+week" without querying the database by hand. This is the ninth appearance of the phase 8–14 deviation
+(**a comment promised behaviour the code did not have**), shaped like D53 — the promised read capability did
+not even have a call site.
+
+D56 wires the two methods into the call chain, and adds reading only — no write, delete or metric surface:
+
+| Dimension | Decision |
+|---|---|
+| Endpoint | `GET /api/audit/logs` with `@RequireDept(source = QUERY, roles = STAFF)` — reviewing the trail is a staff-only capability, patients may not read it, and the department boundary is enforced by the D22 interceptor, so a caller sees their own department only |
+| Scope | `tenantId` / `deptId` are **mandatory** and are carried by the query object `AuditLogPageQuery` into the WHERE clause of both statements; **no read-one-by-auditId primitive is added** (the D41/D42 lesson) |
+| Filters | `operatorId` / `action` / `outcome` are optional, plus the other half the mapper and the V3 indexes promised — a **time window `createdFrom` (inclusive) / `createdTo` (exclusive)**, the same half-inclusive convention as the D55 retention cutoff |
+| Paging | Default page size 20, ceiling 100 (`med.audit.default-page-size` / `med.audit.max-page-size`, the same shape and defaults as `MedSessionProperties`); a page past the end returns an **empty page carrying the real total** instead of an error |
+| Audit | `@MedAudit(action = "AUDIT_LOG_LIST")`: an audit review that leaves no trace is not evidence |
+| Response | `AuditLogResponse` mirrors the stored entity field for field, with **no masking** — the trail carries identifiers and outcomes only, no clinical text |
+| Deliberately absent | No Swagger group (the default document serves the endpoint), no cold store or export (V3's own argument opposes it), no audit-table size gauge (the same trade-off as D55) |
+
+Guard tests: `AuditLogServiceTest` (filter pass-through, the time window, the out-of-range empty page, an
+over-limit `BAD_REQUEST`, MySQL failures as `STORAGE_ERROR`), `AuditLogControllerTest` (blank scope
+rejected, filter assembly, DTO mapping, the staff-only and `@MedAudit` wiring), `AuditLogPageQueryTest`
+(mandatory scope, the half-inclusive window, inverted-window and negative-bound rejection),
+`AuditLogMapperShardingTest` extended with time-window cases (both statements on a real H2 +
+ShardingSphere, pinning the half-open `>=` / `<` semantics), `MedAuditPropertiesTest` extended with the
+paging bounds, and a D56 assertion in each of the three documentation guards. As the project's convention
+requires, the new guards were **watched to go red**.
+
 ---
 
 ## Error codes
@@ -1082,6 +1116,7 @@ requires, the new guards were **watched to go red**.
 | `MED_AUDIT_LOG_RETENTION_DAYS` | `365` | Retention window in days, **floored at 90 days**; below the floor the context fails to start |
 | `MED_AUDIT_LOG_RETENTION_BATCH_SIZE` / `MED_AUDIT_LOG_RETENTION_MAX_BATCHES` | `500` / `5` | Rows per delete statement and statements per run |
 | `MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL` / `MED_AUDIT_LOG_RETENTION_INITIAL_DELAY` | `24h` / `15m` | Trim period and startup grace period |
+| `MED_AUDIT_DEFAULT_PAGE_SIZE` / `MED_AUDIT_MAX_PAGE_SIZE` | `20` / `100` | Paging of the audit review endpoint: the page size applied when a request omits `size`, and the ceiling on a requested one — over the ceiling is a 400, not an unbounded scan (see D56) |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | Vector index |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | Retrieval parameters |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | Ingestion limits |

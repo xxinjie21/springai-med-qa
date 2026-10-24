@@ -431,6 +431,27 @@ springai-med-qa/
 > （批失败即整轮失败，见上表）、也**刻意没有**发布审计表规模 gauge：审计表按设计就该增长，
 > 「是否跟得上」由每轮报告的 `remaining` 与运行账本回答，一个没有规则消费的 gauge 是未验证的面。
 
+### 阶段 15：审计轨迹的查阅闭环（D56）
+
+> 阶段 15 的出发点：`AuditLogMapper#selectPage` / `#countByCondition` 连同完整 XML 从 D23 起就写在
+> 仓库里，mapper 的 javadoc 与 V3 迁移的注释都用同一句话描述它们的用途——「audit reviews filter by
+> tenant/department/operator/action **over a time window**」，V3 的三条复合索引
+> （`(tenant_id, dept_id, created_at)` 及其operator/action 变体）也正是为这种时间窗范围扫描而建。
+> **但这两个读方法至今没有任何生产调用方**：D23 让审计行落库、D55 让过期的审计行被裁剪，而整个
+> 服务没有任何一条路径能把它们读回来。这是阶段 8–14 那类偏差（**注释承诺了代码没有的行为**）的
+> 第 9 次出现，形态与 D53 相邻——被承诺的读能力连一个调用点都没有；而它的代价同样已经悄悄支付：
+> 医院拿不到「上周谁动过这个会话」的答案，只能派人连库 `SELECT`，审计表于是一个只能写、不能读、
+> 还会自己删自己的表。
+
+| Day | 任务 | 实现要点 | Commit 信息 |
+|---|---|---|---|
+| D56 | 审计查阅端点（audit review read path） | 把 D23 就写好的两个读方法接进调用链：`AuditLogService`（`com.med.qa.service`，`@Service` **常驻**——查阅能力与保留作业的开关无关， retention 关闭的部署同样必须能读）暴露 `PageResult<AuditLogDO> review(AuditLogPageQuery)`，复用 `SessionPageQuery` 同形的不可变查询对象（scope 必填、operator/action/outcome 可选、**时间窗 `createdFrom`（含）/ `createdTo`（不含）补上 mapper 与 V3 索引承诺的那半个过滤器**），分页口径（默认页大小 / 上限 / 越页返回空页带真实总数）与 `pageSessions` 逐字同源；`AuditLogController` 暴露 `GET /api/audit/logs`，`@RequireDept(source = QUERY, roles = STAFF)`——查阅操作轨迹是staff 专属能力，患者不得读取，科室边界由 D22 拦截器保证（调用方只能看本科室）；`@MedAudit(action = "AUDIT_LOG_LIST")` 让「查阅审计」本身留痕（一个不能被审计的审计查阅接口不是证据）；**不新增任何按 auditId 直读的无守卫原语**（D41/D42 的教训），范围由查询对象强制。mapper 的两个语句各加两个可空参数（`<if>` 条件进 `filterConditions`，与既有过滤器同一段 WHERE），`LIMIT ? OFFSET ?` 与排序不变。响应 DTO `AuditLogResponse` 逐字段镜像存储实体，**不做文本脱敏**（轨迹里只有标识符与结局，没有临床正文）。`MedAuditProperties` 补 `default-page-size` / `max-page-size`（与 `MedSessionProperties` 同形、同默认值 20/100）。守护测试：`AuditLogServiceTest`（过滤器透传、时间窗、越页空页、超限 BAD_REQUEST、MySQL 故障 STORAGE_ERROR）、`AuditLogControllerTest`（空 scope 拒绝、过滤器组装、DTO 映射）、`AuditLogPageQueryTest`、`AuditLogMapperShardingTest` 扩展时间窗用例（H2 + ShardingSphere 真跑两条语句）、`MedAuditPropertiesTest` 扩展分页边界；文档三件套（两份 README 的 API 表 + 手册 §）与三个文档守卫各补一条 D56 断言 | `feat(audit): read the audit trail through a scoped review endpoint` |
+
+> **阶段 15 之后没有 D57**：下次运行必须先扩写本路线图（新增阶段 16）再实现，不得自造迭代编号。
+> D56 **刻意没有**给 `/api/audit/logs` 加 Swagger 分组（端点由默认文档服务，分组是 UI 便利而非能力）、
+> **刻意没有**给审计行建任何冷库或导出（V3 的论证正好反对它）、也**刻意没有**发布审计表规模 gauge
+> （D55 的同款取舍）：本迭代只补「读」，不新增任何写、删或度量面。
+
 ---
 
 ## 四、统一存储对接规范（与外部 Python 中间件字段级对齐，代码零依赖）

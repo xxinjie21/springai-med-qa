@@ -379,6 +379,8 @@ livenessProbe:
 | `MED_RATE_LIMIT_DEFAULT_RATE` | `10` | 默认令牌数 |
 | `MED_RATE_LIMIT_DEFAULT_DURATION` | `1` | 默认窗口（秒） |
 | `MED_AUDIT_ENABLED` | `true` | 审计落库；关闭会丢失访问证据，仅限本地 |
+| `MED_AUDIT_DEFAULT_PAGE_SIZE` | `20` | 审计查阅端点 `GET /api/audit/logs` 的默认页大小：请求缺省 `size` 时生效（见 7.17） |
+| `MED_AUDIT_MAX_PAGE_SIZE` | `100` | 审计查阅端点的页大小上限：请求超过它是 `400`，不是无界扫描（见 7.17） |
 
 ### 5.4 存储与会话
 
@@ -1459,6 +1461,49 @@ completed、让位只记日志）、`AuditLogRetentionReportTest`（计数器校
 真实占位符）、`ReadmeDocumentationTest` / `EnglishReadmeDocumentationTest`（D55 小节、开关、锁键、
 告警码）、`AlertingStackConfigTest`（新规则选择 scheduler 真实导出的码、停摆选择器覆盖第五个作业）、
 `MedProductionStartupIntegrationTest`（真实 MySQL 上 V7 索引建成）。
+
+### 7.17 审计查阅端点（D56）
+
+`AuditLogMapper#selectPage` / `#countByCondition` 从 D23 起就写在仓库里，mapper 的 javadoc 与 V3 迁移
+的注释都用同一句话描述它们的用途——「audit reviews filter by tenant/department/operator/action **over a
+time window**」，V3 的三条复合索引也正是为这种时间窗范围扫描而建。**但这两个读方法至今没有任何生产
+调用方**：审计轨迹能写（D23）、能裁（D55），应用侧却没有一条路径能把它读回来——「上周谁动过这个会话」
+只能派人连库 `SELECT`。D56 把这两个方法接进调用链，只补读，不新增任何写、删或度量面。
+
+#### 端点与调用方式
+
+```
+GET /api/audit/logs?tenantId=t-1001&deptId=dept-cardio
+    [&operatorId=staff-42] [&action=SESSION_CLOSE] [&outcome=FAILURE]
+    [&createdFrom=1718000000000] [&createdTo=1718604800000]
+    [&page=1] [&size=20]
+```
+
+| 问题 | 答案 |
+|---|---|
+| 谁能调 | **仅 STAFF**（`@RequireDept(roles = STAFF)`）：患者 Key 直接被拦截器拒绝；科室边界由同一拦截器保证，调用方只能看本科室 |
+| scope | `tenantId` / `deptId` **必填**，由查询对象 `AuditLogPageQuery` 强制带进两条语句的 WHERE；**没有**按 auditId 直读的原语 |
+| 时间窗 | `createdFrom`（含）/ `createdTo`（不含），与 §7.16 保留裁剪的截止线同一套半开口径；反掉的窗口在绑定期就是 `400`，不会静默返回空 |
+| 分页 | 缺省 `size` 时用 `med.audit.default-page-size`（默认 20）；超过 `med.audit.max-page-size`（默认 100）是 `400`；越页返回**空页带真实总数**，不是错误 |
+| 留痕 | `@MedAudit(action = "AUDIT_LOG_LIST")`：查阅审计本身写一条审计行——一个不能被审计的审计查阅接口不是证据 |
+| 失败语义 | MySQL 故障是 `STORAGE_ERROR`，与其它读端点一致；分页与过滤参数错误是 `BAD_REQUEST` |
+
+#### 现场处置
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| 查阅返回空页但 `total` 很大 | 过滤条件或时间窗写错了 | 先去掉可选过滤器整窗口查一遍，再逐个加回；时间窗是 epoch 毫秒且上界不含 |
+| `400` 提示 size 超过上限 | 请求了超过 `max-page-size` 的页大小 | 调小 `size` 并翻页，或按合规需要上调 `MED_AUDIT_MAX_PAGE_SIZE` |
+| 患者 Key 调 `/api/audit/logs` 得到 `403` | **设计如此** | 查阅操作轨迹是 staff 专属能力；患者可见的是自己的会话与轨迹，不是审计表 |
+| 想导出给合规审查 | 端点只分页读 | 按 `page` / `size` 翻页拉取即可；审计行不含临床正文，导出物只有标识符与结局 |
+
+#### 跨组件契约
+
+`AuditLogServiceTest`（过滤器透传、时间窗、越页空页、超限 `BAD_REQUEST`、MySQL 故障
+`STORAGE_ERROR`）、`AuditLogControllerTest`（空 scope 拒绝、过滤器组装、DTO 映射、staff-only 与
+`@MedAudit` 装配）、`AuditLogPageQueryTest`（scope 必填、半开窗口、越界与负边界拒绝）、
+`AuditLogMapperShardingTest` 时间窗用例（H2 + ShardingSphere 真跑两条语句，钉住 `>=` / `<`）、
+`MedAuditPropertiesTest` 分页边界，以及三个文档守卫的 D56 断言（两份 README 的 API 表与手册本节）。
 
 ---
 

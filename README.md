@@ -197,6 +197,7 @@ Swagger UI：`http://localhost:8080/swagger-ui.html` ｜ OpenAPI 文档：`/v3/a
 | `POST` | `/api/rag/documents/ingest` | 医疗文档批量入库 | `@RateLimit`，仅 STAFF；身份取自 API Key（D42） |
 | `POST` | `/api/rag/documents/delete` | 按隔离 scope 删除 | 仅 STAFF；部门级删除需 `confirmDepartmentWide=true`（D42） |
 | `POST` | `/api/rag/documents/search` | 标签隔离检索预览 | 仅 STAFF；透传 `topK` / `threshold` / `includeShared`（D42） |
+| `GET` | `/api/audit/logs` | 审计轨迹查阅（分页） | 仅 STAFF；可选 `operatorId` / `action` / `outcome` 与半开时间窗 `[createdFrom, createdTo)`；查阅本身留痕（D56） |
 | `GET` | `/actuator/health` | 健康检查 | 容器 / 编排探针 |
 | `GET` | `/actuator/prometheus` | Prometheus 指标 | 监控栈抓取端点 |
 
@@ -833,6 +834,35 @@ gauge 求导只添故障模式，不添问题；`min_over_time` 在采样稀疏�
 `AuditLogRetentionReportTest`，以及文档三件套与 `MedProductionStartupIntegrationTest` 的 V7 断言。按项目惯例，
 新守卫**先被亲眼看过它变红**。
 
+#### 审计查阅端点（D56）
+
+**D55 之后，审计轨迹「能写、能删、不能读」。** `AuditLogMapper#selectPage` / `#countByCondition` 连同完整
+XML 从 D23 起就写在仓库里，mapper 的 javadoc 与 V3 迁移的注释都用同一句话描述它们的用途——「audit
+reviews filter by tenant/department/operator/action **over a time window**」，V3 的三条复合索引
+（`(tenant_id, dept_id, created_at)` 及其 operator/action 变体）也正是为这种时间窗范围扫描而建。
+**但这两个读方法至今没有任何生产调用方**：医院拿不到「上周谁动过这个会话」的答案，只能派人连库
+`SELECT`。这是阶段 8–14 那类偏差（**注释承诺了代码没有的行为**）的第 9 次出现，形态与 D53 相邻——
+被承诺的读能力连一个调用点都没有。
+
+D56 把这两个方法接进调用链，且只补读、不新增任何写、删或度量面：
+
+| 维度 | 决策 |
+|---|---|
+| 端点 | `GET /api/audit/logs`，`@RequireDept(source = QUERY, roles = STAFF)`——查阅操作轨迹是 staff 专属能力，患者不得读取；科室边界由 D22 拦截器保证，调用方只能看本科室 |
+| scope | `tenantId` / `deptId` **必填**，由查询对象 `AuditLogPageQuery` 强制带进每条语句的 WHERE；**不新增任何按 auditId 直读的原语**（D41/D42 的教训） |
+| 过滤器 | `operatorId` / `action` / `outcome` 可选，外加 mapper 与 V3 索引承诺的那半个过滤器——**时间窗 `createdFrom`（含）/ `createdTo`（不含）**，与 D55 保留裁剪的截止线同一套半开口径 |
+| 分页 | 默认页大小 20、上限 100（`med.audit.default-page-size` / `med.audit.max-page-size`，与 `MedSessionProperties` 同形同默认值）；越页返回**空页带真实总数**而不是错误 |
+| 留痕 | `@MedAudit(action = "AUDIT_LOG_LIST")`：一个不能被审计的审计查阅接口不是证据 |
+| 响应 | `AuditLogResponse` 逐字段镜像存储实体，**不做文本脱敏**——轨迹里只有标识符与结局，没有临床正文 |
+| 刻意不做 | 不加 Swagger 分组（端点由默认文档服务）、不建冷库或导出（V3 的论证正好反对它）、不发布审计表规模 gauge（D55 的同款取舍） |
+
+守护测试：`AuditLogServiceTest`（过滤器透传、时间窗、越页空页、超限 `BAD_REQUEST`、MySQL 故障
+`STORAGE_ERROR`）、`AuditLogControllerTest`（空 scope 拒绝、过滤器组装、DTO 映射、staff-only 与
+`@MedAudit` 装配断言）、`AuditLogPageQueryTest`（scope 必填、半开窗口、越界窗口与负边界拒绝）、
+`AuditLogMapperShardingTest` 扩展时间窗用例（H2 + ShardingSphere 真跑两条语句，钉住 `>=` / `<` 的半开
+语义）、`MedAuditPropertiesTest` 扩展分页边界，以及文档三件套与三个文档守卫的 D56 断言。按项目惯例，
+新守卫**先被亲眼看过它变红**。
+
 ---
 
 ## 错误码
@@ -888,6 +918,7 @@ gauge 求导只添故障模式，不添问题；`min_over_time` 在采样稀疏�
 | `MED_AUDIT_LOG_RETENTION_DAYS` | `365` | 保留窗口（天），**下限 90 天**，低于下限上下文启动失败 |
 | `MED_AUDIT_LOG_RETENTION_BATCH_SIZE` / `MED_AUDIT_LOG_RETENTION_MAX_BATCHES` | `500` / `5` | 单条删除语句的行数上限与单次运行的语句数上限 |
 | `MED_AUDIT_LOG_RETENTION_CHECK_INTERVAL` / `MED_AUDIT_LOG_RETENTION_INITIAL_DELAY` | `24h` / `15m` | 裁剪轮询间隔与启动宽限期 |
+| `MED_AUDIT_DEFAULT_PAGE_SIZE` / `MED_AUDIT_MAX_PAGE_SIZE` | `20` / `100` | 审计查阅端点分页口径：缺省 `size` 时的页大小与请求上限，超限是 400 而不是无界扫描（见 D56） |
 | `MED_RAG_INDEX_NAME` / `MED_RAG_KEY_PREFIX` | `med-doc-index` / `med:doc:` | 向量索引 |
 | `MED_RAG_TOP_K` / `MED_RAG_MAX_TOP_K` / `MED_RAG_SIMILARITY_THRESHOLD` | `4` / `50` / `0.0` | 检索参数 |
 | `MED_RAG_INGEST_BATCH_SIZE` / `MED_RAG_INGEST_MAX_DOCUMENTS` | `25` / `500` | 入库上限 |

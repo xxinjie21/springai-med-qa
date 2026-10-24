@@ -549,6 +549,26 @@ class EnglishReadmeDocumentationTest {
     }
 
     @Test
+    @DisplayName("the English README documents the D56 audit review endpoint, its staff-only scope and the window")
+    void apiChapterDocumentsTheD56AuditReview() {
+        // D56 is the ninth "a comment promised behaviour the code did not have" deviation: the two
+        // mapper read statements existed since D23 with a documented time-window purpose and no
+        // caller. What must be pinned: the endpoint is staff-only (a patient key is a 403, not a
+        // filtered page), the time window is half-inclusive like the D55 cutoff, and reading the
+        // trail is itself audited. The heading is asserted whole: a bare "D56" would be satisfied by
+        // the roadmap row.
+        assertThat(english).contains("D56");
+        assertThat(english).contains("#### Reading the audit trail through a scoped review endpoint (D56)");
+        assertThat(english).contains("/api/audit/logs");
+        assertThat(english).contains("AuditLogService");
+        assertThat(english).contains("AuditLogPageQuery");
+        assertThat(english).contains("AUDIT_LOG_LIST");
+        assertThat(english).contains("MED_AUDIT_DEFAULT_PAGE_SIZE");
+        assertThat(english).contains("MED_AUDIT_MAX_PAGE_SIZE");
+        assertThat(english).contains("AuditLogMapperShardingTest");
+    }
+
+    @Test
     @DisplayName("the linked handbook and roadmap exist and are linked from both READMEs")
     void linkedDocumentsExist() {
         Path root = Path.of(System.getProperty("user.dir"));
